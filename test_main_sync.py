@@ -92,6 +92,17 @@ class SyncCoreTests(unittest.TestCase):
         row = main.build_canonical_row(rec, [], {}, price_cutover_round=123, power_up_gmt_value=999.0)
         self.assertEqual(row[-1], "")
 
+    def test_build_canonical_row_post_cutover_defaults_to_zero(self) -> None:
+        rec = {
+            "snapshot_ts": "2026-02-25T13:49:20.702613+00:00",
+            "league_id": 1,
+            "round_id": 124,
+            "league_th": 1000.0,
+            "efficiency_league": 20.0,
+        }
+        row = main.build_canonical_row(rec, [], {}, price_cutover_round=123, power_up_gmt_value=None)
+        self.assertEqual(row[-1], 0.0)
+
     def test_formula_helpers(self) -> None:
         self.assertAlmostEqual(main.calc_league_pps(1000.0, 20.0), 1400.0)
         self.assertAlmostEqual(main.calc_power_up_gmt(1000.0, 20.0), 1400.0 * 0.0389)

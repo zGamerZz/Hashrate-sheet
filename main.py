@@ -2720,8 +2720,8 @@ def build_canonical_row(
 
     power_up_gmt: Any = ""
     if round_id_num is not None and (price_cutover_round is None or round_id_num > price_cutover_round):
-        if power_up_gmt_value is not None:
-            power_up_gmt = power_up_gmt_value
+        # After cutover we persist explicit zero when no Power Up usage was observed.
+        power_up_gmt = 0.0 if power_up_gmt_value is None else power_up_gmt_value
     row.append(power_up_gmt)
     return row
 
