@@ -65,14 +65,20 @@ class SyncCoreTests(unittest.TestCase):
         }
         ability_headers = ["Echo Boost (x1)", "Rocket (x1)"]
         counts = {"Echo Boost (x1)": 3}
-        row = main.build_canonical_row(rec, ability_headers, counts, price_cutover_round=122)
+        row = main.build_canonical_row(
+            rec,
+            ability_headers,
+            counts,
+            price_cutover_round=122,
+            power_up_gmt_value=555.0,
+        )
         self.assertEqual(row[1], 1)
         self.assertEqual(row[6], 123)
         self.assertAlmostEqual(row[7], 1234.5)
         self.assertEqual(row[10], 662)
         self.assertAlmostEqual(row[11], 20.49)
         self.assertEqual(row[-3:-1], [3, 0])
-        self.assertAlmostEqual(row[-1], main.calc_power_up_gmt(1234.5, 20.49))
+        self.assertAlmostEqual(row[-1], 555.0)
 
     def test_build_canonical_row_cutover_blocks_old_round(self) -> None:
         rec = {
@@ -82,7 +88,7 @@ class SyncCoreTests(unittest.TestCase):
             "league_th": 1000.0,
             "efficiency_league": 20.0,
         }
-        row = main.build_canonical_row(rec, [], {}, price_cutover_round=123)
+        row = main.build_canonical_row(rec, [], {}, price_cutover_round=123, power_up_gmt_value=999.0)
         self.assertEqual(row[-1], "")
 
     def test_formula_helpers(self) -> None:

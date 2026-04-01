@@ -822,6 +822,128 @@ class DBClient:
             out.setdefault(rid, {})[aid] = int(cnt)
         return out
 
+    def fetch_power_up_gmt_sum_for_rounds(self, league_id: int, round_ids: Sequence[int]) -> Dict[int, float]:
+        """
+        Sum Power Up GMT cost per round from participant usage:
+          ability_count * (PPS_FACTOR * nft_power / mean_energy_efficiency) * POWER_UP_GMT_FACTOR
+        Power/eff are resolved by priority:
+          1) exact round-linked player snapshot membership
+          2) latest same-league membership at or before round
+          3) latest membership at or before round (any league)
+        """
+        if not round_ids:
+            return {}
+        ids = sorted({int(x) for x in round_ids})
+        placeholders = ", ".join(["%s"] * len(ids))
+        sql = f"""
+        WITH pu AS (
+          SELECT ability_id
+          FROM gomining.ability_dim
+          WHERE lower(ability_name) IN ('power up boost', 'power-up boost')
+          UNION
+          SELECT DISTINCT i.ability_id::text
+          FROM gomining.abilities_snapshot_items i
+          WHERE lower(COALESCE(i.item_payload->>'abilityName', '')) IN ('power up boost', 'power-up boost')
+        ),
+        latest AS (
+          SELECT
+            COALESCE(
+              s.round_id,
+              CASE WHEN (s.source_payload #>> '{{data,roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{data,roundId}}')::bigint END,
+              CASE WHEN (s.source_payload #>> '{{roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{roundId}}')::bigint END
+            ) AS round_id,
+            MAX(s.abilities_snapshot_id) AS abilities_snapshot_id
+          FROM gomining.abilities_snapshots s
+          WHERE s.league_id = %s
+            AND COALESCE(
+              s.round_id,
+              CASE WHEN (s.source_payload #>> '{{data,roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{data,roundId}}')::bigint END,
+              CASE WHEN (s.source_payload #>> '{{roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{roundId}}')::bigint END
+            ) IN ({placeholders})
+          GROUP BY 1
+        ),
+        uses AS (
+          SELECT
+            l.round_id,
+            i.entity_id::bigint AS user_id,
+            SUM(COALESCE(i.ability_count, 0))::numeric AS ability_count
+          FROM latest l
+          JOIN gomining.abilities_snapshot_items i ON i.abilities_snapshot_id = l.abilities_snapshot_id
+          WHERE i.entity_type = 'participant'
+            AND i.entity_id IS NOT NULL
+            AND COALESCE(i.ability_count, 0) > 0
+            AND (
+              i.ability_id IN (SELECT ability_id FROM pu)
+              OR lower(COALESCE(i.item_payload->>'abilityName', '')) IN ('power up boost', 'power-up boost')
+            )
+          GROUP BY l.round_id, i.entity_id
+        ),
+        linked AS (
+          SELECT l.round_id, l.player_snapshot_id
+          FROM gomining.round_player_snapshot_links l
+          WHERE l.league_id = %s
+            AND l.round_id IN ({placeholders})
+        ),
+        resolved AS (
+          SELECT
+            u.round_id,
+            u.user_id,
+            u.ability_count,
+            COALESCE(pm_exact.nft_power, pm_league.nft_power, pm_any.nft_power) AS nft_power,
+            COALESCE(pm_exact.mean_energy_efficiency, pm_league.mean_energy_efficiency, pm_any.mean_energy_efficiency) AS mean_eff
+          FROM uses u
+          LEFT JOIN linked lk ON lk.round_id = u.round_id
+          LEFT JOIN gomining.player_snapshot_memberships pm_exact
+            ON pm_exact.player_snapshot_id = lk.player_snapshot_id
+           AND pm_exact.user_id = u.user_id
+           AND pm_exact.nft_power IS NOT NULL
+           AND pm_exact.nft_power > 0
+           AND pm_exact.mean_energy_efficiency IS NOT NULL
+           AND pm_exact.mean_energy_efficiency > 0
+          LEFT JOIN LATERAL (
+            SELECT m.nft_power, m.mean_energy_efficiency
+            FROM gomining.player_snapshot_memberships m
+            WHERE m.user_id = u.user_id
+              AND m.league_id = %s
+              AND m.nft_power IS NOT NULL
+              AND m.nft_power > 0
+              AND m.mean_energy_efficiency IS NOT NULL
+              AND m.mean_energy_efficiency > 0
+              AND (m.round_id IS NULL OR m.round_id <= u.round_id)
+            ORDER BY m.round_id DESC NULLS LAST, m.created_at DESC
+            LIMIT 1
+          ) pm_league ON TRUE
+          LEFT JOIN LATERAL (
+            SELECT m.nft_power, m.mean_energy_efficiency
+            FROM gomining.player_snapshot_memberships m
+            WHERE m.user_id = u.user_id
+              AND m.nft_power IS NOT NULL
+              AND m.nft_power > 0
+              AND m.mean_energy_efficiency IS NOT NULL
+              AND m.mean_energy_efficiency > 0
+              AND (m.round_id IS NULL OR m.round_id <= u.round_id)
+            ORDER BY m.round_id DESC NULLS LAST, m.created_at DESC
+            LIMIT 1
+          ) pm_any ON TRUE
+        )
+        SELECT
+          round_id,
+          SUM(ability_count * ({PPS_FACTOR} * nft_power / mean_eff) * {POWER_UP_GMT_FACTOR})::numeric AS total_power_up_gmt
+        FROM resolved
+        WHERE nft_power IS NOT NULL AND mean_eff IS NOT NULL AND mean_eff > 0
+        GROUP BY round_id
+        """
+        params: List[Any] = [league_id] + ids + [league_id] + ids + [league_id]
+        rows = self.query(sql, params)
+        out: Dict[int, float] = {}
+        for r in rows:
+            rid = safe_int(r.get("round_id"))
+            val = safe_float(r.get("total_power_up_gmt"))
+            if rid is None or val is None:
+                continue
+            out[rid] = val
+        return out
+
     def fetch_clan_shield_rows_for_rounds(
         self,
         league_id: int,
@@ -2056,6 +2178,7 @@ def build_canonical_row(
     ability_headers: List[str],
     counts_by_name: Dict[str, int],
     price_cutover_round: Optional[int],
+    power_up_gmt_value: Optional[float] = None,
 ) -> List[Any]:
     ts_iso = to_iso_utc(rec.get("snapshot_ts")) or ""
     ended_iso = to_iso_utc(rec.get("ended_at")) or ""
@@ -2091,9 +2214,8 @@ def build_canonical_row(
 
     power_up_gmt: Any = ""
     if round_id_num is not None and (price_cutover_round is None or round_id_num > price_cutover_round):
-        calc = calc_power_up_gmt(league_th, efficiency_league)
-        if calc is not None:
-            power_up_gmt = calc
+        if power_up_gmt_value is not None:
+            power_up_gmt = power_up_gmt_value
     row.append(power_up_gmt)
     return row
 
@@ -2184,6 +2306,7 @@ def enqueue_main_sheet_ops(
         max_round = max(round_ids)
         row_maps = state.get_round_row_map_bulk(ws_id, round_ids)
         counts_by_round = db.fetch_ability_counts_for_rounds(ctx.league_id, round_ids)
+        power_up_gmt_by_round = db.fetch_power_up_gmt_sum_for_rounds(ctx.league_id, round_ids)
 
         for rec in rounds_sorted:
             rid = safe_int(rec.get("round_id"))
@@ -2198,7 +2321,13 @@ def enqueue_main_sheet_ops(
                     continue
                 counts_by_name[aname] = counts_by_name.get(aname, 0) + int(cnt)
 
-            row = build_canonical_row(rec, ability_headers, counts_by_name, price_cutover_round=price_cutover)
+            row = build_canonical_row(
+                rec,
+                ability_headers,
+                counts_by_name,
+                price_cutover_round=price_cutover,
+                power_up_gmt_value=safe_float(power_up_gmt_by_round.get(rid)),
+            )
             checksum = row_checksum(row)
             finalized = 1 if rid <= (max_round - STABILIZATION_ROUNDS) else 0
             mapped = row_maps.get(rid)
