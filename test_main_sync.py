@@ -336,6 +336,131 @@ class SyncCoreTests(unittest.TestCase):
             except OSError:
                 pass
 
+    def test_enqueue_main_sheet_ops_waits_for_abilities_before_append(self) -> None:
+        class FakeDB:
+            def fetch_latest_completed_round_id(self, league_id: int) -> int:
+                return 101
+
+            def fetch_latest_abilities_round_id(self, league_id: int) -> int:
+                return 100
+
+            def fetch_completed_rounds_from_db(self, league_id: int, since_round: int, limit: int) -> List[Dict[str, Any]]:
+                return [{"round_id": 101, "league_id": league_id}]
+
+            def fetch_available_ability_round_ids(self, league_id: int, round_ids: List[int]) -> set[int]:
+                return set()
+
+            def fetch_ability_counts_for_rounds(self, league_id: int, round_ids: List[int]) -> Dict[int, Dict[str, int]]:
+                return {}
+
+            def fetch_power_up_gmt_sum_for_rounds(self, league_id: int, round_ids: List[int]) -> Dict[int, float]:
+                return {}
+
+        fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
+        os.close(fd)
+        try:
+            st = main.StateStore(path)
+            st.upsert_sheet_meta(11, "tab-main", 1)
+            st.set_last_synced_round(11, 100)
+            st.set_price_cutover_round(11, 100)
+            ctx = main.SheetContext(
+                ws_id=11,
+                title="tab-main",
+                ws=None,
+                league_id=1,
+                kind="main",
+                expected_cols=len(main.BASE_HEADERS) + 1 + 1,
+                round_col_idx=6,
+            )
+            enq = main.enqueue_main_sheet_ops(
+                FakeDB(),  # type: ignore[arg-type]
+                st,
+                {11: ctx},
+                {"a1": "Power Up Boost"},
+                ["Power Up Boost"],
+            )
+            self.assertEqual(enq, 0)
+            self.assertEqual(st.queue_total_count(), 0)
+            self.assertEqual(st.get_last_synced_round(11), 100)
+            st.close()
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def test_enqueue_main_sheet_ops_updates_when_abilities_arrive(self) -> None:
+        rec = {
+            "snapshot_ts": "2026-04-01T22:00:00+00:00",
+            "league_id": 1,
+            "round_id": 103,
+            "block_number": 5000,
+            "multiplier": 1.0,
+            "gmt_fund": 10.0,
+            "gmt_per_block": 0.1,
+            "league_th": 1000.0,
+            "ended_at": "2026-04-01T22:00:00+00:00",
+            "round_duration_sec": 60,
+            "blocks_mined": 100,
+            "efficiency_league": 20.0,
+        }
+
+        class FakeDB:
+            def fetch_latest_completed_round_id(self, league_id: int) -> int:
+                return 105
+
+            def fetch_latest_abilities_round_id(self, league_id: int) -> int:
+                return 103
+
+            def fetch_completed_rounds_from_db(self, league_id: int, since_round: int, limit: int) -> List[Dict[str, Any]]:
+                return [rec]
+
+            def fetch_available_ability_round_ids(self, league_id: int, round_ids: List[int]) -> set[int]:
+                return {103}
+
+            def fetch_ability_counts_for_rounds(self, league_id: int, round_ids: List[int]) -> Dict[int, Dict[str, int]]:
+                return {103: {"a1": 5}}
+
+            def fetch_power_up_gmt_sum_for_rounds(self, league_id: int, round_ids: List[int]) -> Dict[int, float]:
+                return {103: 12.5}
+
+        fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
+        os.close(fd)
+        try:
+            st = main.StateStore(path)
+            st.upsert_sheet_meta(11, "tab-main", 1)
+            st.set_last_synced_round(11, 105)
+            st.set_price_cutover_round(11, 100)
+            old_row = main.build_canonical_row(rec, ["Power Up Boost"], {}, price_cutover_round=100, power_up_gmt_value=None)
+            st.upsert_row_map(11, 103, 77, main.row_checksum(old_row), 1)
+            ctx = main.SheetContext(
+                ws_id=11,
+                title="tab-main",
+                ws=None,
+                league_id=1,
+                kind="main",
+                expected_cols=len(main.BASE_HEADERS) + 1 + 1,
+                round_col_idx=6,
+            )
+            enq = main.enqueue_main_sheet_ops(
+                FakeDB(),  # type: ignore[arg-type]
+                st,
+                {11: ctx},
+                {"a1": "Power Up Boost"},
+                ["Power Up Boost"],
+            )
+            self.assertEqual(enq, 1)
+            due = st.fetch_due_ops(limit=10)
+            self.assertEqual(len(due), 1)
+            self.assertEqual(due[0]["op_type"], "update_round")
+            self.assertEqual(due[0]["round_id"], 103)
+            st.close()
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
     def test_build_clan_round_rows(self) -> None:
         rec = {
             "snapshot_ts": "2026-04-01T19:36:53+00:00",

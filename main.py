@@ -1243,6 +1243,51 @@ class DBClient:
             out.setdefault(rid, {})[aid] = int(cnt)
         return out
 
+    def fetch_latest_abilities_round_id(self, league_id: int) -> Optional[int]:
+        sql = """
+        SELECT MAX(
+          COALESCE(
+            s.round_id,
+            CASE WHEN (s.source_payload #>> '{data,roundId}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{data,roundId}')::bigint END,
+            CASE WHEN (s.source_payload #>> '{roundId}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{roundId}')::bigint END
+          )
+        ) AS round_id
+        FROM gomining.abilities_snapshots s
+        WHERE s.league_id = %s
+        """
+        rows = self.query(sql, (league_id,))
+        if not rows:
+            return None
+        return safe_int(rows[0].get("round_id"))
+
+    def fetch_available_ability_round_ids(self, league_id: int, round_ids: Sequence[int]) -> set[int]:
+        if not round_ids:
+            return set()
+        ids = sorted({int(x) for x in round_ids})
+        placeholders = ", ".join(["%s"] * len(ids))
+        sql = f"""
+        SELECT DISTINCT
+          COALESCE(
+            s.round_id,
+            CASE WHEN (s.source_payload #>> '{{data,roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{data,roundId}}')::bigint END,
+            CASE WHEN (s.source_payload #>> '{{roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{roundId}}')::bigint END
+          ) AS round_id
+        FROM gomining.abilities_snapshots s
+        WHERE s.league_id = %s
+          AND COALESCE(
+            s.round_id,
+            CASE WHEN (s.source_payload #>> '{{data,roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{data,roundId}}')::bigint END,
+            CASE WHEN (s.source_payload #>> '{{roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{roundId}}')::bigint END
+          ) IN ({placeholders})
+        """
+        rows = self.query(sql, [league_id] + ids)
+        out: set[int] = set()
+        for r in rows:
+            rid = safe_int(r.get("round_id"))
+            if rid is not None:
+                out.add(rid)
+        return out
+
     def fetch_power_up_gmt_sum_for_rounds(self, league_id: int, round_ids: Sequence[int]) -> Dict[int, float]:
         """
         Sum Power Up GMT cost per round from participant usage:
@@ -2788,7 +2833,12 @@ def enqueue_main_sheet_ops(
             price_cutover = last_synced
             log_info("sync.price_cutover_initialized", sheet=ctx.title, league_id=ctx.league_id, cutover_round=price_cutover)
 
+        ability_latest_round = db.fetch_latest_abilities_round_id(ctx.league_id)
         since_round = max(0, last_synced - STABILIZATION_ROUNDS)
+        if ability_latest_round is not None:
+            # Ability snapshots can lag behind multiplier snapshots significantly.
+            # Pull from the lower watermark so previously written zero-rows can be corrected later.
+            since_round = min(since_round, max(0, ability_latest_round - STABILIZATION_ROUNDS))
         rounds = db.fetch_completed_rounds_from_db(ctx.league_id, since_round, MAX_ROUNDS_PER_POLL)
         if DEBUG_VERBOSE:
             log_debug(
@@ -2798,6 +2848,7 @@ def enqueue_main_sheet_ops(
                 league_id=ctx.league_id,
                 last_synced=last_synced,
                 since_round=since_round,
+                ability_latest_round=ability_latest_round,
                 fetched_rounds=len(rounds),
             )
         if not rounds:
@@ -2811,12 +2862,30 @@ def enqueue_main_sheet_ops(
 
         max_round = max(round_ids)
         row_maps = state.get_round_row_map_bulk(ws_id, round_ids)
+        available_ability_rounds = db.fetch_available_ability_round_ids(ctx.league_id, round_ids)
         counts_by_round = db.fetch_ability_counts_for_rounds(ctx.league_id, round_ids)
         power_up_gmt_by_round = db.fetch_power_up_gmt_sum_for_rounds(ctx.league_id, round_ids)
 
         for rec in rounds_sorted:
             rid = safe_int(rec.get("round_id"))
             if rid is None:
+                continue
+            is_new_round = rid > last_synced
+
+            # For new rows, require ability snapshot availability; otherwise wait and keep strict order.
+            if is_new_round:
+                if ability_latest_round is None or rid > ability_latest_round or rid not in available_ability_rounds:
+                    log_warn(
+                        "sync.round_wait_abilities",
+                        sheet=ctx.title,
+                        league_id=ctx.league_id,
+                        round_id=rid,
+                        last_synced=last_synced,
+                        ability_latest_round=ability_latest_round,
+                    )
+                    break
+            elif rid not in available_ability_rounds:
+                # Existing rows can only be recalculated once matching ability snapshot exists.
                 continue
 
             counts_by_id = counts_by_round.get(rid, {})
