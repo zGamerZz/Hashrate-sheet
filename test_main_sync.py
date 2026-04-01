@@ -119,6 +119,7 @@ class SyncCoreTests(unittest.TestCase):
     def test_extract_token_candidate_variants(self) -> None:
         self.assertEqual(main._extract_token_candidate({"token": "abc"}), "abc")
         self.assertEqual(main._extract_token_candidate({"data": {"access_token": "xyz"}}), "xyz")
+        self.assertEqual(main._extract_token_candidate({"jwtToken": "tok_jwt"}), "tok_jwt")
         self.assertEqual(main._extract_token_candidate("Bearer qwe"), "qwe")
         self.assertEqual(main._extract_token_candidate([None, {"jwt": "j1.j2.j3"}]), "j1.j2.j3")
         self.assertIsNone(main._extract_token_candidate({"data": {}}))

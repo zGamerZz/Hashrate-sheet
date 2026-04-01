@@ -392,7 +392,7 @@ def _extract_token_candidate(value: Any) -> Optional[str]:
     if value is None:
         return None
     if isinstance(value, dict):
-        for k in ("token", "access_token", "bearer", "jwt"):
+        for k in ("token", "access_token", "bearer", "jwt", "jwtToken", "jwt_token"):
             if k in value:
                 out = _extract_token_candidate(value.get(k))
                 if out:
