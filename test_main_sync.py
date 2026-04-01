@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from typing import Any, Dict, List
 
 import main
 
@@ -99,6 +100,222 @@ class SyncCoreTests(unittest.TestCase):
         self.assertAlmostEqual(main.calc_clan_shield_gmt(200.0), 0.111)
         self.assertIsNone(main.calc_power_up_gmt(1000.0, 0.0))
         self.assertIsNone(main.calc_team_pps_fallback(None, 20.0))
+
+    def test_calc_team_th_and_pps_from_users_mixed(self) -> None:
+        users = [
+            {"power": 1000, "ee": 20},
+            {"power": 500, "ee": None},
+            {"power": 0, "ee": 15},
+            {"power": "200", "ee": "10"},
+        ]
+        team_th, team_pps = main.calc_team_th_and_pps_from_users(users)
+        self.assertAlmostEqual(team_th, 1700.0)
+        self.assertAlmostEqual(team_pps, 1960.0)
+
+    def test_to_api_calculated_at(self) -> None:
+        out = main._to_api_calculated_at("2026-03-31T12:34:56+00:00")
+        self.assertEqual(out, "2026-03-31T12:34:56.000Z")
+
+    def test_clan_api_client_pagination_merge(self) -> None:
+        class StubClient(main.GoMiningClanApiClient):
+            def __init__(self) -> None:
+                super().__init__(
+                    bearer_token="x",
+                    limiter=main.TokenBucket(9999, name="test"),
+                    page_limit=1,
+                    max_retries=1,
+                )
+
+            def _post_json_with_retry(self, url: str, payload: Dict[str, Any], op: str, **ctx: Any) -> Dict[str, Any] | None:
+                if op == "clan_leaderboard":
+                    skip = payload["pagination"]["skip"]
+                    if skip == 0:
+                        return {
+                            "data": {
+                                "count": 2,
+                                "clansRemaining": [{"clanId": 11, "clan": {"name": "Alpha"}}],
+                                "clansPromoted": [{"clanId": 22, "clan": {"name": "Beta"}}],
+                                "clansRelegated": [],
+                            }
+                        }
+                    if skip == 1:
+                        return {
+                            "data": {
+                                "count": 2,
+                                "clansRemaining": [{"clanId": 22, "clan": {"name": "Beta"}}],
+                                "clansPromoted": [{"clanId": 22, "clan": {"name": "Beta"}}],
+                                "clansRelegated": [],
+                            }
+                        }
+                    return {"data": {"count": 2, "clansRemaining": [], "clansPromoted": [], "clansRelegated": []}}
+
+                if op == "clan_get_by_id":
+                    clan_id = payload["clanId"]
+                    skip = payload["pagination"]["skip"]
+                    if clan_id == 11 and skip == 0:
+                        return {"data": {"name": "Alpha", "usersCount": 2, "usersForClient": [{"power": 100, "ee": 20}]}}
+                    if clan_id == 11 and skip == 1:
+                        return {"data": {"name": "Alpha", "usersCount": 2, "usersForClient": [{"power": 50, "ee": 10}]}}
+                    if clan_id == 22 and skip == 0:
+                        return {"data": {"name": "Beta", "usersCount": 1, "usersForClient": [{"power": 0, "ee": None}]}}
+                return None
+
+        client = StubClient()
+        rows = client.fetch_clan_rows_for_round(
+            league_id=1,
+            round_id=123,
+            calculated_at="2026-03-31T00:00:00.000Z",
+            snapshot_ts="2026-03-31T00:00:00+00:00",
+        )
+        self.assertIsNotNone(rows)
+        assert rows is not None
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["clan_id"], 11)
+        self.assertAlmostEqual(rows[0]["team_th"], 150.0)
+        self.assertAlmostEqual(rows[0]["team_pps"], 280.0)
+        self.assertEqual(rows[0]["members_total"], 2)
+        self.assertEqual(rows[0]["members_seen"], 2)
+        self.assertEqual(rows[0]["calc_mode"], "api_exact")
+        self.assertEqual(rows[0]["snapshot_round_id"], 123)
+
+    def test_enqueue_clan_sheet_ops_blocks_on_incomplete_round(self) -> None:
+        class FakeDB:
+            def fetch_latest_completed_round_id(self, league_id: int) -> int:
+                return 12
+
+            def fetch_completed_rounds_from_db(self, league_id: int, since_round: int, limit: int) -> List[Dict[str, Any]]:
+                return [
+                    {"round_id": 11, "league_id": league_id, "snapshot_ts": "2026-03-31T12:00:00+00:00"},
+                    {"round_id": 12, "league_id": league_id, "snapshot_ts": "2026-03-31T12:02:00+00:00"},
+                ]
+
+        class FakeAPI:
+            def __init__(self) -> None:
+                self.calls: List[int] = []
+
+            def fetch_clan_rows_for_round(
+                self,
+                league_id: int,
+                round_id: int,
+                calculated_at: str,
+                snapshot_ts: str | None = None,
+            ) -> List[Dict[str, Any]] | None:
+                self.calls.append(round_id)
+                if round_id == 11:
+                    return None
+                return [
+                    {
+                        "round_id": round_id,
+                        "snapshot_round_id": round_id,
+                        "snapshot_ts": snapshot_ts or "2026-03-31T12:00:00+00:00",
+                        "clan_id": 100,
+                        "clan_name": "X",
+                        "members_total": 1,
+                        "members_seen": 1,
+                        "member_coverage": 1.0,
+                        "team_th": 100.0,
+                        "team_pps": 200.0,
+                        "clan_shield_gmt": main.calc_clan_shield_gmt(200.0),
+                        "calc_mode": "api_exact",
+                    }
+                ]
+
+        fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
+        os.close(fd)
+        try:
+            st = main.StateStore(path)
+            st.upsert_sheet_meta(11, "tab-clan", 1)
+            st.set_last_synced_round(11, 10)
+            ctx = main.SheetContext(
+                ws_id=11,
+                title="tab-clan",
+                ws=None,
+                league_id=1,
+                kind="clan",
+                expected_cols=len(main.CLAN_HEADERS),
+                round_col_idx=2,
+            )
+            fake_api = FakeAPI()
+            enq = main.enqueue_clan_sheet_ops(FakeDB(), st, {11: ctx}, fake_api)  # type: ignore[arg-type]
+            self.assertEqual(enq, 0)
+            self.assertEqual(fake_api.calls, [11])
+            self.assertEqual(st.queue_total_count(), 0)
+            st.close()
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def test_enqueue_clan_sheet_ops_blocks_on_empty_round(self) -> None:
+        class FakeDB:
+            def fetch_latest_completed_round_id(self, league_id: int) -> int:
+                return 12
+
+            def fetch_completed_rounds_from_db(self, league_id: int, since_round: int, limit: int) -> List[Dict[str, Any]]:
+                return [
+                    {"round_id": 11, "league_id": league_id, "snapshot_ts": "2026-03-31T12:00:00+00:00"},
+                    {"round_id": 12, "league_id": league_id, "snapshot_ts": "2026-03-31T12:02:00+00:00"},
+                ]
+
+        class FakeAPI:
+            def __init__(self) -> None:
+                self.calls: List[int] = []
+
+            def fetch_clan_rows_for_round(
+                self,
+                league_id: int,
+                round_id: int,
+                calculated_at: str,
+                snapshot_ts: str | None = None,
+            ) -> List[Dict[str, Any]] | None:
+                self.calls.append(round_id)
+                if round_id == 11:
+                    return []
+                return [
+                    {
+                        "round_id": round_id,
+                        "snapshot_round_id": round_id,
+                        "snapshot_ts": snapshot_ts or "2026-03-31T12:00:00+00:00",
+                        "clan_id": 100,
+                        "clan_name": "X",
+                        "members_total": 1,
+                        "members_seen": 1,
+                        "member_coverage": 1.0,
+                        "team_th": 100.0,
+                        "team_pps": 200.0,
+                        "clan_shield_gmt": main.calc_clan_shield_gmt(200.0),
+                        "calc_mode": "api_exact",
+                    }
+                ]
+
+        fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
+        os.close(fd)
+        try:
+            st = main.StateStore(path)
+            st.upsert_sheet_meta(11, "tab-clan", 1)
+            st.set_last_synced_round(11, 10)
+            ctx = main.SheetContext(
+                ws_id=11,
+                title="tab-clan",
+                ws=None,
+                league_id=1,
+                kind="clan",
+                expected_cols=len(main.CLAN_HEADERS),
+                round_col_idx=2,
+            )
+            fake_api = FakeAPI()
+            enq = main.enqueue_clan_sheet_ops(FakeDB(), st, {11: ctx}, fake_api)  # type: ignore[arg-type]
+            self.assertEqual(enq, 0)
+            self.assertEqual(fake_api.calls, [11])
+            self.assertEqual(st.queue_total_count(), 0)
+            self.assertEqual(st.get_last_synced_round(11), 10)
+            st.close()
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     def test_build_clan_round_rows(self) -> None:
         rec = {

@@ -61,6 +61,18 @@ STATE_DB_PATH = os.getenv("STATE_DB_PATH", "./sync_state.sqlite")
 LOCK_FILE_PATH = os.getenv("LOCK_FILE_PATH", "./sync.lock")
 LEAGUES_API_URL = os.getenv("LEAGUES_API_URL", "https://api.gomining.com/api/nft-game/league/index")
 GOMINING_BEARER_TOKEN = os.getenv("GOMINING_BEARER_TOKEN", "")
+CLAN_LEADERBOARD_API_URL = os.getenv(
+    "CLAN_LEADERBOARD_API_URL",
+    "https://api.gomining.com/api/nft-game/clan-leaderboard/index-v2",
+)
+CLAN_GET_BY_ID_API_URL = os.getenv(
+    "CLAN_GET_BY_ID_API_URL",
+    "https://api.gomining.com/api/nft-game/clan/get-by-id",
+)
+CLAN_API_PAGE_LIMIT = max(1, min(50, int(os.getenv("CLAN_API_PAGE_LIMIT", "50"))))
+CLAN_API_TIMEOUT_SECONDS = int(os.getenv("CLAN_API_TIMEOUT_SECONDS", "45"))
+CLAN_API_MAX_RETRIES = max(1, int(os.getenv("CLAN_API_MAX_RETRIES", "4")))
+GOMINING_API_REQ_PER_MIN = int(os.getenv("GOMINING_API_REQ_PER_MIN", "120"))
 LEAGUES_API_POLL_SECONDS = int(os.getenv("LEAGUES_API_POLL_SECONDS", str(SHEET_REFRESH_SECONDS)))
 
 STABILIZATION_ROUNDS = int(os.getenv("STABILIZATION_ROUNDS", "2"))
@@ -96,6 +108,8 @@ POWER_UP_GMT_FACTOR = 0.0389
 CLAN_SHIELD_GMT_FACTOR = 0.000555
 CLAN_EXACT_MEMBER_COVERAGE_THRESHOLD = float(os.getenv("CLAN_EXACT_MEMBER_COVERAGE_THRESHOLD", "0.90"))
 CLAN_EXACT_POWER_COVERAGE_THRESHOLD = float(os.getenv("CLAN_EXACT_POWER_COVERAGE_THRESHOLD", "0.90"))
+CLAN_SNAPSHOT_MIN_COVERAGE = float(os.getenv("CLAN_SNAPSHOT_MIN_COVERAGE", "0.50"))
+CLAN_SNAPSHOT_FALLBACK_ROUND_WINDOW = int(os.getenv("CLAN_SNAPSHOT_FALLBACK_ROUND_WINDOW", "250"))
 
 BASE_HEADERS: List[str] = [
     "timestamp_utc",
@@ -390,6 +404,307 @@ def fetch_league_catalog_from_api() -> Dict[int, str]:
     except Exception as e:
         log_warn("league_api.failed", err=repr(e))
         return {}
+
+
+def _to_api_calculated_at(value: Any) -> str:
+    """
+    API expects RFC3339 UTC timestamp with millisecond precision and trailing Z.
+    """
+    raw = to_iso_utc(value) or utc_now_iso()
+    try:
+        s = str(raw).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def calc_team_th_and_pps_from_users(users: Sequence[Dict[str, Any]]) -> Tuple[float, float]:
+    team_th = 0.0
+    team_pps = 0.0
+    for user in users:
+        pwr = safe_float(user.get("power"))
+        ee = safe_float(user.get("ee"))
+        if pwr is None or pwr <= 0:
+            continue
+        team_th += pwr
+        if ee is None or ee <= 0:
+            continue
+        team_pps += PPS_FACTOR * pwr / ee
+    return team_th, team_pps
+
+
+class GoMiningClanApiClient:
+    def __init__(
+        self,
+        bearer_token: str,
+        limiter: TokenBucket,
+        leaderboard_url: str = CLAN_LEADERBOARD_API_URL,
+        clan_get_by_id_url: str = CLAN_GET_BY_ID_API_URL,
+        page_limit: int = CLAN_API_PAGE_LIMIT,
+        timeout_seconds: int = CLAN_API_TIMEOUT_SECONDS,
+        max_retries: int = CLAN_API_MAX_RETRIES,
+    ) -> None:
+        self.bearer_token = bearer_token.strip()
+        self.limiter = limiter
+        self.leaderboard_url = leaderboard_url
+        self.clan_get_by_id_url = clan_get_by_id_url
+        self.page_limit = max(1, min(50, int(page_limit)))
+        self.timeout_seconds = max(1, int(timeout_seconds))
+        self.max_retries = max(1, int(max_retries))
+        self.session = requests.Session()
+        self.headers = {
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "authorization": f"Bearer {self.bearer_token}",
+            "x-device-type": "desktop",
+            "origin": "https://app.gomining.com",
+            "referer": "https://app.gomining.com/",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        }
+
+    @staticmethod
+    def _extract_clan_meta(item: Any) -> Tuple[Optional[int], str]:
+        if not isinstance(item, dict):
+            return None, ""
+        cid = safe_int(item.get("clanId"))
+        if cid is None:
+            cid = safe_int(item.get("id"))
+        clan = item.get("clan")
+        name = ""
+        if isinstance(clan, dict):
+            name = str(clan.get("name") or "").strip()
+        if not name:
+            name = str(item.get("clanName") or item.get("name") or "").strip()
+        return cid, name
+
+    def _post_json_with_retry(self, url: str, payload: Dict[str, Any], op: str, **ctx: Any) -> Optional[Dict[str, Any]]:
+        delay_s = 0.6
+        for attempt in range(1, self.max_retries + 1):
+            self.limiter.wait_for_token(1.0)
+            try:
+                resp = self.session.post(url, headers=self.headers, json=payload, timeout=self.timeout_seconds)
+            except Exception as e:
+                if attempt >= self.max_retries:
+                    log_warn("gomining_api.request_failed", op=op, attempt=attempt, err=repr(e), **ctx)
+                    return None
+                sleep_s = delay_s + random.uniform(0.0, 0.2)
+                log_warn("gomining_api.request_retry", op=op, attempt=attempt, sleep_s=round(sleep_s, 3), err=repr(e), **ctx)
+                time.sleep(sleep_s)
+                delay_s = min(8.0, delay_s * 2.0)
+                continue
+
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        return data
+                    log_warn("gomining_api.invalid_json_type", op=op, attempt=attempt, typ=type(data).__name__, **ctx)
+                    return None
+                except Exception as e:
+                    log_warn("gomining_api.invalid_json", op=op, attempt=attempt, err=repr(e), **ctx)
+                    return None
+
+            retryable = resp.status_code in {429, 500, 502, 503, 504}
+            if retryable and attempt < self.max_retries:
+                retry_after = None
+                try:
+                    ra = resp.headers.get("Retry-After")
+                    if ra:
+                        retry_after = float(ra)
+                except Exception:
+                    retry_after = None
+                sleep_s = max(delay_s, retry_after or 0.0) + random.uniform(0.0, 0.2)
+                log_warn(
+                    "gomining_api.http_retry",
+                    op=op,
+                    attempt=attempt,
+                    status=resp.status_code,
+                    sleep_s=round(sleep_s, 3),
+                    **ctx,
+                )
+                time.sleep(sleep_s)
+                delay_s = min(8.0, delay_s * 2.0)
+                continue
+
+            log_warn(
+                "gomining_api.http_error",
+                op=op,
+                attempt=attempt,
+                status=resp.status_code,
+                body_preview=resp.text[:180],
+                **ctx,
+            )
+            return None
+        return None
+
+    def _fetch_leaderboard_clans(self, league_id: int, calculated_at: str) -> Optional[Dict[int, str]]:
+        clans: Dict[int, str] = {}
+        skip = 0
+        max_pages = 200
+        page_no = 0
+        while True:
+            payload = {
+                "calculatedAt": calculated_at,
+                "leagueId": league_id,
+                "pagination": {"skip": skip, "limit": self.page_limit},
+            }
+            body = self._post_json_with_retry(
+                self.leaderboard_url,
+                payload,
+                op="clan_leaderboard",
+                league_id=league_id,
+                skip=skip,
+            )
+            if body is None:
+                return None
+            data = body.get("data")
+            if not isinstance(data, dict):
+                log_warn("gomining_api.leaderboard_bad_shape", league_id=league_id, skip=skip)
+                return None
+
+            remaining = data.get("clansRemaining") or []
+            promoted = data.get("clansPromoted") or []
+            relegated = data.get("clansRelegated") or []
+            for group in (remaining, promoted, relegated):
+                if not isinstance(group, list):
+                    continue
+                for item in group:
+                    cid, name = self._extract_clan_meta(item)
+                    if cid is None:
+                        continue
+                    if name:
+                        clans[cid] = name
+                    else:
+                        clans.setdefault(cid, f"clan-{cid}")
+
+            total_count = safe_int(data.get("count"))
+            max_group_len = max(
+                len(remaining) if isinstance(remaining, list) else 0,
+                len(promoted) if isinstance(promoted, list) else 0,
+                len(relegated) if isinstance(relegated, list) else 0,
+            )
+            if total_count is not None and total_count >= 0:
+                if (skip + self.page_limit) >= total_count:
+                    break
+            elif max_group_len < self.page_limit:
+                break
+
+            skip += self.page_limit
+            page_no += 1
+            if page_no >= max_pages:
+                log_warn("gomining_api.leaderboard_pagination_guard", league_id=league_id, pages=page_no)
+                return None
+        return clans
+
+    def _fetch_clan_detail_all_pages(self, clan_id: int) -> Optional[Dict[str, Any]]:
+        skip = 0
+        users_all: List[Dict[str, Any]] = []
+        base: Optional[Dict[str, Any]] = None
+        max_pages = 400
+        page_no = 0
+        while True:
+            payload = {
+                "clanId": clan_id,
+                "pagination": {"limit": self.page_limit, "skip": skip, "count": 0},
+                "filters": {"filterType": "none"},
+                "sort": {"sortType": "none"},
+            }
+            body = self._post_json_with_retry(
+                self.clan_get_by_id_url,
+                payload,
+                op="clan_get_by_id",
+                clan_id=clan_id,
+                skip=skip,
+            )
+            if body is None:
+                return None
+            data = body.get("data")
+            if not isinstance(data, dict):
+                log_warn("gomining_api.clan_bad_shape", clan_id=clan_id, skip=skip)
+                return None
+
+            if base is None:
+                base = {k: v for k, v in data.items() if k != "usersForClient"}
+
+            chunk = data.get("usersForClient") or []
+            if isinstance(chunk, list):
+                for item in chunk:
+                    if isinstance(item, dict):
+                        users_all.append(item)
+            else:
+                chunk = []
+
+            users_count = safe_int(data.get("usersCount"))
+            chunk_len = len(chunk)
+            if chunk_len < self.page_limit:
+                break
+            if users_count is not None and users_count >= 0 and len(users_all) >= users_count:
+                break
+
+            skip += self.page_limit
+            page_no += 1
+            if page_no >= max_pages:
+                log_warn("gomining_api.clan_pagination_guard", clan_id=clan_id, pages=page_no)
+                return None
+
+        if base is None:
+            return None
+        base["usersForClient"] = users_all
+        expected_total = safe_int(base.get("usersCount"))
+        if expected_total is not None and expected_total > 0 and len(users_all) < expected_total:
+            log_warn("gomining_api.clan_incomplete", clan_id=clan_id, expected=expected_total, seen=len(users_all))
+            return None
+        return base
+
+    def fetch_clan_rows_for_round(
+        self,
+        league_id: int,
+        round_id: int,
+        calculated_at: str,
+        snapshot_ts: Optional[str] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        clan_names = self._fetch_leaderboard_clans(league_id, calculated_at)
+        if clan_names is None:
+            return None
+        rows: List[Dict[str, Any]] = []
+        snap_ts = snapshot_ts or utc_now_iso()
+        for clan_id in sorted(clan_names.keys()):
+            detail = self._fetch_clan_detail_all_pages(clan_id)
+            if detail is None:
+                return None
+            users_raw = detail.get("usersForClient") or []
+            users = [u for u in users_raw if isinstance(u, dict)] if isinstance(users_raw, list) else []
+            members_seen = len(users)
+            members_total = safe_int(detail.get("usersCount"))
+            if members_total is None or members_total <= 0:
+                members_total = members_seen
+            member_cov = (float(members_seen) / float(members_total)) if members_total > 0 else None
+            team_th, team_pps = calc_team_th_and_pps_from_users(users)
+            clan_name = str(detail.get("name") or clan_names.get(clan_id) or f"clan-{clan_id}")
+            rows.append(
+                {
+                    "round_id": round_id,
+                    "snapshot_round_id": round_id,
+                    "snapshot_ts": snap_ts,
+                    "clan_id": clan_id,
+                    "clan_name": clan_name,
+                    "members_total": members_total,
+                    "members_seen": members_seen,
+                    "member_coverage": member_cov,
+                    "team_th": team_th,
+                    "team_pps": team_pps,
+                    "clan_shield_gmt": calc_clan_shield_gmt(team_pps),
+                    "calc_mode": "api_exact",
+                }
+            )
+        rows.sort(key=lambda x: (-(safe_float(x.get("team_pps")) or 0.0), safe_int(x.get("clan_id")) or 0))
+        return rows
 
 
 def parse_row_range(updated_range: str) -> Optional[Tuple[int, int]]:
@@ -950,13 +1265,18 @@ class DBClient:
         round_ids: Sequence[int],
         min_member_coverage: float = CLAN_EXACT_MEMBER_COVERAGE_THRESHOLD,
         min_power_coverage: float = CLAN_EXACT_POWER_COVERAGE_THRESHOLD,
+        min_snapshot_coverage: float = CLAN_SNAPSHOT_MIN_COVERAGE,
+        fallback_round_window: int = CLAN_SNAPSHOT_FALLBACK_ROUND_WINDOW,
     ) -> Dict[int, List[Dict[str, Any]]]:
         if not round_ids:
             return {}
         ids = sorted({int(x) for x in round_ids})
         placeholders = ", ".join(["%s"] * len(ids))
+        round_window = max(0, int(fallback_round_window))
+        window_lo = min(ids) - round_window
+        window_hi = max(ids) + round_window
         sql = f"""
-        WITH links AS (
+        WITH base_links AS (
           SELECT
             l.round_id,
             l.player_snapshot_id,
@@ -965,13 +1285,86 @@ class DBClient:
           FROM gomining.round_player_snapshot_links l
           WHERE l.league_id = %s
             AND l.round_id IN ({placeholders})
+            AND l.player_snapshot_id IS NOT NULL
+        ),
+        candidate_links AS (
+          SELECT
+            l.round_id,
+            l.player_snapshot_id,
+            l.player_snapshot_round_id,
+            l.snapshot_calculated_at
+          FROM gomining.round_player_snapshot_links l
+          WHERE l.league_id = %s
+            AND l.round_id BETWEEN %s AND %s
+            AND l.player_snapshot_id IS NOT NULL
+        ),
+        candidate_snapshot_ids AS (
+          SELECT DISTINCT player_snapshot_id FROM candidate_links
+        ),
+        snapshot_quality AS (
+          SELECT
+            s.player_snapshot_id,
+            COALESCE(ct.members_total, 0)::numeric AS members_total,
+            COALESCE(pm.members_seen, 0)::numeric AS members_seen,
+            CASE
+              WHEN COALESCE(ct.members_total, 0) > 0
+                THEN COALESCE(pm.members_seen, 0)::numeric / ct.members_total
+              ELSE 0::numeric
+            END AS member_coverage
+          FROM candidate_snapshot_ids s
+          LEFT JOIN (
+            SELECT
+              t.player_snapshot_id,
+              SUM(COALESCE(t.member_count, 0))::numeric AS members_total
+            FROM gomining.player_snapshot_clan_totals t
+            WHERE t.player_snapshot_id IN (SELECT player_snapshot_id FROM candidate_snapshot_ids)
+            GROUP BY t.player_snapshot_id
+          ) ct ON ct.player_snapshot_id = s.player_snapshot_id
+          LEFT JOIN (
+            SELECT
+              m.player_snapshot_id,
+              COUNT(*)::numeric AS members_seen
+            FROM gomining.player_snapshot_memberships m
+            WHERE m.player_snapshot_id IN (SELECT player_snapshot_id FROM candidate_snapshot_ids)
+            GROUP BY m.player_snapshot_id
+          ) pm ON pm.player_snapshot_id = s.player_snapshot_id
+        ),
+        effective_links AS (
+          SELECT
+            b.round_id,
+            pick.player_snapshot_id,
+            pick.player_snapshot_round_id,
+            pick.snapshot_calculated_at
+          FROM base_links b
+          LEFT JOIN snapshot_quality bq
+            ON bq.player_snapshot_id = b.player_snapshot_id
+          JOIN LATERAL (
+            SELECT
+              c.player_snapshot_id,
+              c.player_snapshot_round_id,
+              c.snapshot_calculated_at
+            FROM candidate_links c
+            LEFT JOIN snapshot_quality q
+              ON q.player_snapshot_id = c.player_snapshot_id
+            ORDER BY
+              CASE
+                WHEN COALESCE(bq.member_coverage, 0) >= %s
+                  THEN CASE WHEN c.player_snapshot_id = b.player_snapshot_id THEN 0 ELSE 1 END
+                ELSE
+                  CASE WHEN COALESCE(q.member_coverage, 0) >= %s THEN 0 ELSE 1 END
+              END,
+              ABS(c.round_id - b.round_id),
+              CASE WHEN c.player_snapshot_id = b.player_snapshot_id THEN 0 ELSE 1 END,
+              c.snapshot_calculated_at DESC
+            LIMIT 1
+          ) pick ON TRUE
         ),
         round_meta AS (
           SELECT
             round_id,
             MAX(player_snapshot_round_id) AS snapshot_round_id,
             MAX(snapshot_calculated_at) AS snapshot_ts
-          FROM links
+          FROM effective_links
           GROUP BY round_id
         ),
         eff AS (
@@ -989,7 +1382,7 @@ class DBClient:
             t.clan_id,
             SUM(COALESCE(t.member_count, 0))::numeric AS members_total,
             SUM(COALESCE(t.total_nft_power, 0))::numeric AS team_th
-          FROM links l
+          FROM effective_links l
           JOIN gomining.player_snapshot_clan_totals t
             ON t.player_snapshot_id = l.player_snapshot_id
           GROUP BY l.round_id, t.clan_id
@@ -1009,7 +1402,7 @@ class DBClient:
                 ELSE 0
               END
             )::numeric AS sum_th_over_w
-          FROM links l
+          FROM effective_links l
           JOIN gomining.player_snapshot_memberships m
             ON m.player_snapshot_id = l.player_snapshot_id
           GROUP BY l.round_id, m.clan_id
@@ -1075,7 +1468,14 @@ class DBClient:
         LEFT JOIN cn ON cn.snapshot_round_id = rm.snapshot_round_id AND cn.clan_id = ct.clan_id
         ORDER BY ct.round_id ASC, team_pps DESC NULLS LAST, ct.clan_id ASC
         """
-        params: List[Any] = [league_id] + ids + [league_id] + ids + [league_id]
+        params: List[Any] = (
+            [league_id]
+            + ids
+            + [league_id, window_lo, window_hi, min_snapshot_coverage, min_snapshot_coverage]
+            + [league_id]
+            + ids
+            + [league_id]
+        )
         params.extend(
             [
                 min_member_coverage,
@@ -2385,6 +2785,7 @@ def enqueue_clan_sheet_ops(
     db: DBClient,
     state: StateStore,
     clan_contexts: Dict[int, SheetContext],
+    clan_api: GoMiningClanApiClient,
 ) -> int:
     enqueued = 0
     for ws_id, ctx in clan_contexts.items():
@@ -2419,12 +2820,6 @@ def enqueue_clan_sheet_ops(
             continue
 
         row_maps = state.get_round_row_map_bulk(ws_id, round_ids)
-        clan_rows_by_round = db.fetch_clan_shield_rows_for_rounds(
-            ctx.league_id,
-            round_ids,
-            min_member_coverage=CLAN_EXACT_MEMBER_COVERAGE_THRESHOLD,
-            min_power_coverage=CLAN_EXACT_POWER_COVERAGE_THRESHOLD,
-        )
 
         for rec in rounds_sorted:
             rid = safe_int(rec.get("round_id"))
@@ -2436,11 +2831,37 @@ def enqueue_clan_sheet_ops(
                     log_debug("sync.clan_round_skip_existing", sheet=ctx.title, round_id=rid, row_idx=mapped.get("row_idx"))
                 continue
 
-            clan_rows = clan_rows_by_round.get(rid) or []
+            round_ts = to_iso_utc(rec.get("snapshot_ts")) or to_iso_utc(rec.get("ended_at")) or utc_now_iso()
+            calculated_at = _to_api_calculated_at(rec.get("ended_at") or rec.get("snapshot_ts"))
+            clan_rows = clan_api.fetch_clan_rows_for_round(
+                ctx.league_id,
+                rid,
+                calculated_at=calculated_at,
+                snapshot_ts=round_ts,
+            )
+            if clan_rows is None:
+                log_warn(
+                    "sync.clan_round_api_incomplete",
+                    sheet=ctx.title,
+                    ws_id=ws_id,
+                    round_id=rid,
+                    league_id=ctx.league_id,
+                    calculated_at=calculated_at,
+                )
+                # Block sequentially: do not enqueue this or newer rounds for this league.
+                break
+
             if not clan_rows:
-                state.set_last_synced_round(ws_id, rid)
-                log_warn("sync.clan_round_no_rows", sheet=ctx.title, round_id=rid, league_id=ctx.league_id)
-                continue
+                log_warn(
+                    "sync.clan_round_api_empty",
+                    sheet=ctx.title,
+                    ws_id=ws_id,
+                    round_id=rid,
+                    league_id=ctx.league_id,
+                    calculated_at=calculated_at,
+                )
+                # Treat empty API data as incomplete to preserve strict round gating.
+                break
 
             rows = build_clan_round_rows(rec, clan_rows)
             checksum = row_checksum(rows)  # type: ignore[arg-type]
@@ -2490,6 +2911,18 @@ def main() -> None:
         state = StateStore(STATE_DB_PATH)
         write_limiter = TokenBucket(GS_WRITE_REQ_PER_MIN, name="sheets_write")
         read_limiter = TokenBucket(GS_READ_REQ_PER_MIN, name="sheets_read")
+        gomining_limiter = TokenBucket(GOMINING_API_REQ_PER_MIN, name="gomining_api")
+        if not GOMINING_BEARER_TOKEN.strip():
+            raise RuntimeError("GOMINING_BEARER_TOKEN is required for API-first clan CPU pricing sync.")
+        clan_api = GoMiningClanApiClient(
+            GOMINING_BEARER_TOKEN.strip(),
+            limiter=gomining_limiter,
+            leaderboard_url=CLAN_LEADERBOARD_API_URL,
+            clan_get_by_id_url=CLAN_GET_BY_ID_API_URL,
+            page_limit=CLAN_API_PAGE_LIMIT,
+            timeout_seconds=CLAN_API_TIMEOUT_SECONDS,
+            max_retries=CLAN_API_MAX_RETRIES,
+        )
 
         sh = open_spreadsheet()
         main_contexts, clan_contexts = refresh_sheet_contexts(
@@ -2520,6 +2953,10 @@ def main() -> None:
             auto_expand_rows=AUTO_EXPAND_SHEET_ROWS,
             drop_non_retryable=DROP_NON_RETRYABLE_SHEET_ERRORS,
             purge_missing_sheet_ops=PURGE_QUEUE_FOR_MISSING_SHEETS,
+            gomining_api_req_per_min=GOMINING_API_REQ_PER_MIN,
+            clan_api_page_limit=CLAN_API_PAGE_LIMIT,
+            clan_api_timeout_s=CLAN_API_TIMEOUT_SECONDS,
+            clan_api_max_retries=CLAN_API_MAX_RETRIES,
             dry_run=DRY_RUN,
             log_level=LOG_LEVEL,
             debug_verbose=DEBUG_VERBOSE,
@@ -2582,7 +3019,7 @@ def main() -> None:
 
             if now - last_poll >= SYNC_POLL_SECONDS:
                 enq_main = enqueue_main_sheet_ops(db, state, main_contexts, ability_id_to_name, ability_headers)
-                enq_clan = enqueue_clan_sheet_ops(db, state, clan_contexts)
+                enq_clan = enqueue_clan_sheet_ops(db, state, clan_contexts, clan_api)
                 enq = enq_main + enq_clan
                 last_poll = now
                 if enq > 0:
@@ -2610,6 +3047,7 @@ def main() -> None:
                     clan_contexts=len(clan_contexts),
                     write_limiter=write_limiter.snapshot(),
                     read_limiter=read_limiter.snapshot(),
+                    gomining_limiter=gomining_limiter.snapshot(),
                 )
                 last_heartbeat = now
 
