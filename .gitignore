@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Local secrets and service credentials
+.env
+service_acc.json
+abc.json
+
+# Runtime artifacts
+sync_debug.log
+sync_state.sqlite
+sync.lock
+
