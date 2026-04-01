@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import requests
 
 try:
@@ -73,6 +73,11 @@ CLAN_API_PAGE_LIMIT = max(1, min(50, int(os.getenv("CLAN_API_PAGE_LIMIT", "50"))
 CLAN_API_TIMEOUT_SECONDS = int(os.getenv("CLAN_API_TIMEOUT_SECONDS", "45"))
 CLAN_API_MAX_RETRIES = max(1, int(os.getenv("CLAN_API_MAX_RETRIES", "4")))
 GOMINING_API_REQ_PER_MIN = int(os.getenv("GOMINING_API_REQ_PER_MIN", "120"))
+TOKEN_URL = os.getenv("TOKEN_URL", "").strip()
+TOKEN_X_AUTH = os.getenv("TOKEN_X_AUTH", "").strip()
+TOKEN_METHOD = os.getenv("TOKEN_METHOD", "GET").strip().upper()
+TOKEN_TIMEOUT_SECONDS = max(1, int(os.getenv("TOKEN_TIMEOUT_SECONDS", "20")))
+TOKEN_VERIFY_SSL = os.getenv("TOKEN_VERIFY_SSL", "1").strip() in {"1", "true", "TRUE", "yes", "YES"}
 LEAGUES_API_POLL_SECONDS = int(os.getenv("LEAGUES_API_POLL_SECONDS", str(SHEET_REFRESH_SECONDS)))
 
 STABILIZATION_ROUNDS = int(os.getenv("STABILIZATION_ROUNDS", "2"))
@@ -383,13 +388,88 @@ def parse_league_index_response(payload: Dict[str, Any]) -> Dict[int, str]:
     return out
 
 
-def fetch_league_catalog_from_api() -> Dict[int, str]:
-    if not GOMINING_BEARER_TOKEN.strip():
+def _extract_token_candidate(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        for k in ("token", "access_token", "bearer", "jwt"):
+            if k in value:
+                out = _extract_token_candidate(value.get(k))
+                if out:
+                    return out
+        nested = value.get("data")
+        if nested is not None:
+            out = _extract_token_candidate(nested)
+            if out:
+                return out
+        return None
+    if isinstance(value, list):
+        for item in value:
+            out = _extract_token_candidate(item)
+            if out:
+                return out
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if s.lower().startswith("bearer "):
+        s = s[7:].strip()
+    return s or None
+
+
+def fetch_bearer_token_from_auth_api() -> Optional[str]:
+    if not TOKEN_URL or not TOKEN_X_AUTH:
+        return None
+    method = TOKEN_METHOD if TOKEN_METHOD in {"GET", "POST"} else "GET"
+    headers = {
+        "x-auth": TOKEN_X_AUTH,
+        "accept": "application/json, text/plain, */*",
+    }
+    try:
+        if method == "POST":
+            resp = requests.post(
+                TOKEN_URL,
+                headers=headers,
+                json={},
+                timeout=TOKEN_TIMEOUT_SECONDS,
+                verify=TOKEN_VERIFY_SSL,
+            )
+        else:
+            resp = requests.get(
+                TOKEN_URL,
+                headers=headers,
+                timeout=TOKEN_TIMEOUT_SECONDS,
+                verify=TOKEN_VERIFY_SSL,
+            )
+    except Exception as e:
+        log_warn("token_api.request_failed", url=TOKEN_URL, method=method, err=repr(e))
+        return None
+
+    if resp.status_code != 200:
+        log_warn("token_api.http_error", url=TOKEN_URL, method=method, status=resp.status_code, body_preview=resp.text[:180])
+        return None
+
+    token: Optional[str] = None
+    try:
+        token = _extract_token_candidate(resp.json())
+    except Exception:
+        token = _extract_token_candidate(resp.text)
+
+    if not token:
+        log_warn("token_api.token_missing", url=TOKEN_URL, method=method, body_preview=resp.text[:180])
+        return None
+    log_info("token_api.ok", url=TOKEN_URL, method=method)
+    return token
+
+
+def fetch_league_catalog_from_api(bearer_token: Optional[str] = None) -> Dict[int, str]:
+    token = str(bearer_token or GOMINING_BEARER_TOKEN).strip()
+    if not token:
         return {}
     headers = {
         "accept": "application/json, text/plain, */*",
         "content-type": "application/json",
-        "authorization": f"Bearer {GOMINING_BEARER_TOKEN.strip()}",
+        "authorization": f"Bearer {token}",
         "x-device-type": "desktop",
     }
     payload = {"calculatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00.000Z")}
@@ -448,8 +528,10 @@ class GoMiningClanApiClient:
         page_limit: int = CLAN_API_PAGE_LIMIT,
         timeout_seconds: int = CLAN_API_TIMEOUT_SECONDS,
         max_retries: int = CLAN_API_MAX_RETRIES,
+        token_fetcher: Optional[Callable[[], Optional[str]]] = None,
     ) -> None:
         self.bearer_token = bearer_token.strip()
+        self.token_fetcher = token_fetcher
         self.limiter = limiter
         self.leaderboard_url = leaderboard_url
         self.clan_get_by_id_url = clan_get_by_id_url
@@ -460,13 +542,29 @@ class GoMiningClanApiClient:
         self.headers = {
             "accept": "application/json, text/plain, */*",
             "content-type": "application/json",
-            "authorization": f"Bearer {self.bearer_token}",
             "x-device-type": "desktop",
             "origin": "https://app.gomining.com",
             "referer": "https://app.gomining.com/",
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         }
+        if self.bearer_token:
+            self._set_bearer(self.bearer_token)
+
+    def _set_bearer(self, token: str) -> None:
+        self.bearer_token = token.strip()
+        self.headers["authorization"] = f"Bearer {self.bearer_token}"
+
+    def _refresh_bearer(self, force: bool = False) -> bool:
+        if not self.token_fetcher:
+            return bool(self.bearer_token)
+        if self.bearer_token and not force:
+            return True
+        tok = (self.token_fetcher() or "").strip()
+        if not tok:
+            return bool(self.bearer_token)
+        self._set_bearer(tok)
+        return True
 
     @staticmethod
     def _extract_clan_meta(item: Any) -> Tuple[Optional[int], str]:
@@ -484,6 +582,7 @@ class GoMiningClanApiClient:
         return cid, name
 
     def _post_json_with_retry(self, url: str, payload: Dict[str, Any], op: str, **ctx: Any) -> Optional[Dict[str, Any]]:
+        self._refresh_bearer(force=False)
         delay_s = 0.6
         for attempt in range(1, self.max_retries + 1):
             self.limiter.wait_for_token(1.0)
@@ -509,6 +608,13 @@ class GoMiningClanApiClient:
                 except Exception as e:
                     log_warn("gomining_api.invalid_json", op=op, attempt=attempt, err=repr(e), **ctx)
                     return None
+
+            if resp.status_code == 401:
+                if attempt < self.max_retries and self._refresh_bearer(force=True):
+                    log_warn("gomining_api.http_unauthorized_retry", op=op, attempt=attempt, **ctx)
+                    continue
+                log_warn("gomining_api.http_unauthorized", op=op, attempt=attempt, **ctx)
+                return None
 
             retryable = resp.status_code in {429, 500, 502, 503, 504}
             if retryable and attempt < self.max_retries:
@@ -2912,16 +3018,28 @@ def main() -> None:
         write_limiter = TokenBucket(GS_WRITE_REQ_PER_MIN, name="sheets_write")
         read_limiter = TokenBucket(GS_READ_REQ_PER_MIN, name="sheets_read")
         gomining_limiter = TokenBucket(GOMINING_API_REQ_PER_MIN, name="gomining_api")
-        if not GOMINING_BEARER_TOKEN.strip():
-            raise RuntimeError("GOMINING_BEARER_TOKEN is required for API-first clan CPU pricing sync.")
+        token_fetcher: Optional[Callable[[], Optional[str]]] = None
+        effective_bearer = GOMINING_BEARER_TOKEN.strip()
+        if TOKEN_URL and TOKEN_X_AUTH:
+            token_fetcher = fetch_bearer_token_from_auth_api
+            fetched = (token_fetcher() or "").strip()
+            if fetched:
+                effective_bearer = fetched
+            elif not effective_bearer:
+                raise RuntimeError("Failed to fetch bearer token from TOKEN_URL and no GOMINING_BEARER_TOKEN fallback is set.")
+            else:
+                log_warn("token_api.startup_failed_using_fallback", token_url=TOKEN_URL)
+        if not effective_bearer:
+            raise RuntimeError("GOMINING_BEARER_TOKEN is required when TOKEN_URL/TOKEN_X_AUTH is not configured.")
         clan_api = GoMiningClanApiClient(
-            GOMINING_BEARER_TOKEN.strip(),
+            effective_bearer,
             limiter=gomining_limiter,
             leaderboard_url=CLAN_LEADERBOARD_API_URL,
             clan_get_by_id_url=CLAN_GET_BY_ID_API_URL,
             page_limit=CLAN_API_PAGE_LIMIT,
             timeout_seconds=CLAN_API_TIMEOUT_SECONDS,
             max_retries=CLAN_API_MAX_RETRIES,
+            token_fetcher=token_fetcher,
         )
 
         sh = open_spreadsheet()
@@ -2935,7 +3053,7 @@ def main() -> None:
         )
         contexts_all = {**main_contexts, **clan_contexts}
         purge_stale_queue_ops(state, contexts_all)
-        api_leagues = fetch_league_catalog_from_api()
+        api_leagues = fetch_league_catalog_from_api(clan_api.bearer_token)
 
         log_info(
             "sync.spreadsheet_opened",
@@ -2957,6 +3075,9 @@ def main() -> None:
             clan_api_page_limit=CLAN_API_PAGE_LIMIT,
             clan_api_timeout_s=CLAN_API_TIMEOUT_SECONDS,
             clan_api_max_retries=CLAN_API_MAX_RETRIES,
+            token_url_set=bool(TOKEN_URL),
+            token_method=(TOKEN_METHOD if TOKEN_METHOD in {"GET", "POST"} else "GET"),
+            token_verify_ssl=TOKEN_VERIFY_SSL,
             dry_run=DRY_RUN,
             log_level=LOG_LEVEL,
             debug_verbose=DEBUG_VERBOSE,
@@ -3002,7 +3123,7 @@ def main() -> None:
                 log_info("sync.sheet_refresh_done", active_main=len(main_contexts), active_clan=len(clan_contexts))
 
             if now - last_league_api_poll >= LEAGUES_API_POLL_SECONDS:
-                api_leagues = fetch_league_catalog_from_api()
+                api_leagues = fetch_league_catalog_from_api(clan_api.bearer_token)
                 last_league_api_poll = now
                 if api_leagues:
                     configured = {ctx.league_id for ctx in main_contexts.values()}

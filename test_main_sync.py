@@ -116,6 +116,13 @@ class SyncCoreTests(unittest.TestCase):
         out = main._to_api_calculated_at("2026-03-31T12:34:56+00:00")
         self.assertEqual(out, "2026-03-31T12:34:56.000Z")
 
+    def test_extract_token_candidate_variants(self) -> None:
+        self.assertEqual(main._extract_token_candidate({"token": "abc"}), "abc")
+        self.assertEqual(main._extract_token_candidate({"data": {"access_token": "xyz"}}), "xyz")
+        self.assertEqual(main._extract_token_candidate("Bearer qwe"), "qwe")
+        self.assertEqual(main._extract_token_candidate([None, {"jwt": "j1.j2.j3"}]), "j1.j2.j3")
+        self.assertIsNone(main._extract_token_candidate({"data": {}}))
+
     def test_clan_api_client_pagination_merge(self) -> None:
         class StubClient(main.GoMiningClanApiClient):
             def __init__(self) -> None:
