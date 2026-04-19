@@ -1,10 +1,11 @@
 import os
 import json
 import tempfile
+import time
 import unittest
 from typing import Any, Dict, List
 
-import backfill_round_gap as backfill
+import backfill_round_gap
 import main
 
 
@@ -227,6 +228,54 @@ class SyncCoreTests(unittest.TestCase):
         self.assertEqual(rec["round_id"], 1000)
         self.assertEqual(rec["blocks_mined"], 200)
         self.assertAlmostEqual(rec["gmt_per_block"], 0.5)
+
+    def test_round_metrics_by_round_id_fetches_full_triplet(self) -> None:
+        client = main.GoMiningRoundMetricsApiClient(
+            bearer_token="token",
+            limiter=main.TokenBucket(9999, name="test"),
+            max_retries=1,
+        )
+        calls: List[Dict[str, Any]] = []
+
+        def fake_request(
+            method: str,
+            url: str,
+            *,
+            params: Dict[str, Any] | None = None,
+            json_payload: Dict[str, Any] | None = None,
+            op: str,
+            **ctx: Any,
+        ) -> Dict[str, Any] | None:
+            calls.append({"method": method, "url": url, "params": params, "json_payload": json_payload, "op": op, "ctx": ctx})
+            if op == "round_clan_leaderboard_by_round":
+                rid = (json_payload or {}).get("roundId")
+                return {
+                    "data": {
+                        "roundId": rid,
+                        "leagueId": 1,
+                        "blockNumber": 945700,
+                        "multiplier": 2.0,
+                        "endedAt": "2026-04-18T11:00:00.000Z",
+                        "roundTime": 60,
+                        "active": False,
+                    }
+                }
+            if op == "user_leaderboard_index":
+                return {"data": {"gmtFund": 300.0, "totalMinedBlocks": 30}}
+            if op == "clan_leaderboard_index_v2":
+                return {"data": {"totalMinedBlocks": 30, "totalPower": 900.0, "weightedEnergyEfficiencyPerTh": 19.0}}
+            return None
+
+        client._request_json_with_retry = fake_request  # type: ignore[method-assign]
+        rec = client.fetch_round_metrics_by_round_id(league_id=1, round_id=7777)
+        self.assertIsInstance(rec, dict)
+        assert rec is not None
+        self.assertEqual([c["op"] for c in calls], ["round_clan_leaderboard_by_round", "user_leaderboard_index", "clan_leaderboard_index_v2"])
+        self.assertEqual(calls[0]["json_payload"]["roundId"], 7777)
+        self.assertEqual(rec["round_id"], 7777)
+        self.assertEqual(rec["league_id"], 1)
+        self.assertEqual(rec["blocks_mined"], 30)
+        self.assertAlmostEqual(rec["gmt_per_block"], 10.0)
 
     def test_round_metrics_triplet_mismatch_post_probe_resolves(self) -> None:
         client = main.GoMiningRoundMetricsApiClient(
@@ -1307,7 +1356,33 @@ class SyncCoreTests(unittest.TestCase):
         self.assertEqual(fake_session.calls[0].get("auth"), "Bearer old-token")
         self.assertEqual(fake_session.calls[1].get("auth"), "Bearer new-token")
 
-    def test_enqueue_main_sheet_ops_blocks_on_round_api_failure(self) -> None:
+    def test_shared_token_refresh_reused_across_clients(self) -> None:
+        refresh_calls: List[int] = []
+
+        def token_fetcher() -> str:
+            refresh_calls.append(1)
+            return "shared-new-token"
+
+        round_client = main.GoMiningRoundMetricsApiClient(
+            bearer_token="old-round",
+            limiter=main.TokenBucket(9999, name="test"),
+            max_retries=1,
+            token_fetcher=token_fetcher,
+        )
+        ability_client = main.GoMiningRoundAbilityApiClient(
+            bearer_token="old-ability",
+            limiter=main.TokenBucket(9999, name="test"),
+            max_retries=1,
+            token_fetcher=token_fetcher,
+        )
+
+        self.assertTrue(round_client._refresh_bearer(force=True))
+        self.assertTrue(ability_client._refresh_bearer(force=True))
+        self.assertEqual(len(refresh_calls), 1)
+        self.assertEqual(round_client.headers.get("authorization"), "Bearer shared-new-token")
+        self.assertEqual(ability_client.headers.get("authorization"), "Bearer shared-new-token")
+
+    def test_enqueue_main_sheet_ops_continues_on_round_api_failure(self) -> None:
         class FakeRoundAPI:
             def __init__(self) -> None:
                 self.calls: List[int] = []
@@ -1325,71 +1400,7 @@ class SyncCoreTests(unittest.TestCase):
 
         fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
         os.close(fd)
-        orig_hybrid = main.ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR
         try:
-            main.ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR = False
-            st = main.StateStore(path)
-            st.upsert_sheet_meta(11, "tab-main", 1)
-            st.set_last_synced_round(11, 100)
-            st.set_price_cutover_round(11, 100)
-            self._seed_api_rounds(
-                st,
-                [
-                    {"round_id": 101, "league_id": 1, "snapshot_ts": "2026-04-01T22:00:00+00:00"},
-                    {"round_id": 102, "league_id": 1, "snapshot_ts": "2026-04-01T22:02:00+00:00"},
-                ],
-            )
-            ctx = main.SheetContext(
-                ws_id=11,
-                title="tab-main",
-                ws=None,
-                league_id=1,
-                kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 6,
-                round_col_idx=6,
-            )
-            fake_round_api = FakeRoundAPI()
-            enq = main.enqueue_main_sheet_ops(
-                None,
-                st,
-                {11: ctx},
-                {"a1": "Power Up Boost"},
-                ["Power Up Boost"],
-                fake_round_api,  # type: ignore[arg-type]
-            )
-            self.assertEqual(enq, 0)
-            self.assertEqual(st.queue_total_count(), 0)
-            self.assertEqual(fake_round_api.calls, [101])
-            st.close()
-        finally:
-            main.ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR = orig_hybrid
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-
-    def test_enqueue_main_sheet_ops_hybrid_continues_after_round_api_failure(self) -> None:
-        class FakeRoundAPI:
-            def __init__(self) -> None:
-                self.calls: List[int] = []
-
-            def fetch_round_ability_counts(
-                self,
-                round_id: int,
-                expected_league_id: int | None = None,
-                progress_hook: Any | None = None,
-            ) -> Dict[str, int] | None:
-                _ = (expected_league_id, progress_hook)
-                self.calls.append(round_id)
-                if round_id == 101:
-                    return None
-                return {"a1": 1}
-
-        fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
-        os.close(fd)
-        orig_hybrid = main.ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR
-        try:
-            main.ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR = True
             st = main.StateStore(path)
             st.upsert_sheet_meta(11, "tab-main", 1)
             st.set_last_synced_round(11, 100)
@@ -1420,180 +1431,51 @@ class SyncCoreTests(unittest.TestCase):
                 fake_round_api,  # type: ignore[arg-type]
             )
             self.assertEqual(enq, 1)
+            self.assertEqual(st.queue_total_count(), 1)
             self.assertEqual(fake_round_api.calls, [101, 102])
-            due = st.fetch_due_ops(limit=10)
-            self.assertEqual(len(due), 1)
-            self.assertEqual(due[0]["round_id"], 102)
+            state_101 = st.get_round_processing_state(1, 101) or {}
+            self.assertEqual(state_101.get("abilities_status"), "failed")
             st.close()
         finally:
-            main.ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR = orig_hybrid
             try:
                 os.remove(path)
             except OSError:
                 pass
 
-    def test_state_advance_last_synced_round_contiguous(self) -> None:
+    def test_round_processing_state_upsert_and_retry_listing(self) -> None:
         fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
         os.close(fd)
         try:
             st = main.StateStore(path)
-            st.upsert_sheet_meta(11, "tab-main", 1)
-            st.set_last_synced_round(11, 100)
-            st.upsert_row_map(11, 102, 10, "x102", 1)
-            st.upsert_row_map(11, 103, 11, "x103", 1)
-            advanced = st.advance_last_synced_round_contiguous(11)
-            self.assertEqual(advanced, 100)
-            self.assertEqual(st.get_last_synced_round(11), 100)
-            st.upsert_row_map(11, 101, 9, "x101", 1)
-            advanced = st.advance_last_synced_round_contiguous(11)
-            self.assertEqual(advanced, 103)
-            self.assertEqual(st.get_last_synced_round(11), 103)
+            now = time.time()
+            st.upsert_round_processing_state(
+                3,
+                900001,
+                metrics_status="ok",
+                abilities_status="failed",
+                sheet_status="pending",
+                retry_after_ts=now - 1,
+                attempt_count=2,
+            )
+            st.upsert_round_processing_state(
+                3,
+                900002,
+                metrics_status="ok",
+                abilities_status="pending",
+                sheet_status="pending",
+                retry_after_ts=now + 999,
+                attempt_count=1,
+            )
+            rows = st.list_retryable_round_states(3, limit=10)
+            round_ids = [int(r.get("round_id")) for r in rows]
+            self.assertIn(900001, round_ids)
+            self.assertNotIn(900002, round_ids)
             st.close()
         finally:
             try:
                 os.remove(path)
             except OSError:
                 pass
-
-    def test_flush_queue_advances_last_synced_only_when_contiguous(self) -> None:
-        class FakeWorksheet:
-            def __init__(self) -> None:
-                self.row_count = 100
-                self.writes: List[Dict[str, Any]] = []
-
-            def update(self, range_name: str, values: List[List[Any]], value_input_option: str = "RAW") -> None:
-                self.writes.append({"range_name": range_name, "values": values, "value_input_option": value_input_option})
-
-            def add_rows(self, n: int) -> None:
-                self.row_count += int(n)
-
-        fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
-        os.close(fd)
-        try:
-            st = main.StateStore(path)
-            st.upsert_sheet_meta(11, "tab-main", 1)
-            st.set_last_synced_round(11, 100)
-            ws = FakeWorksheet()
-            ctx = main.SheetContext(
-                ws_id=11,
-                title="tab-main",
-                ws=ws,
-                league_id=1,
-                kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 6,
-                round_col_idx=6,
-            )
-            row_102 = [""] * ctx.expected_cols
-            checksum_102 = main.row_checksum(row_102)
-            st.enqueue_op(
-                11,
-                "update_round",
-                102,
-                checksum_102,
-                {"row_idx": 6, "row": row_102, "finalized": 1},
-            )
-            processed = main.flush_sheet_queue_with_rate_limit(
-                st,
-                {11: ctx},
-                main.TokenBucket(9999, name="test_write"),
-            )
-            self.assertEqual(processed, 1)
-            self.assertEqual(st.get_last_synced_round(11), 100)
-
-            row_101 = [""] * ctx.expected_cols
-            checksum_101 = main.row_checksum(row_101)
-            st.enqueue_op(
-                11,
-                "update_round",
-                101,
-                checksum_101,
-                {"row_idx": 5, "row": row_101, "finalized": 1},
-            )
-            processed = main.flush_sheet_queue_with_rate_limit(
-                st,
-                {11: ctx},
-                main.TokenBucket(9999, name="test_write"),
-            )
-            self.assertEqual(processed, 1)
-            self.assertEqual(st.get_last_synced_round(11), 102)
-            st.close()
-        finally:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-
-    def test_round_ability_api_503_retry_uses_extended_budget_and_adaptive_throttle(self) -> None:
-        class FakeResponse:
-            def __init__(self, status_code: int, body: Dict[str, Any]) -> None:
-                self.status_code = status_code
-                self._body = body
-                self.text = json.dumps(body)
-                self.headers: Dict[str, str] = {}
-
-            def json(self) -> Dict[str, Any]:
-                return self._body
-
-        class FakeSession:
-            def __init__(self) -> None:
-                self.calls: List[int] = []
-
-            def post(self, url: str, headers: Dict[str, str], json: Dict[str, Any], timeout: int) -> FakeResponse:
-                _ = (url, headers, json, timeout)
-                self.calls.append(1)
-                if len(self.calls) < 3:
-                    return FakeResponse(503, {"statusCode": 503, "message": "Service unavailable"})
-                return FakeResponse(200, {"data": {"ok": True}})
-
-        orig_503_retries = main.ROUND_USER_503_MAX_RETRIES
-        orig_backoff_max = main.ROUND_USER_BACKOFF_MAX_SECONDS
-        orig_adaptive_min = main.ROUND_USER_ADAPTIVE_MIN_RPM
-        orig_sleep = main.time.sleep
-        orig_uniform = main.random.uniform
-        orig_log_warn = main.log_warn
-        orig_log_info = main.log_info
-        warn_events: List[str] = []
-        info_events: List[str] = []
-        sleep_calls: List[float] = []
-        try:
-            main.ROUND_USER_503_MAX_RETRIES = 4
-            main.ROUND_USER_BACKOFF_MAX_SECONDS = 1.5
-            main.ROUND_USER_ADAPTIVE_MIN_RPM = 30.0
-            main.time.sleep = lambda x: sleep_calls.append(float(x))  # type: ignore[assignment]
-            main.random.uniform = lambda _a, _b: 0.0  # type: ignore[assignment]
-
-            def fake_log_warn(msg: str, **fields: Any) -> None:
-                _ = fields
-                warn_events.append(msg)
-
-            def fake_log_info(msg: str, **fields: Any) -> None:
-                _ = fields
-                info_events.append(msg)
-
-            main.log_warn = fake_log_warn  # type: ignore[assignment]
-            main.log_info = fake_log_info  # type: ignore[assignment]
-
-            client = main.GoMiningRoundAbilityApiClient(
-                bearer_token="token",
-                limiter=main.TokenBucket(9999, name="test"),
-                max_retries=1,
-            )
-            fake_session = FakeSession()
-            client.session = fake_session  # type: ignore[assignment]
-            body = client._post_json_with_retry({"roundId": 901204}, round_id=901204, skip=0)
-            self.assertEqual(body, {"data": {"ok": True}})
-            self.assertEqual(len(fake_session.calls), 3)
-            self.assertIn("gomining_api.round_user_adaptive_throttle_enter", warn_events)
-            self.assertIn("gomining_api.round_user_adaptive_throttle_exit", info_events)
-            self.assertGreaterEqual(len(sleep_calls), 2)
-        finally:
-            main.ROUND_USER_503_MAX_RETRIES = orig_503_retries
-            main.ROUND_USER_BACKOFF_MAX_SECONDS = orig_backoff_max
-            main.ROUND_USER_ADAPTIVE_MIN_RPM = orig_adaptive_min
-            main.time.sleep = orig_sleep  # type: ignore[assignment]
-            main.random.uniform = orig_uniform  # type: ignore[assignment]
-            main.log_warn = orig_log_warn  # type: ignore[assignment]
-            main.log_info = orig_log_info  # type: ignore[assignment]
 
     def test_enqueue_main_sheet_ops_updates_when_abilities_arrive(self) -> None:
         rec = {
@@ -2146,6 +2028,62 @@ class SyncCoreTests(unittest.TestCase):
             except OSError:
                 pass
 
+    def test_single_instance_lock_removes_stale_lock_file(self) -> None:
+        fd, path = tempfile.mkstemp(prefix="sync_lock_", suffix=".lock")
+        os.close(fd)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("pid=123456 ts=2026-04-18T00:00:00+00:00\n")
+
+        orig_is_pid_running = main._is_pid_running
+        try:
+            main._is_pid_running = lambda pid: False  # type: ignore[assignment]
+            lock = main.SingleInstanceLock(path)
+            lock.acquire()
+            self.assertTrue(lock.acquired)
+            with open(path, "r", encoding="utf-8") as f:
+                txt = f.read()
+            self.assertIn(f"pid={os.getpid()}", txt)
+            lock.release()
+            self.assertFalse(os.path.exists(path))
+        finally:
+            main._is_pid_running = orig_is_pid_running  # type: ignore[assignment]
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def test_single_instance_lock_keeps_live_lock_file(self) -> None:
+        fd, path = tempfile.mkstemp(prefix="sync_lock_", suffix=".lock")
+        os.close(fd)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("pid=123456 ts=2026-04-18T00:00:00+00:00\n")
+
+        orig_is_pid_running = main._is_pid_running
+        try:
+            main._is_pid_running = lambda pid: True  # type: ignore[assignment]
+            lock = main.SingleInstanceLock(path)
+            with self.assertRaises(RuntimeError):
+                lock.acquire()
+            self.assertTrue(os.path.exists(path))
+        finally:
+            main._is_pid_running = orig_is_pid_running  # type: ignore[assignment]
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def test_is_pid_running_handles_windows_invalid_parameter_as_dead(self) -> None:
+        orig_kill = os.kill
+        try:
+            def fake_kill(pid: int, sig: int) -> None:
+                _ = (pid, sig)
+                raise OSError(22, "Invalid parameter", None, 87, None)
+
+            os.kill = fake_kill  # type: ignore[assignment]
+            self.assertFalse(main._is_pid_running(123456))
+        finally:
+            os.kill = orig_kill  # type: ignore[assignment]
+
     def test_state_api_round_cache_methods(self) -> None:
         fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
         os.close(fd)
@@ -2352,6 +2290,148 @@ class SyncCoreTests(unittest.TestCase):
             except OSError:
                 pass
 
+    def test_sync_api_round_cache_gap_fill_fetches_intermediate_rounds(self) -> None:
+        class StubRoundMetricsAPI:
+            def __init__(self) -> None:
+                self.by_round_calls: List[int] = []
+
+            @staticmethod
+            def _build_record(round_id: int) -> Dict[str, Any]:
+                return {
+                    "snapshot_ts": "2026-04-18T10:30:00+00:00",
+                    "league_id": 1,
+                    "round_id": round_id,
+                    "block_number": 100 + round_id,
+                    "multiplier": 1.0,
+                    "gmt_fund": 10.0,
+                    "blocks_mined": 2,
+                    "gmt_per_block": 5.0,
+                    "league_th": 1500.0,
+                    "efficiency_league": 20.0,
+                    "ended_at": "2026-04-18T10:30:00+00:00",
+                    "round_duration_sec": 60,
+                }
+
+            def fetch_round_metrics_triplet(
+                self,
+                league_id: int,
+                strict_league_validation: bool = False,
+            ) -> Dict[str, Any] | None:
+                _ = (league_id, strict_league_validation)
+                return self._build_record(104)
+
+            def fetch_round_metrics_by_round_id(self, league_id: int, round_id: int) -> Dict[str, Any] | None:
+                _ = league_id
+                self.by_round_calls.append(round_id)
+                return self._build_record(round_id)
+
+        fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
+        os.close(fd)
+        orig_gap_max = main.SYNC_API_GAP_FILL_MAX
+        orig_log_info = main.log_info
+        info_events: List[Dict[str, Any]] = []
+        try:
+            st = main.StateStore(path)
+            st.upsert_api_round_record(
+                {
+                    "snapshot_ts": "2026-04-18T10:20:00+00:00",
+                    "league_id": 1,
+                    "round_id": 100,
+                    "ended_at": "2026-04-18T10:21:00+00:00",
+                }
+            )
+            stub = StubRoundMetricsAPI()
+            main.SYNC_API_GAP_FILL_MAX = 20
+            main.log_info = lambda msg, **fields: info_events.append({"msg": msg, "fields": dict(fields)})  # type: ignore[assignment]
+            written, seen = main.sync_api_round_cache(st, stub, [1])
+            self.assertEqual((written, seen), (4, 4))
+            self.assertEqual(stub.by_round_calls, [101, 102, 103])
+            latest = st.fetch_latest_api_round_record(1)
+            self.assertIsNotNone(latest)
+            self.assertEqual(latest["round_id"], 104)
+            gap_logs = [e for e in info_events if e["msg"] == "sync.api_round_gap_fill"]
+            self.assertEqual(len(gap_logs), 1)
+            self.assertFalse(bool(gap_logs[0]["fields"].get("capped")))
+            st.close()
+        finally:
+            main.SYNC_API_GAP_FILL_MAX = orig_gap_max
+            main.log_info = orig_log_info  # type: ignore[assignment]
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def test_sync_api_round_cache_gap_fill_capped_defers_latest(self) -> None:
+        class StubRoundMetricsAPI:
+            def __init__(self) -> None:
+                self.by_round_calls: List[int] = []
+
+            @staticmethod
+            def _build_record(round_id: int) -> Dict[str, Any]:
+                return {
+                    "snapshot_ts": "2026-04-18T10:30:00+00:00",
+                    "league_id": 1,
+                    "round_id": round_id,
+                    "block_number": 100 + round_id,
+                    "multiplier": 1.0,
+                    "gmt_fund": 10.0,
+                    "blocks_mined": 2,
+                    "gmt_per_block": 5.0,
+                    "league_th": 1500.0,
+                    "efficiency_league": 20.0,
+                    "ended_at": "2026-04-18T10:30:00+00:00",
+                    "round_duration_sec": 60,
+                }
+
+            def fetch_round_metrics_triplet(
+                self,
+                league_id: int,
+                strict_league_validation: bool = False,
+            ) -> Dict[str, Any] | None:
+                _ = (league_id, strict_league_validation)
+                return self._build_record(104)
+
+            def fetch_round_metrics_by_round_id(self, league_id: int, round_id: int) -> Dict[str, Any] | None:
+                _ = league_id
+                self.by_round_calls.append(round_id)
+                return self._build_record(round_id)
+
+        fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
+        os.close(fd)
+        orig_gap_max = main.SYNC_API_GAP_FILL_MAX
+        orig_log_info = main.log_info
+        info_events: List[Dict[str, Any]] = []
+        try:
+            st = main.StateStore(path)
+            st.upsert_api_round_record(
+                {
+                    "snapshot_ts": "2026-04-18T10:20:00+00:00",
+                    "league_id": 1,
+                    "round_id": 100,
+                    "ended_at": "2026-04-18T10:21:00+00:00",
+                }
+            )
+            stub = StubRoundMetricsAPI()
+            main.SYNC_API_GAP_FILL_MAX = 2
+            main.log_info = lambda msg, **fields: info_events.append({"msg": msg, "fields": dict(fields)})  # type: ignore[assignment]
+            written, seen = main.sync_api_round_cache(st, stub, [1])
+            self.assertEqual((written, seen), (2, 2))
+            self.assertEqual(stub.by_round_calls, [101, 102])
+            latest = st.fetch_latest_api_round_record(1)
+            self.assertIsNotNone(latest)
+            self.assertEqual(latest["round_id"], 102)
+            gap_logs = [e for e in info_events if e["msg"] == "sync.api_round_gap_fill"]
+            self.assertEqual(len(gap_logs), 1)
+            self.assertTrue(bool(gap_logs[0]["fields"].get("capped")))
+            st.close()
+        finally:
+            main.SYNC_API_GAP_FILL_MAX = orig_gap_max
+            main.log_info = orig_log_info  # type: ignore[assignment]
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
     def test_enqueue_main_sheet_ops_no_db_round_fetch_dependency(self) -> None:
         class LegacyDB:
             def fetch_completed_rounds_from_db(self, *args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
@@ -2440,21 +2520,320 @@ class SyncCoreTests(unittest.TestCase):
         norm3 = main._normalize_payload_row(row3, expected_cols=6, round_id=77, round_col_idx=2)
         self.assertEqual(norm3[2], 77)
 
-    def test_backfill_normalize_round_records_skips_non_dict(self) -> None:
-        items: List[Any] = [{"round_id": 1}, "bad", 42, {"round_id": 2}]
-        normalized = backfill._normalize_round_records(items, context="test")
-        self.assertEqual(len(normalized), 2)
-        self.assertEqual([main.safe_int(x.get("round_id")) for x in normalized], [1, 2])
 
-    def test_backfill_profile_resolution_defaults_to_stable(self) -> None:
-        name, cfg = backfill._resolve_backfill_profile("unknown-profile")
-        self.assertEqual(name, "stable")
-        self.assertEqual(cfg["workers"], backfill.BACKFILL_PROFILE_PRESETS["stable"]["workers"])
-        self.assertEqual(cfg["gomining_rpm"], backfill.BACKFILL_PROFILE_PRESETS["stable"]["gomining_rpm"])
-        self.assertEqual(cfg["prefetch_attempts"], backfill.BACKFILL_PROFILE_PRESETS["stable"]["prefetch_attempts"])
-        name2, cfg2 = backfill._resolve_backfill_profile("aggressive")
-        self.assertEqual(name2, "aggressive")
-        self.assertEqual(cfg2["workers"], backfill.BACKFILL_PROFILE_PRESETS["aggressive"]["workers"])
+class BackfillRoundGapTests(unittest.TestCase):
+    def test_backfill_resolve_to_round(self) -> None:
+        self.assertEqual(backfill_round_gap.resolve_to_round("latest", 958000), 958000)
+        self.assertEqual(backfill_round_gap.resolve_to_round("957900", 958000), 957900)
+        self.assertEqual(backfill_round_gap.resolve_to_round("958999", 958000), 958000)
+        self.assertEqual(backfill_round_gap.resolve_to_round("958999", None), 958999)
+        self.assertIsNone(backfill_round_gap.resolve_to_round("latest", None))
+
+    def test_backfill_collect_missing_round_records_skips_existing(self) -> None:
+        records = [
+            {"round_id": 945484},
+            {"round_id": 945485},
+            {"round_id": 945486},
+            {"round_id": 945487},
+            {"round_id": 945700},
+        ]
+        missing = backfill_round_gap.collect_missing_round_records(
+            records,
+            existing_round_ids={945486},
+            from_round=945485,
+            to_round=945487,
+        )
+        self.assertEqual([main.safe_int(r.get("round_id")) for r in missing], [945485, 945487])
+
+    def test_backfill_merge_prefetch_results_populates_master_cache(self) -> None:
+        client = main.GoMiningRoundAbilityApiClient(
+            bearer_token="token",
+            limiter=main.TokenBucket(9999, name="test"),
+            max_retries=1,
+        )
+        results = [
+            backfill_round_gap.PrefetchRoundResult(
+                league_id=1,
+                round_id=945500,
+                ok=True,
+                counts={"aid-1": 3},
+                power_up_users=[{"user_id": 1, "clan_id": 10, "count": 2, "avatar_url": "", "alias": "u1"}],
+                clan_power_up_users=[{"user_id": 2, "clan_id": 11, "count": 1, "avatar_url": "", "alias": "u2"}],
+                excluded_user_boosts={"aid-1": 7},
+            ),
+            backfill_round_gap.PrefetchRoundResult(
+                league_id=1,
+                round_id=945501,
+                ok=False,
+                error="boom",
+            ),
+        ]
+        ok, failed = backfill_round_gap.merge_prefetch_results_into_client(client, results)
+        self.assertEqual((ok, failed), (1, 1))
+        self.assertEqual(client.round_counts_cache[945500]["aid-1"], 3)
+        power_users = client.get_cached_ability_users_for_round(945500, main.POWER_UP_ABILITY_ID)
+        clan_users = client.get_cached_ability_users_for_round(945500, main.CLAN_POWER_UP_ABILITY_ID)
+        self.assertEqual(len(power_users), 1)
+        self.assertEqual(len(clan_users), 1)
+        self.assertEqual(client.get_cached_excluded_user_boosts_for_round(945500).get("aid-1"), 7)
+
+    def test_backfill_filter_records_for_prefetch_failures_keeps_other_rounds(self) -> None:
+        records = [{"round_id": 945500}, {"round_id": 945501}, {"round_id": 945502}]
+        kept, skipped = backfill_round_gap.filter_records_for_prefetch_failures(records, failed_round_ids={945501})
+        self.assertEqual([main.safe_int(r.get("round_id")) for r in kept], [945500, 945502])
+        self.assertEqual(skipped, [945501])
+
+    def test_backfill_fetch_latest_completed_round_from_api_filters_invalid(self) -> None:
+        class FakeClient:
+            def __init__(self, payload: Dict[str, Any] | None) -> None:
+                self.payload = payload
+
+            def fetch_round_metrics_triplet(self, league_id: int, strict_league_validation: bool = False) -> Dict[str, Any] | None:
+                _ = (league_id, strict_league_validation)
+                return self.payload
+
+        valid = backfill_round_gap._fetch_latest_completed_round_from_api(
+            FakeClient({"round_id": 945625, "ended_at": "2026-04-18T10:35:49+00:00"}),  # type: ignore[arg-type]
+            1,
+        )
+        self.assertIsInstance(valid, dict)
+        invalid = backfill_round_gap._fetch_latest_completed_round_from_api(
+            FakeClient({"round_id": 945625, "ended_at": None}),  # type: ignore[arg-type]
+            1,
+        )
+        self.assertIsNone(invalid)
+
+    def test_backfill_fetch_round_record_for_round_id_success(self) -> None:
+        class FakeClient:
+            user_page_limit = 50
+            clan_page_limit = 1
+            player_leaderboard_url = "https://x/user"
+            clan_leaderboard_url = "https://x/clan"
+
+            @staticmethod
+            def _payload_data(body: Any) -> Dict[str, Any] | None:
+                if isinstance(body, dict):
+                    data = body.get("data")
+                    if isinstance(data, dict):
+                        return data
+                return None
+
+            @staticmethod
+            def _compute_round_duration_sec(round_data: Dict[str, Any], ended_at_iso: str) -> int | None:
+                _ = (round_data, ended_at_iso)
+                return 60
+
+            def _fetch_round_clan_leaderboard_by_round_id(self, league_id: int, round_id: int) -> Dict[str, Any] | None:
+                _ = league_id
+                return {
+                    "data": {
+                        "roundId": round_id,
+                        "leagueId": 1,
+                        "blockNumber": 945602,
+                        "multiplier": 1.0,
+                        "endedAt": "2026-04-18T10:35:49.883Z",
+                        "active": False,
+                    }
+                }
+
+            def _request_json_with_retry(
+                self,
+                method: str,
+                url: str,
+                *,
+                params: Dict[str, Any] | None = None,
+                json_payload: Dict[str, Any] | None = None,
+                op: str,
+                **ctx: Any,
+            ) -> Dict[str, Any] | None:
+                _ = (method, url, params, json_payload, ctx)
+                if op == "backfill_user_leaderboard_index":
+                    return {"data": {"gmtFund": 100.0, "totalMinedBlocks": 20}}
+                if op == "backfill_clan_leaderboard_index_v2":
+                    return {
+                        "data": {
+                            "totalMinedBlocks": 20,
+                            "totalPower": 1500.0,
+                            "weightedEnergyEfficiencyPerTh": 20.0,
+                        }
+                    }
+                return None
+
+        rec = backfill_round_gap._fetch_round_record_for_round_id(  # type: ignore[arg-type]
+            FakeClient(),
+            probe_league_id=1,
+            round_id=945625,
+        )
+        self.assertIsInstance(rec, dict)
+        assert rec is not None
+        self.assertEqual(rec["round_id"], 945625)
+        self.assertEqual(rec["league_id"], 1)
+        self.assertEqual(rec["blocks_mined"], 20)
+        self.assertAlmostEqual(rec["gmt_per_block"], 5.0)
+
+    def test_backfill_prefetch_rounds_with_retries_eventually_succeeds(self) -> None:
+        orig_parallel = backfill_round_gap._prefetch_rounds_parallel
+        call_no = {"n": 0}
+
+        def fake_parallel(
+            tasks: List[tuple[int, int]],
+            workers: int,
+            bearer_token: str,
+            token_fetcher: Any,
+            limiter: Any,
+        ) -> List[backfill_round_gap.PrefetchRoundResult]:
+            _ = (workers, bearer_token, token_fetcher, limiter)
+            call_no["n"] += 1
+            out: List[backfill_round_gap.PrefetchRoundResult] = []
+            for league_id, round_id in tasks:
+                if call_no["n"] == 1:
+                    out.append(
+                        backfill_round_gap.PrefetchRoundResult(
+                            league_id=league_id,
+                            round_id=round_id,
+                            ok=False,
+                            error="503",
+                        )
+                    )
+                else:
+                    out.append(
+                        backfill_round_gap.PrefetchRoundResult(
+                            league_id=league_id,
+                            round_id=round_id,
+                            ok=True,
+                            counts={"a1": 1},
+                        )
+                    )
+            return out
+
+        try:
+            backfill_round_gap._prefetch_rounds_parallel = fake_parallel  # type: ignore[assignment]
+            results = backfill_round_gap._prefetch_rounds_with_retries(
+                tasks=[(1, 100)],
+                workers=8,
+                attempts=3,
+                bearer_token="token",
+                token_fetcher=None,
+                limiter=backfill_round_gap.ThreadSafeRateGuard(9999, name="test"),
+            )
+        finally:
+            backfill_round_gap._prefetch_rounds_parallel = orig_parallel  # type: ignore[assignment]
+
+        self.assertEqual(call_no["n"], 2)
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].ok)
+
+    def test_backfill_run_enqueue_flush_requires_target_progress(self) -> None:
+        fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
+        os.close(fd)
+        orig_enqueue = main.enqueue_main_sheet_ops
+        orig_flush = main.flush_sheet_queue_with_rate_limit
+        try:
+            st = main.StateStore(path)
+            st.upsert_sheet_meta(11, "tab-main", 1)
+            st.set_last_synced_round(11, 100)
+            ctx = main.SheetContext(
+                ws_id=11,
+                title="tab-main",
+                ws=None,
+                league_id=1,
+                kind="main",
+                expected_cols=len(main.BASE_HEADERS) + len(main.ABILITY_HEADER_ORDER) + 6,
+                round_col_idx=6,
+            )
+
+            def fake_enqueue(*args: Any, **kwargs: Any) -> int:
+                _ = (args, kwargs)
+                return 0
+
+            def fake_flush(*args: Any, **kwargs: Any) -> int:
+                _ = (args, kwargs)
+                return 0
+
+            main.enqueue_main_sheet_ops = fake_enqueue  # type: ignore[assignment]
+            main.flush_sheet_queue_with_rate_limit = fake_flush  # type: ignore[assignment]
+            enq, flushed, cycles, completed = backfill_round_gap._run_enqueue_flush_for_sheet(
+                state=st,
+                ctx=ctx,
+                records_for_sheet=[{"round_id": 101}],
+                round_ability_api=object(),  # type: ignore[arg-type]
+                power_up_clan_api=object(),  # type: ignore[arg-type]
+                ability_id_to_name={},
+                ability_headers=[],
+                write_limiter=main.TokenBucket(9999, name="test"),
+                read_limiter=main.TokenBucket(9999, name="test"),
+                max_cycles=20,
+            )
+            self.assertEqual(enq, 0)
+            self.assertEqual(flushed, 0)
+            self.assertFalse(completed)
+            self.assertEqual(cycles, 5)
+            st.close()
+        finally:
+            main.enqueue_main_sheet_ops = orig_enqueue  # type: ignore[assignment]
+            main.flush_sheet_queue_with_rate_limit = orig_flush  # type: ignore[assignment]
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def test_backfill_run_enqueue_flush_completes_when_target_reached(self) -> None:
+        fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
+        os.close(fd)
+        orig_enqueue = main.enqueue_main_sheet_ops
+        orig_flush = main.flush_sheet_queue_with_rate_limit
+        try:
+            st = main.StateStore(path)
+            st.upsert_sheet_meta(11, "tab-main", 1)
+            st.set_last_synced_round(11, 100)
+            ctx = main.SheetContext(
+                ws_id=11,
+                title="tab-main",
+                ws=None,
+                league_id=1,
+                kind="main",
+                expected_cols=len(main.BASE_HEADERS) + len(main.ABILITY_HEADER_ORDER) + 6,
+                round_col_idx=6,
+            )
+            bumped = {"done": False}
+
+            def fake_enqueue(*args: Any, **kwargs: Any) -> int:
+                _ = (args, kwargs)
+                if not bumped["done"]:
+                    st.set_last_synced_round(11, 101)
+                    bumped["done"] = True
+                return 1
+
+            def fake_flush(*args: Any, **kwargs: Any) -> int:
+                _ = (args, kwargs)
+                return 0
+
+            main.enqueue_main_sheet_ops = fake_enqueue  # type: ignore[assignment]
+            main.flush_sheet_queue_with_rate_limit = fake_flush  # type: ignore[assignment]
+            enq, flushed, cycles, completed = backfill_round_gap._run_enqueue_flush_for_sheet(
+                state=st,
+                ctx=ctx,
+                records_for_sheet=[{"round_id": 101}],
+                round_ability_api=object(),  # type: ignore[arg-type]
+                power_up_clan_api=object(),  # type: ignore[arg-type]
+                ability_id_to_name={},
+                ability_headers=[],
+                write_limiter=main.TokenBucket(9999, name="test"),
+                read_limiter=main.TokenBucket(9999, name="test"),
+                max_cycles=20,
+            )
+            self.assertEqual(enq, 1)
+            self.assertEqual(flushed, 0)
+            self.assertTrue(completed)
+            self.assertEqual(cycles, 1)
+            st.close()
+        finally:
+            main.enqueue_main_sheet_ops = orig_enqueue  # type: ignore[assignment]
+            main.flush_sheet_queue_with_rate_limit = orig_flush  # type: ignore[assignment]
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

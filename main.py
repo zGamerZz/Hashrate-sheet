@@ -3,14 +3,18 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import logging
 import os
+import errno
 import random
 import re
 import sqlite3
+import threading
 import time
+import weakref
 from decimal import Decimal, ROUND_HALF_UP
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -44,7 +48,8 @@ if dotenv is not None:
 SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "service_acc.json")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1bq5Sy2pV35x33Q12G5_EJ2S0Kb1iXo1Y2FCxL7QIxGg")
 
-SYNC_POLL_SECONDS = int(os.getenv("SYNC_POLL_SECONDS", "120"))
+SYNC_POLL_SECONDS = int(os.getenv("SYNC_POLL_SECONDS", "5"))
+SYNC_API_GAP_FILL_MAX = max(1, int(os.getenv("SYNC_API_GAP_FILL_MAX", "20")))
 SHEET_REFRESH_SECONDS = int(os.getenv("SHEET_REFRESH_SECONDS", "1800"))
 GS_WRITE_REQ_PER_MIN = int(os.getenv("GS_WRITE_REQ_PER_MIN", "45"))
 GS_READ_REQ_PER_MIN = int(os.getenv("GS_READ_REQ_PER_MIN", "20"))
@@ -86,25 +91,26 @@ ROUND_USER_LEADERBOARD_API_URL = os.getenv(
 ROUND_API_PAGE_LIMIT = max(1, min(50, int(os.getenv("ROUND_API_PAGE_LIMIT", "50"))))
 ROUND_API_TIMEOUT_SECONDS = int(os.getenv("ROUND_API_TIMEOUT_SECONDS", "45"))
 ROUND_API_MAX_RETRIES = max(1, int(os.getenv("ROUND_API_MAX_RETRIES", "4")))
-ROUND_USER_503_MAX_RETRIES = max(1, int(os.getenv("ROUND_USER_503_MAX_RETRIES", "8")))
-try:
-    ROUND_USER_BACKOFF_MAX_SECONDS = max(1.0, float(os.getenv("ROUND_USER_BACKOFF_MAX_SECONDS", "30")))
-except Exception:
-    ROUND_USER_BACKOFF_MAX_SECONDS = 30.0
-try:
-    ROUND_USER_ADAPTIVE_MIN_RPM = max(1.0, float(os.getenv("ROUND_USER_ADAPTIVE_MIN_RPM", "60")))
-except Exception:
-    ROUND_USER_ADAPTIVE_MIN_RPM = 60.0
-ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR = os.getenv(
-    "ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR",
-    "1",
-).strip() in {"1", "true", "TRUE", "yes", "YES"}
 GOMINING_API_REQ_PER_MIN = int(os.getenv("GOMINING_API_REQ_PER_MIN", "120"))
 TOKEN_URL = os.getenv("TOKEN_URL", "").strip()
 TOKEN_X_AUTH = os.getenv("TOKEN_X_AUTH", "").strip()
 TOKEN_METHOD = os.getenv("TOKEN_METHOD", "GET").strip().upper()
 TOKEN_TIMEOUT_SECONDS = max(1, int(os.getenv("TOKEN_TIMEOUT_SECONDS", "20")))
 TOKEN_VERIFY_SSL = os.getenv("TOKEN_VERIFY_SSL", "1").strip() in {"1", "true", "TRUE", "yes", "YES"}
+try:
+    TOKEN_SHARED_REFRESH_MIN_INTERVAL_SECONDS = max(
+        0.0,
+        float(os.getenv("TOKEN_SHARED_REFRESH_MIN_INTERVAL_SECONDS", "1.5")),
+    )
+except Exception:
+    TOKEN_SHARED_REFRESH_MIN_INTERVAL_SECONDS = 1.5
+try:
+    TOKEN_SHARED_REFRESH_WAIT_TIMEOUT_SECONDS = max(
+        0.1,
+        float(os.getenv("TOKEN_SHARED_REFRESH_WAIT_TIMEOUT_SECONDS", "5.0")),
+    )
+except Exception:
+    TOKEN_SHARED_REFRESH_WAIT_TIMEOUT_SECONDS = 5.0
 LEAGUES_API_POLL_SECONDS = int(os.getenv("LEAGUES_API_POLL_SECONDS", str(SHEET_REFRESH_SECONDS)))
 LEAGUE_INDEX_LOOKBACK_DAYS = max(0, int(os.getenv("LEAGUE_INDEX_LOOKBACK_DAYS", "7")))
 LEAGUE_INDEX_TRY_WITHOUT_CALCULATED_AT = os.getenv(
@@ -132,6 +138,23 @@ try:
     ENQUEUE_FLUSH_EVERY_SECONDS = max(0.0, float(os.getenv("ENQUEUE_FLUSH_EVERY_SECONDS", "5")))
 except Exception:
     ENQUEUE_FLUSH_EVERY_SECONDS = 5.0
+RECONCILE_INTERVAL_SECONDS = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "900"))
+ROUND_SOFT_FAIL_MAX_ATTEMPTS = max(1, int(os.getenv("ROUND_SOFT_FAIL_MAX_ATTEMPTS", "8")))
+try:
+    ROUND_RETRY_BACKOFF_MIN_SECONDS = max(1.0, float(os.getenv("ROUND_RETRY_BACKOFF_MIN_SECONDS", "15")))
+except Exception:
+    ROUND_RETRY_BACKOFF_MIN_SECONDS = 15.0
+try:
+    ROUND_RETRY_BACKOFF_MAX_SECONDS = max(
+        ROUND_RETRY_BACKOFF_MIN_SECONDS,
+        float(os.getenv("ROUND_RETRY_BACKOFF_MAX_SECONDS", "600")),
+    )
+except Exception:
+    ROUND_RETRY_BACKOFF_MAX_SECONDS = max(ROUND_RETRY_BACKOFF_MIN_SECONDS, 600.0)
+GAP_SCAN_LOOKBACK_ROUNDS = max(10, int(os.getenv("GAP_SCAN_LOOKBACK_ROUNDS", "500")))
+ADAPTIVE_RPM_ENABLE = os.getenv("ADAPTIVE_RPM_ENABLE", "1").strip() in {"1", "true", "TRUE", "yes", "YES"}
+ADAPTIVE_RPM_MIN = max(1, int(os.getenv("ADAPTIVE_RPM_MIN", "120")))
+ADAPTIVE_RPM_MAX = max(ADAPTIVE_RPM_MIN, int(os.getenv("ADAPTIVE_RPM_MAX", str(GOMINING_API_REQ_PER_MIN))))
 
 CONFIG_CELL = "B1"
 LOG_START_ROW = 4
@@ -444,6 +467,8 @@ def calc_boost_gmt_triplet_from_boost_users_api(
     clan_ids: List[int] = []
     needed_users_by_clan: Dict[int, set[int]] = {}
     for item in boost_users:
+        if not isinstance(item, dict):
+            continue
         uid = safe_int(item.get("user_id"))
         cnt = safe_int(item.get("count")) or 0
         cid = safe_int(item.get("clan_id"))
@@ -563,60 +588,70 @@ def calc_clan_power_up_gmt_pair_from_boost_users_api(
     (or sentinel marker in alias).
     Returns (None, None) when users exist but clan pricing cannot be fully resolved.
     """
-    by_user_usage: Dict[int, Dict[str, Any]] = {}
-    clan_ids: List[int] = []
-    for item in clan_power_up_users:
-        uid = safe_int(item.get("user_id"))
-        cnt = safe_int(item.get("count")) or 0
-        cid = safe_int(item.get("clan_id"))
-        avatar_url = str(item.get("avatar_url") or "")
-        alias = str(item.get("alias") or "")
-        if uid is None or cnt <= 0:
-            continue
-        usage = by_user_usage.get(uid)
-        sentinel = has_sentinel_user_discount(avatar_url, alias)
-        if usage is None:
-            by_user_usage[uid] = {
-                "clan_id": cid,
-                "sentinel": sentinel,
-            }
-        else:
-            if usage.get("clan_id") is None and cid is not None:
-                usage["clan_id"] = cid
-            usage["sentinel"] = bool(usage.get("sentinel")) or sentinel
-    if not by_user_usage:
-        return 0.0, 0.0
-    for usage in by_user_usage.values():
-        cid = safe_int(usage.get("clan_id"))
-        if cid is not None:
-            clan_ids.append(cid)
-    if clan_api is None:
-        return None, None
-    team_pps_by_clan = clan_api.fetch_clan_team_pps_for_clans(clan_ids)
-    if not team_pps_by_clan:
-        return None, None
+    try:
+        by_user_usage: Dict[int, Dict[str, Any]] = {}
+        clan_ids: List[int] = []
+        for item in clan_power_up_users:
+            if not isinstance(item, dict):
+                continue
+            uid = safe_int(item.get("user_id"))
+            cnt = safe_int(item.get("count")) or 0
+            cid = safe_int(item.get("clan_id"))
+            avatar_url = str(item.get("avatar_url") or "")
+            alias = str(item.get("alias") or "")
+            if uid is None or cnt <= 0:
+                continue
+            usage = by_user_usage.get(uid)
+            sentinel = has_sentinel_user_discount(avatar_url, alias)
+            if usage is None:
+                by_user_usage[uid] = {
+                    "clan_id": cid,
+                    "sentinel": sentinel,
+                }
+            else:
+                if usage.get("clan_id") is None and cid is not None:
+                    usage["clan_id"] = cid
+                usage["sentinel"] = bool(usage.get("sentinel")) or sentinel
+        if not by_user_usage:
+            return 0.0, 0.0
+        for usage in by_user_usage.values():
+            cid = safe_int(usage.get("clan_id"))
+            if cid is not None:
+                clan_ids.append(cid)
+        if clan_api is None:
+            return None, None
+        team_pps_by_clan = clan_api.fetch_clan_team_pps_for_clans(clan_ids)
+        if not team_pps_by_clan:
+            return None, None
 
-    total_gmt = Decimal("0.00")
-    total_gmt_sentinel = Decimal("0.00")
-    resolved_users = 0
-    for _uid, usage in by_user_usage.items():
-        cid = safe_int(usage.get("clan_id"))
-        sentinel = bool(usage.get("sentinel"))
-        if cid is None:
-            continue
-        team_pps = safe_float(team_pps_by_clan.get(cid))
-        if team_pps is None or team_pps <= 0:
-            continue
-        per_use = calc_clan_power_up_gmt(team_pps)
-        if per_use is None:
-            continue
-        user_price = round_gmt_2(float(per_use))
-        total_gmt += user_price
-        total_gmt_sentinel += round_gmt_2(float(user_price * Decimal("0.8"))) if sentinel else user_price
-        resolved_users += 1
-    if resolved_users <= 0:
+        total_gmt = Decimal("0.00")
+        total_gmt_sentinel = Decimal("0.00")
+        resolved_users = 0
+        for _uid, usage in by_user_usage.items():
+            cid = safe_int(usage.get("clan_id"))
+            sentinel = bool(usage.get("sentinel"))
+            if cid is None:
+                continue
+            team_pps = safe_float(team_pps_by_clan.get(cid))
+            if team_pps is None or team_pps <= 0:
+                continue
+            per_use = calc_clan_power_up_gmt(team_pps)
+            if per_use is None:
+                continue
+            user_price = round_gmt_2(float(per_use))
+            total_gmt += user_price
+            total_gmt_sentinel += round_gmt_2(float(user_price * Decimal("0.8"))) if sentinel else user_price
+            resolved_users += 1
+        if resolved_users <= 0:
+            return None, None
+        return float(total_gmt), float(total_gmt_sentinel)
+    except Exception as e:
+        log_warn(
+            "sync.clan_power_up_calc_failed",
+            err=repr(e),
+            users=len([u for u in clan_power_up_users if isinstance(u, dict)]),
+        )
         return None, None
-    return float(total_gmt), float(total_gmt_sentinel)
 
 
 def calc_team_pps_exact(sum_th_over_w: Optional[float]) -> Optional[float]:
@@ -1051,6 +1086,90 @@ def fetch_bearer_token_from_auth_api() -> Optional[str]:
     return token
 
 
+class _SharedTokenState:
+    def __init__(self) -> None:
+        self.cond = threading.Condition()
+        self.token: str = ""
+        self.refreshed_at_mono: float = 0.0
+        self.refreshing: bool = False
+
+
+_SHARED_TOKEN_STATES_LOCK = threading.Lock()
+_SHARED_TOKEN_STATES_WEAK: "weakref.WeakKeyDictionary[Callable[[], Optional[str]], _SharedTokenState]" = weakref.WeakKeyDictionary()
+_SHARED_TOKEN_STATES_STRONG: Dict[int, _SharedTokenState] = {}
+
+
+def _get_shared_token_state(token_fetcher: Callable[[], Optional[str]]) -> _SharedTokenState:
+    with _SHARED_TOKEN_STATES_LOCK:
+        try:
+            state = _SHARED_TOKEN_STATES_WEAK.get(token_fetcher)
+            if state is None:
+                state = _SharedTokenState()
+                _SHARED_TOKEN_STATES_WEAK[token_fetcher] = state
+            return state
+        except TypeError:
+            key = id(token_fetcher)
+            state = _SHARED_TOKEN_STATES_STRONG.get(key)
+            if state is None:
+                state = _SharedTokenState()
+                _SHARED_TOKEN_STATES_STRONG[key] = state
+            return state
+
+
+def _shared_token_cached(token_fetcher: Callable[[], Optional[str]]) -> Optional[str]:
+    state = _get_shared_token_state(token_fetcher)
+    with state.cond:
+        tok = (state.token or "").strip()
+        return tok or None
+
+
+def _shared_token_fetch(token_fetcher: Callable[[], Optional[str]], *, force: bool) -> Optional[str]:
+    state = _get_shared_token_state(token_fetcher)
+    now_mono = time.monotonic()
+    with state.cond:
+        if state.token and not force:
+            return state.token
+        if (
+            force
+            and state.token
+            and (now_mono - state.refreshed_at_mono) < TOKEN_SHARED_REFRESH_MIN_INTERVAL_SECONDS
+        ):
+            return state.token
+
+        if state.refreshing:
+            deadline = now_mono + TOKEN_SHARED_REFRESH_WAIT_TIMEOUT_SECONDS
+            while state.refreshing:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                state.cond.wait(timeout=remaining)
+            now_mono = time.monotonic()
+            if state.token and (
+                not force or (now_mono - state.refreshed_at_mono) < TOKEN_SHARED_REFRESH_MIN_INTERVAL_SECONDS
+            ):
+                return state.token
+            if state.refreshing:
+                return (state.token or "").strip() or None
+        state.refreshing = True
+
+    tok: Optional[str] = None
+    try:
+        tok = (token_fetcher() or "").strip()
+    except Exception as e:
+        log_warn("token_api.fetcher_exception", err=repr(e))
+
+    with state.cond:
+        if tok:
+            state.token = tok
+            state.refreshed_at_mono = time.monotonic()
+        state.refreshing = False
+        state.cond.notify_all()
+        if tok:
+            return tok
+        cached = (state.token or "").strip()
+        return cached or None
+
+
 def _league_index_calculated_at_candidates(now_utc: Optional[datetime] = None) -> List[Optional[str]]:
     now_dt = now_utc or datetime.now(timezone.utc)
     candidates: List[Optional[str]] = [
@@ -1240,6 +1359,8 @@ def calc_team_th_and_pps_from_users(users: Sequence[Dict[str, Any]]) -> Tuple[fl
     team_th = 0.0
     team_pps = 0.0
     for user in users:
+        if not isinstance(user, dict):
+            continue
         pwr = safe_float(user.get("power"))
         ee = safe_float(user.get("ee"))
         if pwr is None or pwr <= 0:
@@ -1262,6 +1383,7 @@ class GoMiningClanApiClient:
         timeout_seconds: int = CLAN_API_TIMEOUT_SECONDS,
         max_retries: int = CLAN_API_MAX_RETRIES,
         token_fetcher: Optional[Callable[[], Optional[str]]] = None,
+        rate_controller: Optional[AdaptiveRateController] = None,
     ) -> None:
         self.bearer_token = bearer_token.strip()
         self.token_fetcher = token_fetcher
@@ -1271,6 +1393,7 @@ class GoMiningClanApiClient:
         self.page_limit = max(1, min(50, int(page_limit)))
         self.timeout_seconds = max(1, int(timeout_seconds))
         self.max_retries = max(1, int(max_retries))
+        self.rate_controller = rate_controller
         self.session = requests.Session()
         self.headers = {
             "accept": "application/json, text/plain, */*",
@@ -1295,12 +1418,18 @@ class GoMiningClanApiClient:
     def _refresh_bearer(self, force: bool = False) -> bool:
         if not self.token_fetcher:
             return bool(self.bearer_token)
-        if self.bearer_token and not force:
-            return True
-        tok = (self.token_fetcher() or "").strip()
+        if not force:
+            cached = _shared_token_cached(self.token_fetcher)
+            if cached and cached != self.bearer_token:
+                self._set_bearer(cached)
+                return True
+            if self.bearer_token:
+                return True
+        tok = _shared_token_fetch(self.token_fetcher, force=force)
         if not tok:
             return bool(self.bearer_token)
-        self._set_bearer(tok)
+        if tok != self.bearer_token:
+            self._set_bearer(tok)
         return True
 
     @staticmethod
@@ -1336,6 +1465,8 @@ class GoMiningClanApiClient:
                 continue
 
             if resp.status_code == 200:
+                if self.rate_controller is not None:
+                    self.rate_controller.record_status(200)
                 try:
                     data = resp.json()
                     if isinstance(data, dict):
@@ -1360,6 +1491,8 @@ class GoMiningClanApiClient:
                 return None
 
             retryable = resp.status_code in {429, 500, 502, 503, 504}
+            if self.rate_controller is not None:
+                self.rate_controller.record_status(resp.status_code)
             if retryable and attempt < self.max_retries:
                 retry_after = None
                 try:
@@ -1715,7 +1848,7 @@ class GoMiningClanApiClient:
 
         for clan_id in missing:
             detail = self._fetch_clan_detail_all_pages(clan_id)
-            if detail is None:
+            if not isinstance(detail, dict):
                 continue
             users_raw = detail.get("usersForClient") or []
             users = [u for u in users_raw if isinstance(u, dict)] if isinstance(users_raw, list) else []
@@ -1741,6 +1874,7 @@ class GoMiningRoundMetricsApiClient:
         timeout_seconds: int = ROUND_METRICS_TIMEOUT_SECONDS,
         max_retries: int = ROUND_METRICS_MAX_RETRIES,
         token_fetcher: Optional[Callable[[], Optional[str]]] = None,
+        rate_controller: Optional[AdaptiveRateController] = None,
     ) -> None:
         self.bearer_token = bearer_token.strip()
         self.token_fetcher = token_fetcher
@@ -1755,6 +1889,7 @@ class GoMiningRoundMetricsApiClient:
         self.round_scan_lookback = max(1, int(round_scan_lookback))
         self.timeout_seconds = max(1, int(timeout_seconds))
         self.max_retries = max(1, int(max_retries))
+        self.rate_controller = rate_controller
         self.session = requests.Session()
         self.headers = {
             "accept": "application/json, text/plain, */*",
@@ -1787,12 +1922,18 @@ class GoMiningRoundMetricsApiClient:
     def _refresh_bearer(self, force: bool = False) -> bool:
         if not self.token_fetcher:
             return bool(self.bearer_token)
-        if self.bearer_token and not force:
-            return True
-        tok = (self.token_fetcher() or "").strip()
+        if not force:
+            cached = _shared_token_cached(self.token_fetcher)
+            if cached and cached != self.bearer_token:
+                self._set_bearer(cached)
+                return True
+            if self.bearer_token:
+                return True
+        tok = _shared_token_fetch(self.token_fetcher, force=force)
         if not tok:
             return bool(self.bearer_token)
-        self._set_bearer(tok)
+        if tok != self.bearer_token:
+            self._set_bearer(tok)
         return True
 
     def _request_json_with_retry(
@@ -1837,6 +1978,8 @@ class GoMiningRoundMetricsApiClient:
                 continue
 
             if resp.status_code == 200:
+                if self.rate_controller is not None:
+                    self.rate_controller.record_status(200)
                 try:
                     data = resp.json()
                 except Exception as e:
@@ -1868,6 +2011,8 @@ class GoMiningRoundMetricsApiClient:
                 return None
 
             retryable = resp.status_code in {429, 500, 502, 503, 504}
+            if self.rate_controller is not None:
+                self.rate_controller.record_status(resp.status_code)
             if retryable and attempt < self.max_retries:
                 retry_after = None
                 try:
@@ -2069,67 +2214,12 @@ class GoMiningRoundMetricsApiClient:
 
         return safe_int(round_data.get("roundTime"))
 
-    def fetch_round_metrics_triplet(
+    def _fetch_round_metrics_for_round_id(
         self,
-        league_id: int,
-        strict_league_validation: bool = ROUND_GET_LAST_STRICT_LEAGUE_VALIDATION,
+        requested_league_id: int,
+        target_round_id: int,
     ) -> Optional[Dict[str, Any]]:
-        requested_league_id = int(league_id)
-        _ = strict_league_validation
-
-        get_last_body, unresolved_mismatch = self._fetch_get_last_with_probe(
-            requested_league_id,
-            strict_league_validation=strict_league_validation,
-        )
-        if not isinstance(get_last_body, dict):
-            return None
-        get_last_data = self._payload_data(get_last_body)
-        if not isinstance(get_last_data, dict):
-            log_warn("gomining_api.round_get_last_bad_shape", league_id=requested_league_id)
-            return None
-
-        previous_round_id = safe_int(get_last_data.get("previousRoundId"))
-        if previous_round_id is not None and previous_round_id <= 0:
-            previous_round_id = None
-
-        target_round_id: Optional[int]
-        if previous_round_id is not None and not unresolved_mismatch:
-            target_round_id = previous_round_id
-        else:
-            start_round_id = self._payload_round_id(get_last_body)
-            if start_round_id is None or start_round_id <= 0:
-                log_warn(
-                    "gomining_api.round_get_last_scan_missing_start_round",
-                    league_id=requested_league_id,
-                    previous_round_id=previous_round_id,
-                    unresolved_mismatch=bool(unresolved_mismatch),
-                )
-                return None
-            target_round_id = self._scan_closed_round_for_league(
-                requested_league_id,
-                start_round_id=start_round_id,
-                lookback=self.round_scan_lookback,
-            )
-            if target_round_id is None:
-                log_warn(
-                    "gomining_api.round_get_last_scan_failed",
-                    league_id=requested_league_id,
-                    start_round_id=start_round_id,
-                    lookback=self.round_scan_lookback,
-                    previous_round_id=previous_round_id,
-                    unresolved_mismatch=bool(unresolved_mismatch),
-                )
-                return None
-            log_info(
-                "gomining_api.round_get_last_scan_resolved",
-                league_id=requested_league_id,
-                start_round_id=start_round_id,
-                target_round_id=target_round_id,
-                lookback=self.round_scan_lookback,
-                unresolved_mismatch=bool(unresolved_mismatch),
-            )
-
-        round_body = self._fetch_round_clan_leaderboard_by_round_id(requested_league_id, target_round_id)
+        round_body = self._fetch_round_clan_leaderboard_by_round_id(requested_league_id, int(target_round_id))
         if not isinstance(round_body, dict):
             return None
         round_data = self._payload_data(round_body)
@@ -2257,6 +2347,84 @@ class GoMiningRoundMetricsApiClient:
             "round_duration_sec": round_duration_sec,
         }
 
+    def fetch_round_metrics_by_round_id(
+        self,
+        league_id: int,
+        round_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        requested_league_id = int(league_id)
+        target_round_id = safe_int(round_id)
+        if target_round_id is None or target_round_id <= 0:
+            log_warn(
+                "gomining_api.round_metrics_invalid_round_id",
+                league_id=requested_league_id,
+                round_id=round_id,
+            )
+            return None
+        return self._fetch_round_metrics_for_round_id(requested_league_id, target_round_id)
+
+    def fetch_round_metrics_triplet(
+        self,
+        league_id: int,
+        strict_league_validation: bool = ROUND_GET_LAST_STRICT_LEAGUE_VALIDATION,
+    ) -> Optional[Dict[str, Any]]:
+        requested_league_id = int(league_id)
+        _ = strict_league_validation
+
+        get_last_body, unresolved_mismatch = self._fetch_get_last_with_probe(
+            requested_league_id,
+            strict_league_validation=strict_league_validation,
+        )
+        if not isinstance(get_last_body, dict):
+            return None
+        get_last_data = self._payload_data(get_last_body)
+        if not isinstance(get_last_data, dict):
+            log_warn("gomining_api.round_get_last_bad_shape", league_id=requested_league_id)
+            return None
+
+        previous_round_id = safe_int(get_last_data.get("previousRoundId"))
+        if previous_round_id is not None and previous_round_id <= 0:
+            previous_round_id = None
+
+        target_round_id: Optional[int]
+        if previous_round_id is not None and not unresolved_mismatch:
+            target_round_id = previous_round_id
+        else:
+            start_round_id = self._payload_round_id(get_last_body)
+            if start_round_id is None or start_round_id <= 0:
+                log_warn(
+                    "gomining_api.round_get_last_scan_missing_start_round",
+                    league_id=requested_league_id,
+                    previous_round_id=previous_round_id,
+                    unresolved_mismatch=bool(unresolved_mismatch),
+                )
+                return None
+            target_round_id = self._scan_closed_round_for_league(
+                requested_league_id,
+                start_round_id=start_round_id,
+                lookback=self.round_scan_lookback,
+            )
+            if target_round_id is None:
+                log_warn(
+                    "gomining_api.round_get_last_scan_failed",
+                    league_id=requested_league_id,
+                    start_round_id=start_round_id,
+                    lookback=self.round_scan_lookback,
+                    previous_round_id=previous_round_id,
+                    unresolved_mismatch=bool(unresolved_mismatch),
+                )
+                return None
+            log_info(
+                "gomining_api.round_get_last_scan_resolved",
+                league_id=requested_league_id,
+                start_round_id=start_round_id,
+                target_round_id=target_round_id,
+                lookback=self.round_scan_lookback,
+                unresolved_mismatch=bool(unresolved_mismatch),
+            )
+
+        return self._fetch_round_metrics_for_round_id(requested_league_id, target_round_id)
+
 
 class GoMiningRoundAbilityApiClient:
     def __init__(
@@ -2268,6 +2436,7 @@ class GoMiningRoundAbilityApiClient:
         timeout_seconds: int = ROUND_API_TIMEOUT_SECONDS,
         max_retries: int = ROUND_API_MAX_RETRIES,
         token_fetcher: Optional[Callable[[], Optional[str]]] = None,
+        rate_controller: Optional[AdaptiveRateController] = None,
     ) -> None:
         self.bearer_token = bearer_token.strip()
         self.token_fetcher = token_fetcher
@@ -2276,6 +2445,7 @@ class GoMiningRoundAbilityApiClient:
         self.page_limit = max(1, min(50, int(page_limit)))
         self.timeout_seconds = max(1, int(timeout_seconds))
         self.max_retries = max(1, int(max_retries))
+        self.rate_controller = rate_controller
         self.session = requests.Session()
         self.headers = {
             "accept": "application/json, text/plain, */*",
@@ -2293,10 +2463,6 @@ class GoMiningRoundAbilityApiClient:
         self.round_counts_cache: Dict[int, Dict[str, int]] = {}
         # Cache excluded user's per-round ability usage for audit output in sheet.
         self.round_excluded_user_boosts_cache: Dict[int, Dict[str, int]] = {}
-        self._round_user_503_streak = 0
-        self._adaptive_round_user_throttle_active = False
-        self._adaptive_round_user_next_ts = 0.0
-        self._adaptive_round_user_effective_rpm = float(max(1, GOMINING_API_REQ_PER_MIN))
 
     def _set_bearer(self, token: str) -> None:
         self.bearer_token = token.strip()
@@ -2305,87 +2471,24 @@ class GoMiningRoundAbilityApiClient:
     def _refresh_bearer(self, force: bool = False) -> bool:
         if not self.token_fetcher:
             return bool(self.bearer_token)
-        if self.bearer_token and not force:
-            return True
-        tok = (self.token_fetcher() or "").strip()
+        if not force:
+            cached = _shared_token_cached(self.token_fetcher)
+            if cached and cached != self.bearer_token:
+                self._set_bearer(cached)
+                return True
+            if self.bearer_token:
+                return True
+        tok = _shared_token_fetch(self.token_fetcher, force=force)
         if not tok:
             return bool(self.bearer_token)
-        self._set_bearer(tok)
+        if tok != self.bearer_token:
+            self._set_bearer(tok)
         return True
-
-    def _limiter_per_minute(self) -> float:
-        for attr in ("capacity", "per_minute", "capacity_per_min"):
-            val = safe_float(getattr(self.limiter, attr, None))
-            if val is not None and val > 0:
-                return float(val)
-        return float(max(1, GOMINING_API_REQ_PER_MIN))
-
-    def _adaptive_effective_rpm(self) -> float:
-        base_rpm = max(1.0, self._limiter_per_minute())
-        if self._round_user_503_streak <= 0:
-            return base_rpm
-        scale = float(2 ** min(6, self._round_user_503_streak))
-        return max(float(ROUND_USER_ADAPTIVE_MIN_RPM), base_rpm / scale)
-
-    def _adaptive_wait_before_round_user_request(self) -> None:
-        if not self._adaptive_round_user_throttle_active:
-            return
-        effective_rpm = max(float(ROUND_USER_ADAPTIVE_MIN_RPM), self._adaptive_effective_rpm())
-        slot_s = 60.0 / effective_rpm
-        now = time.monotonic()
-        if self._adaptive_round_user_next_ts < now:
-            self._adaptive_round_user_next_ts = now
-        wait_s = self._adaptive_round_user_next_ts - now
-        self._adaptive_round_user_next_ts += slot_s
-        if wait_s > 0:
-            time.sleep(wait_s)
-
-    def _on_round_user_503_retry(self, attempt: int, **ctx: Any) -> None:
-        self._round_user_503_streak += 1
-        effective_rpm = max(float(ROUND_USER_ADAPTIVE_MIN_RPM), self._adaptive_effective_rpm())
-        self._adaptive_round_user_effective_rpm = effective_rpm
-        if self._round_user_503_streak >= 2 and not self._adaptive_round_user_throttle_active:
-            self._adaptive_round_user_throttle_active = True
-            self._adaptive_round_user_next_ts = time.monotonic()
-            log_warn(
-                "gomining_api.round_user_adaptive_throttle_enter",
-                streak=self._round_user_503_streak,
-                effective_rpm=round(effective_rpm, 2),
-                attempt=attempt,
-                **ctx,
-            )
-        elif self._adaptive_round_user_throttle_active:
-            log_warn(
-                "gomining_api.round_user_adaptive_throttle_update",
-                streak=self._round_user_503_streak,
-                effective_rpm=round(effective_rpm, 2),
-                attempt=attempt,
-                **ctx,
-            )
-
-    def _on_round_user_success(self, attempt: int, **ctx: Any) -> None:
-        if self._adaptive_round_user_throttle_active:
-            log_info(
-                "gomining_api.round_user_adaptive_throttle_exit",
-                streak=self._round_user_503_streak,
-                effective_rpm=round(self._adaptive_round_user_effective_rpm, 2),
-                attempt=attempt,
-                **ctx,
-            )
-        self._round_user_503_streak = 0
-        self._adaptive_round_user_throttle_active = False
-        self._adaptive_round_user_next_ts = 0.0
-        self._adaptive_round_user_effective_rpm = float(max(1, self._limiter_per_minute()))
 
     def _post_json_with_retry(self, payload: Dict[str, Any], **ctx: Any) -> Optional[Dict[str, Any]]:
         self._refresh_bearer(force=False)
         delay_s = 0.6
-        attempt = 0
-        max_attempts_default = max(1, int(self.max_retries))
-        max_attempts_503 = max(max_attempts_default, int(ROUND_USER_503_MAX_RETRIES))
-        while True:
-            attempt += 1
-            self._adaptive_wait_before_round_user_request()
+        for attempt in range(1, self.max_retries + 1):
             self.limiter.wait_for_token(1.0)
             try:
                 resp = self.session.post(
@@ -2395,7 +2498,7 @@ class GoMiningRoundAbilityApiClient:
                     timeout=self.timeout_seconds,
                 )
             except Exception as e:
-                if attempt >= max_attempts_default:
+                if attempt >= self.max_retries:
                     log_warn("gomining_api.round_user_request_failed", attempt=attempt, err=repr(e), **ctx)
                     return None
                 sleep_s = delay_s + random.uniform(0.0, 0.2)
@@ -2407,14 +2510,15 @@ class GoMiningRoundAbilityApiClient:
                     **ctx,
                 )
                 time.sleep(sleep_s)
-                delay_s = min(float(ROUND_USER_BACKOFF_MAX_SECONDS), delay_s * 2.0)
+                delay_s = min(8.0, delay_s * 2.0)
                 continue
 
             if resp.status_code == 200:
+                if self.rate_controller is not None:
+                    self.rate_controller.record_status(200)
                 try:
                     data = resp.json()
                     if isinstance(data, dict):
-                        self._on_round_user_success(attempt=attempt, **ctx)
                         return data
                     log_warn("gomining_api.round_user_invalid_json_type", attempt=attempt, typ=type(data).__name__, **ctx)
                     return None
@@ -2423,21 +2527,22 @@ class GoMiningRoundAbilityApiClient:
                     return None
 
             if resp.status_code == 401:
-                if attempt < max_attempts_default and self._refresh_bearer(force=True):
+                if attempt < self.max_retries and self._refresh_bearer(force=True):
                     log_warn("gomining_api.round_user_unauthorized_retry", attempt=attempt, **ctx)
                     continue
                 log_warn("gomining_api.round_user_unauthorized", attempt=attempt, **ctx)
                 return None
             if resp.status_code == 403 and _is_jwt_expired_response(resp):
-                if attempt < max_attempts_default and self._refresh_bearer(force=True):
+                if attempt < self.max_retries and self._refresh_bearer(force=True):
                     log_warn("gomining_api.round_user_forbidden_expired_retry", attempt=attempt, **ctx)
                     continue
                 log_warn("gomining_api.round_user_forbidden_expired", attempt=attempt, **ctx)
                 return None
 
             retryable = resp.status_code in {429, 500, 502, 503, 504}
-            max_attempts_for_status = max_attempts_503 if resp.status_code == 503 else max_attempts_default
-            if retryable and attempt < max_attempts_for_status:
+            if self.rate_controller is not None:
+                self.rate_controller.record_status(resp.status_code)
+            if retryable and attempt < self.max_retries:
                 retry_after = None
                 try:
                     ra = resp.headers.get("Retry-After")
@@ -2445,27 +2550,16 @@ class GoMiningRoundAbilityApiClient:
                         retry_after = float(ra)
                 except Exception:
                     retry_after = None
-                if resp.status_code == 503:
-                    self._on_round_user_503_retry(attempt=attempt, **ctx)
-                sleep_base = delay_s
-                if resp.status_code in {429, 503}:
-                    sleep_base = min(float(ROUND_USER_BACKOFF_MAX_SECONDS), max(delay_s, 1.0))
-                sleep_s = min(
-                    float(ROUND_USER_BACKOFF_MAX_SECONDS),
-                    max(sleep_base, retry_after or 0.0) + random.uniform(0.0, 0.2),
-                )
+                sleep_s = max(delay_s, retry_after or 0.0) + random.uniform(0.0, 0.2)
                 log_warn(
                     "gomining_api.round_user_http_retry",
                     attempt=attempt,
                     status=resp.status_code,
                     sleep_s=round(sleep_s, 3),
-                    max_attempts=max_attempts_for_status,
-                    streak_503=self._round_user_503_streak,
-                    effective_rpm=round(self._adaptive_round_user_effective_rpm, 2),
                     **ctx,
                 )
                 time.sleep(sleep_s)
-                delay_s = min(float(ROUND_USER_BACKOFF_MAX_SECONDS), delay_s * 2.0)
+                delay_s = min(8.0, delay_s * 2.0)
                 continue
 
             log_warn(
@@ -2473,10 +2567,10 @@ class GoMiningRoundAbilityApiClient:
                 attempt=attempt,
                 status=resp.status_code,
                 body_preview=resp.text[:180],
-                max_attempts=max_attempts_for_status,
                 **ctx,
             )
             return None
+        return None
 
     def fetch_round_ability_counts(
         self,
@@ -2726,41 +2820,43 @@ def classify_sheet_error(err: Exception) -> Tuple[bool, Optional[float], Optiona
 class TokenBucket:
     def __init__(self, per_minute: int, name: str = "bucket") -> None:
         self.name = name
-        self.capacity = max(1, per_minute)
+        self.capacity = max(1, int(per_minute))
         self.tokens = float(self.capacity)
         self.refill = float(self.capacity) / 60.0
         self.last = time.monotonic()
         self.total_acquired = 0
         self.total_wait_s = 0.0
         self.wait_events = 0
+        self._lock = threading.Lock()
 
     def wait_for_token(self, amount: float = 1.0) -> None:
         start_wait = time.monotonic()
         local_wait_events = 0
         while True:
-            now = time.monotonic()
-            dt = now - self.last
-            self.last = now
-            self.tokens = min(self.capacity, self.tokens + dt * self.refill)
-            if self.tokens >= amount:
-                self.tokens -= amount
-                self.total_acquired += int(amount)
-                waited = time.monotonic() - start_wait
-                if waited > 0:
-                    self.total_wait_s += waited
-                    self.wait_events += local_wait_events
-                if DEBUG_VERBOSE and (waited > 0.001 or LOGGER.isEnabledFor(logging.DEBUG)):
-                    log_debug(
-                        "rate.acquire",
-                        bucket=self.name,
-                        amount=amount,
-                        waited_s=f"{waited:.4f}",
-                        tokens_left=f"{self.tokens:.3f}",
-                        total_acquired=self.total_acquired,
-                        total_wait_s=f"{self.total_wait_s:.3f}",
-                    )
-                return
-            need = amount - self.tokens
+            with self._lock:
+                now = time.monotonic()
+                dt = now - self.last
+                self.last = now
+                self.tokens = min(self.capacity, self.tokens + dt * self.refill)
+                if self.tokens >= amount:
+                    self.tokens -= amount
+                    self.total_acquired += int(amount)
+                    waited = time.monotonic() - start_wait
+                    if waited > 0:
+                        self.total_wait_s += waited
+                        self.wait_events += local_wait_events
+                    if DEBUG_VERBOSE and (waited > 0.001 or LOGGER.isEnabledFor(logging.DEBUG)):
+                        log_debug(
+                            "rate.acquire",
+                            bucket=self.name,
+                            amount=amount,
+                            waited_s=f"{waited:.4f}",
+                            tokens_left=f"{self.tokens:.3f}",
+                            total_acquired=self.total_acquired,
+                            total_wait_s=f"{self.total_wait_s:.3f}",
+                        )
+                    return
+                need = amount - self.tokens
             sleep_s = max(0.01, need / self.refill)
             local_wait_events += 1
             if DEBUG_VERBOSE and LOGGER.isEnabledFor(logging.DEBUG):
@@ -2774,15 +2870,91 @@ class TokenBucket:
                 )
             time.sleep(sleep_s)
 
+    def set_rate_per_minute(self, per_minute: int) -> None:
+        new_cap = max(1, int(per_minute))
+        with self._lock:
+            now = time.monotonic()
+            dt = now - self.last
+            self.last = now
+            self.tokens = min(self.capacity, self.tokens + dt * self.refill)
+            self.capacity = new_cap
+            self.refill = float(new_cap) / 60.0
+            self.tokens = min(float(self.capacity), self.tokens)
+
     def snapshot(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "capacity_per_min": self.capacity,
-            "tokens_now": round(self.tokens, 3),
-            "total_acquired": self.total_acquired,
-            "total_wait_s": round(self.total_wait_s, 3),
-            "wait_events": self.wait_events,
-        }
+        with self._lock:
+            return {
+                "name": self.name,
+                "capacity_per_min": self.capacity,
+                "tokens_now": round(self.tokens, 3),
+                "total_acquired": self.total_acquired,
+                "total_wait_s": round(self.total_wait_s, 3),
+                "wait_events": self.wait_events,
+            }
+
+
+class AdaptiveRateController:
+    def __init__(self, limiter: TokenBucket, min_rpm: int, max_rpm: int) -> None:
+        self.limiter = limiter
+        self.min_rpm = max(1, int(min_rpm))
+        self.max_rpm = max(self.min_rpm, int(max_rpm))
+        self.current_rpm = min(self.max_rpm, max(self.min_rpm, int(limiter.capacity)))
+        self._retryable_streak = 0
+        self._success_streak = 0
+        self._lock = threading.Lock()
+
+    def record_status(self, status_code: Optional[int]) -> None:
+        if not ADAPTIVE_RPM_ENABLE:
+            return
+        with self._lock:
+            if status_code is not None and int(status_code) in {429, 500, 502, 503, 504}:
+                self._retryable_streak += 1
+                self._success_streak = 0
+                if self._retryable_streak >= 5:
+                    new_rpm = max(self.min_rpm, int(round(self.current_rpm * 0.9)))
+                    if new_rpm < self.current_rpm:
+                        prev = self.current_rpm
+                        self.current_rpm = new_rpm
+                        self.limiter.set_rate_per_minute(new_rpm)
+                        log_warn("rate.adaptive_down", prev_rpm=prev, new_rpm=new_rpm, status=status_code, streak=self._retryable_streak)
+                    self._retryable_streak = 0
+                return
+
+            if status_code == 200:
+                self._success_streak += 1
+                self._retryable_streak = 0
+                if self._success_streak >= 120:
+                    new_rpm = min(self.max_rpm, int(round(self.current_rpm * 1.05)))
+                    if new_rpm > self.current_rpm:
+                        prev = self.current_rpm
+                        self.current_rpm = new_rpm
+                        self.limiter.set_rate_per_minute(new_rpm)
+                        log_info("rate.adaptive_up", prev_rpm=prev, new_rpm=new_rpm, success_streak=self._success_streak)
+                    self._success_streak = 0
+
+
+def _is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as e:
+        err = getattr(e, "errno", None)
+        winerr = getattr(e, "winerror", None)
+        if err == errno.ESRCH:
+            return False
+        # Windows commonly reports dead PID probes as winerror 87 / EINVAL.
+        if winerr == 87 or err == errno.EINVAL:
+            return False
+        if err == errno.EPERM:
+            return True
+        # Unknown platform-specific error; default to "running" to avoid false unlock.
+        return True
+    return True
 
 
 class SingleInstanceLock:
@@ -2790,15 +2962,49 @@ class SingleInstanceLock:
         self.path = path
         self.acquired = False
 
+    @staticmethod
+    def _read_lock_pid(path: str) -> Optional[int]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                txt = f.read()
+        except Exception:
+            return None
+        m = re.search(r"\bpid=(\d+)\b", txt)
+        if not m:
+            return None
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
     def acquire(self) -> None:
         p = Path(self.path)
-        try:
-            fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(f"pid={os.getpid()} ts={utc_now_iso()}\n")
-            self.acquired = True
-        except FileExistsError:
-            raise RuntimeError(f"Lock file exists: {self.path}")
+        for attempt in (1, 2):
+            try:
+                fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(f"pid={os.getpid()} ts={utc_now_iso()}\n")
+                self.acquired = True
+                return
+            except FileExistsError:
+                if attempt >= 2:
+                    break
+                existing_pid = self._read_lock_pid(str(p))
+                # Conservative stale-lock cleanup: only delete when lock owner is clearly dead
+                # (or lock was left by the current process).
+                if existing_pid is None:
+                    break
+                if existing_pid != os.getpid() and _is_pid_running(existing_pid):
+                    break
+                try:
+                    os.remove(self.path)
+                    log_warn("lockfile.stale_removed", path=self.path, stale_pid=existing_pid)
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    log_warn("lockfile.stale_remove_failed", path=self.path, stale_pid=existing_pid, err=repr(e))
+                    break
+        raise RuntimeError(f"Lock file exists: {self.path}")
 
     def release(self) -> None:
         if not self.acquired:
@@ -2902,6 +3108,21 @@ class StateStore:
             );
             CREATE INDEX IF NOT EXISTS ix_api_round_cache_lookup
               ON api_round_cache(league_id, round_id DESC);
+
+            CREATE TABLE IF NOT EXISTS round_processing_state (
+              league_id INTEGER NOT NULL,
+              round_id INTEGER NOT NULL,
+              metrics_status TEXT NOT NULL DEFAULT 'pending',
+              abilities_status TEXT NOT NULL DEFAULT 'pending',
+              sheet_status TEXT NOT NULL DEFAULT 'pending',
+              last_error TEXT,
+              retry_after_ts REAL NOT NULL DEFAULT 0,
+              attempt_count INTEGER NOT NULL DEFAULT 0,
+              updated_at REAL NOT NULL,
+              PRIMARY KEY (league_id, round_id)
+            );
+            CREATE INDEX IF NOT EXISTS ix_round_processing_retry
+              ON round_processing_state(retry_after_ts, league_id, round_id);
             """
         )
         self._ensure_sheet_state_columns()
@@ -2965,6 +3186,96 @@ class StateStore:
         )
         self.conn.commit()
 
+    def upsert_round_processing_state(
+        self,
+        league_id: int,
+        round_id: int,
+        *,
+        metrics_status: Optional[str] = None,
+        abilities_status: Optional[str] = None,
+        sheet_status: Optional[str] = None,
+        last_error: Optional[str] = None,
+        retry_after_ts: Optional[float] = None,
+        attempt_count: Optional[int] = None,
+    ) -> None:
+        lid = safe_int(league_id)
+        rid = safe_int(round_id)
+        if lid is None or rid is None:
+            return
+        prev = self.get_round_processing_state(lid, rid) or {}
+        now = time.time()
+        self.conn.execute(
+            """
+            INSERT INTO round_processing_state(
+              league_id,round_id,metrics_status,abilities_status,sheet_status,last_error,retry_after_ts,attempt_count,updated_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(league_id,round_id) DO UPDATE SET
+              metrics_status=excluded.metrics_status,
+              abilities_status=excluded.abilities_status,
+              sheet_status=excluded.sheet_status,
+              last_error=excluded.last_error,
+              retry_after_ts=excluded.retry_after_ts,
+              attempt_count=excluded.attempt_count,
+              updated_at=excluded.updated_at
+            """,
+            (
+                lid,
+                rid,
+                str(metrics_status or prev.get("metrics_status") or "pending"),
+                str(abilities_status or prev.get("abilities_status") or "pending"),
+                str(sheet_status or prev.get("sheet_status") or "pending"),
+                (str(last_error)[:4000] if last_error else prev.get("last_error")),
+                float(retry_after_ts if retry_after_ts is not None else prev.get("retry_after_ts") or 0.0),
+                int(attempt_count if attempt_count is not None else prev.get("attempt_count") or 0),
+                now,
+            ),
+        )
+        self.conn.commit()
+
+    def get_round_processing_state(self, league_id: int, round_id: int) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            """
+            SELECT league_id,round_id,metrics_status,abilities_status,sheet_status,last_error,retry_after_ts,attempt_count,updated_at
+            FROM round_processing_state
+            WHERE league_id=? AND round_id=?
+            """,
+            (league_id, round_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_retryable_round_states(self, league_id: int, limit: int = 200) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT league_id,round_id,metrics_status,abilities_status,sheet_status,last_error,retry_after_ts,attempt_count,updated_at
+            FROM round_processing_state
+            WHERE league_id=?
+              AND retry_after_ts<=?
+              AND (metrics_status!='ok' OR abilities_status!='ok' OR sheet_status!='ok')
+            ORDER BY round_id ASC
+            LIMIT ?
+            """,
+            (league_id, time.time(), max(1, int(limit))),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_missing_rows_for_range(self, sheet_id: int, league_id: int, from_round: int, to_round: int) -> int:
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM api_round_cache a
+            LEFT JOIN round_row_map m
+              ON m.sheet_id=? AND m.round_id=a.round_id
+            WHERE a.league_id=?
+              AND a.round_id>=?
+              AND a.round_id<=?
+              AND a.ended_at IS NOT NULL
+              AND m.round_id IS NULL
+            """,
+            (sheet_id, league_id, from_round, to_round),
+        ).fetchone()
+        return int(row["c"]) if row else 0
+
     def get_round_row_map_bulk(self, sheet_id: int, round_ids: Sequence[int]) -> Dict[int, Dict[str, Any]]:
         if not round_ids:
             return {}
@@ -2985,28 +3296,6 @@ class StateStore:
                 "finalized": int(r["finalized"]),
             }
         return out
-
-    def advance_last_synced_round_contiguous(self, sheet_id: int) -> Optional[int]:
-        cur = self.get_last_synced_round(sheet_id)
-        if cur is None:
-            return None
-        start = int(cur)
-        while True:
-            next_round = int(cur) + 1
-            row = self.conn.execute(
-                "SELECT 1 FROM round_row_map WHERE sheet_id=? AND round_id=? LIMIT 1",
-                (sheet_id, next_round),
-            ).fetchone()
-            if row is None:
-                break
-            cur = next_round
-        if cur > start:
-            self.conn.execute(
-                "UPDATE sheet_state SET last_synced_round=?, updated_at=? WHERE sheet_id=?",
-                (int(cur), time.time(), sheet_id),
-            )
-            self.conn.commit()
-        return int(cur)
 
     def get_max_row_idx(self, sheet_id: int) -> Optional[int]:
         row = self.conn.execute(
@@ -4003,6 +4292,17 @@ def flush_sheet_queue_with_rate_limit(state: StateStore, contexts: Dict[int, She
                     finalized = int(valid_payloads[k].get("finalized", 0))
                     row_idx = start_row + k
                     state.upsert_row_map(ws_id, rid, row_idx, checksum, finalized)
+                    state.set_last_synced_round(ws_id, rid)
+                    state.upsert_round_processing_state(
+                        ctx.league_id,
+                        rid,
+                        metrics_status="ok",
+                        abilities_status="ok",
+                        sheet_status="ok",
+                        last_error=None,
+                        retry_after_ts=0.0,
+                        attempt_count=0,
+                    )
                     state.delete_op(int(b["id"]))
                     processed += 1
                     if DEBUG_VERBOSE:
@@ -4015,7 +4315,6 @@ def flush_sheet_queue_with_rate_limit(state: StateStore, contexts: Dict[int, She
                             checksum=checksum[:12],
                         )
 
-                contiguous_last = state.advance_last_synced_round_contiguous(ws_id)
                 ctx.next_row = end_row + 1
                 state.prune_row_map(ws_id, ROW_MAP_KEEP_PER_SHEET)
                 log_info(
@@ -4027,7 +4326,6 @@ def flush_sheet_queue_with_rate_limit(state: StateStore, contexts: Dict[int, She
                     first_round=valid_batch[0]["round_id"],
                     last_round=valid_batch[-1]["round_id"],
                     next_row=ctx.next_row,
-                    contiguous_last_synced=contiguous_last,
                 )
 
             except Exception as e:
@@ -4035,6 +4333,16 @@ def flush_sheet_queue_with_rate_limit(state: StateStore, contexts: Dict[int, She
                 for b in batch:
                     op_id = int(b["id"])
                     next_retry = int(b["retry_count"]) + 1
+                    rid = safe_int(b.get("round_id"))
+                    if rid is not None:
+                        state.upsert_round_processing_state(
+                            ctx.league_id,
+                            rid,
+                            sheet_status="failed",
+                            last_error=repr(e),
+                            retry_after_ts=time.time() + min(ROUND_RETRY_BACKOFF_MAX_SECONDS, ROUND_RETRY_BACKOFF_MIN_SECONDS * (2 ** max(0, min(next_retry, 8) - 1))),
+                            attempt_count=min(ROUND_SOFT_FAIL_MAX_ATTEMPTS, next_retry),
+                        )
                     if DROP_NON_RETRYABLE_SHEET_ERRORS and not retryable:
                         log_warn(
                             "queue.append_drop_non_retryable",
@@ -4096,7 +4404,17 @@ def flush_sheet_queue_with_rate_limit(state: StateStore, contexts: Dict[int, She
                 write_limiter.wait_for_token(1)
                 ctx.ws.update(range_name=f"A{row_idx}", values=[row], value_input_option="RAW")
                 state.upsert_row_map(ws_id, rid, row_idx, str(op["checksum"]), finalized)
-                contiguous_last = state.advance_last_synced_round_contiguous(ws_id)
+                state.set_last_synced_round(ws_id, rid)
+                state.upsert_round_processing_state(
+                    ctx.league_id,
+                    rid,
+                    metrics_status="ok",
+                    abilities_status="ok",
+                    sheet_status="ok",
+                    last_error=None,
+                    retry_after_ts=0.0,
+                    attempt_count=0,
+                )
                 state.delete_op(int(op["id"]))
                 processed += 1
                 if DEBUG_VERBOSE:
@@ -4107,12 +4425,21 @@ def flush_sheet_queue_with_rate_limit(state: StateStore, contexts: Dict[int, She
                         row_idx=row_idx,
                         finalized=finalized,
                         checksum=str(op["checksum"])[:12],
-                        contiguous_last_synced=contiguous_last,
                     )
             except Exception as e:
                 retryable, retry_after, status = classify_sheet_error(e)
                 op_id = int(op["id"])
                 next_retry = int(op["retry_count"]) + 1
+                rid_for_state = safe_int(op.get("round_id"))
+                if rid_for_state is not None:
+                    state.upsert_round_processing_state(
+                        ctx.league_id,
+                        rid_for_state,
+                        sheet_status="failed",
+                        last_error=repr(e),
+                        retry_after_ts=time.time() + min(ROUND_RETRY_BACKOFF_MAX_SECONDS, ROUND_RETRY_BACKOFF_MIN_SECONDS * (2 ** max(0, min(next_retry, 8) - 1))),
+                        attempt_count=min(ROUND_SOFT_FAIL_MAX_ATTEMPTS, next_retry),
+                    )
                 if DROP_NON_RETRYABLE_SHEET_ERRORS and not retryable:
                     log_warn(
                         "queue.update_drop_non_retryable",
@@ -4187,7 +4514,7 @@ def flush_sheet_queue_with_rate_limit(state: StateStore, contexts: Dict[int, She
                 write_limiter.wait_for_token(1)
                 ctx.ws.update(range_name=f"A{start_row}", values=rows, value_input_option="RAW")
                 state.upsert_row_map(ws_id, rid, start_row, str(op["checksum"]), 1)
-                contiguous_last = state.advance_last_synced_round_contiguous(ws_id)
+                state.set_last_synced_round(ws_id, rid)
                 state.delete_op(int(op["id"]))
                 ctx.next_row = end_row + 1
                 state.prune_row_map(ws_id, ROW_MAP_KEEP_PER_SHEET)
@@ -4200,7 +4527,6 @@ def flush_sheet_queue_with_rate_limit(state: StateStore, contexts: Dict[int, She
                     start_row=start_row,
                     end_row=end_row,
                     next_row=ctx.next_row,
-                    contiguous_last_synced=contiguous_last,
                 )
             except Exception as e:
                 retryable, retry_after, status = classify_sheet_error(e)
@@ -4248,6 +4574,13 @@ def sync_api_round_cache(
     records: List[Dict[str, Any]] = []
     failed = 0
     for league_id in wanted:
+        prev = state.fetch_latest_api_round_record(league_id)
+        prev_round_id: Optional[int] = None
+        prev_ended_at: Optional[str] = None
+        if isinstance(prev, dict):
+            prev_round_id = safe_int(prev.get("round_id"))
+            prev_ended_at = to_iso_utc(prev.get("ended_at"))
+
         rec = round_metrics_api.fetch_round_metrics_triplet(
             league_id,
             strict_league_validation=ROUND_GET_LAST_STRICT_LEAGUE_VALIDATION,
@@ -4263,24 +4596,89 @@ def sync_api_round_cache(
             log_warn("sync.api_round_cache_league_skip", league_id=league_id, reason="missing_round_id")
             continue
 
-        if ROUND_CLOSE_ON_ROLLOVER:
-            prev = state.fetch_latest_api_round_record(league_id)
-            if isinstance(prev, dict):
-                prev_round_id = safe_int(prev.get("round_id"))
-                prev_ended_at = to_iso_utc(prev.get("ended_at"))
-                if prev_round_id is not None and round_id > prev_round_id and not prev_ended_at:
-                    ended_at_synth = to_iso_utc(rec.get("snapshot_ts")) or utc_now_iso()
-                    marked = state.mark_api_round_ended(league_id, prev_round_id, ended_at_synth)
-                    if marked > 0:
-                        log_info(
-                            "sync.api_round_rollover_closed",
-                            league_id=league_id,
-                            prev_round_id=prev_round_id,
-                            next_round_id=round_id,
-                            ended_at=ended_at_synth,
-                        )
+        league_records: List[Dict[str, Any]] = []
+        if prev_round_id is not None and round_id > (prev_round_id + 1):
+            missing_total = round_id - prev_round_id - 1
+            attempted = min(missing_total, SYNC_API_GAP_FILL_MAX)
+            fetched = 0
+            fetch_by_round_id = getattr(round_metrics_api, "fetch_round_metrics_by_round_id", None)
 
-        records.append(rec)
+            if callable(fetch_by_round_id):
+                for gap_round_id in range(prev_round_id + 1, prev_round_id + attempted + 1):
+                    gap_rec = fetch_by_round_id(league_id, gap_round_id)
+                    if not isinstance(gap_rec, dict):
+                        log_warn(
+                            "sync.api_round_gap_fill_round_skip",
+                            league_id=league_id,
+                            round_id=gap_round_id,
+                            reason="round_metrics_unavailable",
+                        )
+                        break
+                    gap_round_id_resolved = safe_int(gap_rec.get("round_id"))
+                    if gap_round_id_resolved != gap_round_id:
+                        log_warn(
+                            "sync.api_round_gap_fill_round_skip",
+                            league_id=league_id,
+                            round_id=gap_round_id,
+                            reason="round_id_mismatch",
+                            payload_round_id=gap_round_id_resolved,
+                        )
+                        break
+                    league_records.append(gap_rec)
+                    fetched += 1
+            else:
+                log_warn(
+                    "sync.api_round_gap_fill_round_skip",
+                    league_id=league_id,
+                    round_id=prev_round_id + 1,
+                    reason="client_missing_method",
+                )
+
+            capped = missing_total > SYNC_API_GAP_FILL_MAX
+            remaining_missing = missing_total - fetched
+            log_info(
+                "sync.api_round_gap_fill",
+                league_id=league_id,
+                prev_round_id=prev_round_id,
+                new_round_id=round_id,
+                missing_total=missing_total,
+                attempted=attempted,
+                fetched=fetched,
+                capped=capped,
+                remaining=remaining_missing,
+            )
+            if remaining_missing <= 0:
+                league_records.append(rec)
+        else:
+            league_records.append(rec)
+
+        if ROUND_CLOSE_ON_ROLLOVER and prev_round_id is not None and not prev_ended_at and league_records:
+            next_round_id = safe_int(league_records[0].get("round_id"))
+            if next_round_id is not None and next_round_id > prev_round_id:
+                ended_at_synth = to_iso_utc(league_records[0].get("snapshot_ts")) or utc_now_iso()
+                marked = state.mark_api_round_ended(league_id, prev_round_id, ended_at_synth)
+                if marked > 0:
+                    log_info(
+                        "sync.api_round_rollover_closed",
+                        league_id=league_id,
+                        prev_round_id=prev_round_id,
+                        next_round_id=next_round_id,
+                        ended_at=ended_at_synth,
+                    )
+
+        for league_rec in league_records:
+            league_round_id = safe_int(league_rec.get("round_id"))
+            if league_round_id is None:
+                continue
+            records.append(league_rec)
+            state.upsert_round_processing_state(
+                league_id,
+                league_round_id,
+                metrics_status="ok",
+                abilities_status="pending",
+                sheet_status="pending",
+                retry_after_ts=0.0,
+            )
 
     if not records:
         log_warn("sync.api_round_cache_fetch_failed", leagues=len(wanted), failed=failed)
@@ -4517,6 +4915,18 @@ def enqueue_main_sheet_ops(
             rid = safe_int(rec.get("round_id"))
             if rid is None:
                 continue
+            rstate = state.get_round_processing_state(ctx.league_id, rid) or {}
+            retry_after_ts = float(rstate.get("retry_after_ts") or 0.0)
+            if retry_after_ts > time.time():
+                if DEBUG_VERBOSE:
+                    log_debug(
+                        "sync.round_retry_wait",
+                        sheet=ctx.title,
+                        league_id=ctx.league_id,
+                        round_id=rid,
+                        retry_after_s=round(retry_after_ts - time.time(), 2),
+                    )
+                continue
             _progress_tick(rid)
             latest_last_synced = state.get_last_synced_round(ws_id)
             if latest_last_synced is not None and latest_last_synced > last_synced:
@@ -4532,7 +4942,6 @@ def enqueue_main_sheet_ops(
                 if existing_row_idx is not None:
                     # Reconstruct missing local mapping for rows already present in sheet.
                     state.upsert_row_map(ws_id, rid, existing_row_idx, "", 0)
-                    state.advance_last_synced_round_contiguous(ws_id)
                     mapped = {"row_idx": existing_row_idx, "checksum": "", "finalized": 0}
                     row_maps[rid] = mapped
                     if DEBUG_VERBOSE:
@@ -4551,6 +4960,14 @@ def enqueue_main_sheet_ops(
                         round_id=rid,
                         last_synced=last_synced,
                     )
+            elif not isinstance(mapped, dict):
+                log_warn(
+                    "sync.round_row_map_invalid_shape",
+                    sheet=ctx.title,
+                    round_id=rid,
+                    typ=type(mapped).__name__,
+                )
+                mapped = None
 
             counts_source = "cache"
             if rid not in counts_by_round:
@@ -4574,19 +4991,34 @@ def enqueue_main_sheet_ops(
                 )
             if counts_by_id is None:
                 lag_to_latest = max_round - rid
+                prev_attempt = int(rstate.get("attempt_count") or 0)
+                next_attempt = min(ROUND_SOFT_FAIL_MAX_ATTEMPTS, prev_attempt + 1)
+                delay_s = min(
+                    ROUND_RETRY_BACKOFF_MAX_SECONDS,
+                    ROUND_RETRY_BACKOFF_MIN_SECONDS * (2 ** max(0, next_attempt - 1)),
+                )
+                state.upsert_round_processing_state(
+                    ctx.league_id,
+                    rid,
+                    metrics_status="ok",
+                    abilities_status="failed",
+                    sheet_status="pending",
+                    last_error="abilities_api_unavailable",
+                    retry_after_ts=time.time() + delay_s,
+                    attempt_count=next_attempt,
+                )
                 log_warn(
-                    "sync.round_wait_abilities_api",
+                    "sync.round_abilities_soft_fail",
                     sheet=ctx.title,
                     league_id=ctx.league_id,
                     round_id=rid,
                     last_synced=last_synced,
                     max_round=max_round,
                     lag_to_latest=lag_to_latest,
-                    mode=("hybrid_continue" if ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR else "strict_block"),
+                    retry_in_s=round(delay_s, 1),
+                    attempt=next_attempt,
                 )
-                if ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR:
-                    continue
-                break
+                continue
 
             counts_by_name: Dict[str, int] = {}
             unknown_ability_ids: List[str] = []
@@ -4846,63 +5278,109 @@ def enqueue_main_sheet_ops(
                     clan_power_up_gmt_value = None
                     clan_power_up_gmt_sentinel_value = None
 
-            row = build_canonical_row(
-                rec,
-                ability_headers,
-                counts_by_name,
-                price_cutover_round=price_cutover,
-                power_up_gmt_value=power_up_gmt_value,
-                power_up_gmt_sentinel_value=power_up_gmt_sentinel_value,
-                clan_power_up_gmt_value=clan_power_up_gmt_value,
-                clan_power_up_gmt_sentinel_value=clan_power_up_gmt_sentinel_value,
-                power_up_missing_aliases=power_up_missing_aliases,
-                excluded_user_boosts_audit=excluded_user_boosts_audit,
-            )
-            checksum = row_checksum(row)
-            finalized = 1 if rid <= (max_round - STABILIZATION_ROUNDS) else 0
-
-            if mapped is None:
-                state.enqueue_op(ws_id, "append_round", rid, checksum, {"row": row, "finalized": finalized})
-                enqueued += 1
-                if DEBUG_VERBOSE:
-                    log_debug(
-                        "sync.round_enqueued_append",
-                        sheet=ctx.title,
-                        round_id=rid,
-                        finalized=finalized,
-                        checksum=checksum[:12],
-                        row_preview=row[:12],
-                    )
-                continue
-
-            needs_update = (str(mapped.get("checksum")) != checksum) or (int(mapped.get("finalized") or 0) != finalized)
-            if needs_update:
-                row_idx = safe_int(mapped.get("row_idx"))
-                if row_idx is None:
-                    if DEBUG_VERBOSE:
-                        log_debug("sync.round_skip_update_missing_row_idx", sheet=ctx.title, round_id=rid)
-                    continue
-                state.enqueue_op(
-                    ws_id,
-                    "update_round",
-                    rid,
-                    checksum,
-                    {"row_idx": row_idx, "row": row, "finalized": finalized},
+            try:
+                row = build_canonical_row(
+                    rec,
+                    ability_headers,
+                    counts_by_name,
+                    price_cutover_round=price_cutover,
+                    power_up_gmt_value=power_up_gmt_value,
+                    power_up_gmt_sentinel_value=power_up_gmt_sentinel_value,
+                    clan_power_up_gmt_value=clan_power_up_gmt_value,
+                    clan_power_up_gmt_sentinel_value=clan_power_up_gmt_sentinel_value,
+                    power_up_missing_aliases=power_up_missing_aliases,
+                    excluded_user_boosts_audit=excluded_user_boosts_audit,
                 )
-                enqueued += 1
-                if DEBUG_VERBOSE:
-                    log_debug(
-                        "sync.round_enqueued_update",
-                        sheet=ctx.title,
-                        round_id=rid,
-                        row_idx=row_idx,
-                        finalized=finalized,
-                        old_checksum=str(mapped.get("checksum"))[:12],
-                        new_checksum=checksum[:12],
-                        row_preview=row[:12],
+                checksum = row_checksum(row)
+                finalized = 1 if rid <= (max_round - STABILIZATION_ROUNDS) else 0
+
+                if mapped is None:
+                    state.enqueue_op(ws_id, "append_round", rid, checksum, {"row": row, "finalized": finalized})
+                    state.upsert_round_processing_state(
+                        ctx.league_id,
+                        rid,
+                        metrics_status="ok",
+                        abilities_status="ok",
+                        sheet_status="pending",
+                        last_error=None,
+                        retry_after_ts=0.0,
+                        attempt_count=0,
                     )
-            elif DEBUG_VERBOSE:
-                log_debug("sync.round_skip_no_change", sheet=ctx.title, round_id=rid, row_idx=mapped.get("row_idx"), finalized=finalized)
+                    enqueued += 1
+                    if DEBUG_VERBOSE:
+                        log_debug(
+                            "sync.round_enqueued_append",
+                            sheet=ctx.title,
+                            round_id=rid,
+                            finalized=finalized,
+                            checksum=checksum[:12],
+                            row_preview=row[:12],
+                        )
+                    continue
+
+                needs_update = (str(mapped.get("checksum")) != checksum) or (int(mapped.get("finalized") or 0) != finalized)
+                if needs_update:
+                    row_idx = safe_int(mapped.get("row_idx"))
+                    if row_idx is None:
+                        if DEBUG_VERBOSE:
+                            log_debug("sync.round_skip_update_missing_row_idx", sheet=ctx.title, round_id=rid)
+                        continue
+                    state.enqueue_op(
+                        ws_id,
+                        "update_round",
+                        rid,
+                        checksum,
+                        {"row_idx": row_idx, "row": row, "finalized": finalized},
+                    )
+                    state.upsert_round_processing_state(
+                        ctx.league_id,
+                        rid,
+                        metrics_status="ok",
+                        abilities_status="ok",
+                        sheet_status="pending",
+                        last_error=None,
+                        retry_after_ts=0.0,
+                        attempt_count=0,
+                    )
+                    enqueued += 1
+                    if DEBUG_VERBOSE:
+                        log_debug(
+                            "sync.round_enqueued_update",
+                            sheet=ctx.title,
+                            round_id=rid,
+                            row_idx=row_idx,
+                            finalized=finalized,
+                            old_checksum=str(mapped.get("checksum"))[:12],
+                            new_checksum=checksum[:12],
+                            row_preview=row[:12],
+                        )
+                elif DEBUG_VERBOSE:
+                    log_debug("sync.round_skip_no_change", sheet=ctx.title, round_id=rid, row_idx=mapped.get("row_idx"), finalized=finalized)
+            except Exception as e:
+                log_warn(
+                    "sync.round_process_failed",
+                    sheet=ctx.title,
+                    league_id=ctx.league_id,
+                    round_id=rid,
+                    err=repr(e),
+                )
+                prev_attempt = int(rstate.get("attempt_count") or 0)
+                next_attempt = min(ROUND_SOFT_FAIL_MAX_ATTEMPTS, prev_attempt + 1)
+                delay_s = min(
+                    ROUND_RETRY_BACKOFF_MAX_SECONDS,
+                    ROUND_RETRY_BACKOFF_MIN_SECONDS * (2 ** max(0, next_attempt - 1)),
+                )
+                state.upsert_round_processing_state(
+                    ctx.league_id,
+                    rid,
+                    metrics_status="ok",
+                    abilities_status="ok",
+                    sheet_status="failed",
+                    last_error=repr(e),
+                    retry_after_ts=time.time() + delay_s,
+                    attempt_count=next_attempt,
+                )
+                continue
 
     return enqueued
 
@@ -5048,7 +5526,172 @@ def enqueue_clan_sheet_ops(
     return enqueued
 
 
-def main() -> None:
+def _enqueue_specific_main_rounds(
+    state: StateStore,
+    ctx: SheetContext,
+    records: Sequence[Dict[str, Any]],
+    ability_id_to_name: Dict[str, str],
+    ability_headers: List[str],
+    round_ability_api: GoMiningRoundAbilityApiClient,
+    read_limiter: Optional[TokenBucket],
+    power_up_clan_api: Optional[GoMiningClanApiClient],
+) -> int:
+    if not records:
+        return 0
+    recs_sorted = sorted(
+        [r for r in records if isinstance(r, dict) and safe_int(r.get("round_id")) is not None],
+        key=lambda r: safe_int(r.get("round_id")) or -1,
+    )
+    if not recs_sorted:
+        return 0
+    orig_fetch = fetch_completed_rounds_prefer_api
+
+    def _patched_fetch(
+        db: Optional[DBClient],
+        _state: StateStore,
+        league_id: int,
+        since_round: int,
+        limit: int = MAX_ROUNDS_PER_POLL,
+    ) -> List[Dict[str, Any]]:
+        _ = (db, _state)
+        if int(league_id) != int(ctx.league_id):
+            return []
+        out: List[Dict[str, Any]] = []
+        for rec in recs_sorted:
+            rid = safe_int(rec.get("round_id"))
+            if rid is None or rid <= since_round:
+                continue
+            out.append(rec)
+            if len(out) >= max(1, int(limit)):
+                break
+        return out
+
+    globals()["fetch_completed_rounds_prefer_api"] = _patched_fetch  # type: ignore[assignment]
+    try:
+        return enqueue_main_sheet_ops(
+            None,
+            state,
+            {ctx.ws_id: ctx},
+            ability_id_to_name,
+            ability_headers,
+            round_ability_api,
+            read_limiter,
+            power_up_clan_api=power_up_clan_api,
+            flush_tick=None,
+            flush_every_seconds=ENQUEUE_FLUSH_EVERY_SECONDS,
+        )
+    finally:
+        globals()["fetch_completed_rounds_prefer_api"] = orig_fetch  # type: ignore[assignment]
+
+
+def run_reconcile_pass(
+    state: StateStore,
+    main_contexts: Dict[int, SheetContext],
+    ability_id_to_name: Dict[str, str],
+    ability_headers: List[str],
+    round_ability_api: GoMiningRoundAbilityApiClient,
+    read_limiter: Optional[TokenBucket],
+    power_up_clan_api: Optional[GoMiningClanApiClient],
+) -> Dict[str, int]:
+    repaired_rounds = 0
+    queued_ops = 0
+    sheets_with_gaps = 0
+    for ws_id, ctx in main_contexts.items():
+        latest_round = state.fetch_latest_api_completed_round_id(ctx.league_id)
+        if latest_round is None:
+            continue
+        from_round = max(0, int(latest_round) - int(GAP_SCAN_LOOKBACK_ROUNDS))
+        records = state.fetch_api_completed_rounds(
+            ctx.league_id,
+            since_round=max(0, from_round - 1),
+            limit=max(GAP_SCAN_LOOKBACK_ROUNDS * 2, MAX_ROUNDS_PER_POLL),
+        )
+        if not records:
+            continue
+        records = [r for r in records if to_iso_utc(r.get("ended_at"))]
+        if not records:
+            continue
+        round_ids = sorted({int(safe_int(r.get("round_id")) or -1) for r in records if safe_int(r.get("round_id")) is not None})
+        if not round_ids:
+            continue
+        row_map = state.get_round_row_map_bulk(ws_id, round_ids)
+        retry_states = state.list_retryable_round_states(ctx.league_id, limit=MAX_ROUNDS_PER_POLL)
+        retry_ids = {int(safe_int(x.get("round_id")) or -1) for x in retry_states if safe_int(x.get("round_id")) is not None}
+        missing_ids = [rid for rid in round_ids if rid >= from_round and rid not in row_map]
+        target_ids = sorted({rid for rid in missing_ids if rid > 0} | {rid for rid in retry_ids if rid > 0})
+        if not target_ids:
+            continue
+        sheets_with_gaps += 1
+        rec_by_rid = {int(safe_int(r.get("round_id")) or -1): r for r in records if safe_int(r.get("round_id")) is not None}
+        target_records = [rec_by_rid[rid] for rid in target_ids if rid in rec_by_rid]
+        for rid in target_ids:
+            state.upsert_round_processing_state(
+                ctx.league_id,
+                rid,
+                metrics_status="ok",
+                abilities_status="pending",
+                sheet_status="pending",
+                retry_after_ts=0.0,
+            )
+        enq = _enqueue_specific_main_rounds(
+            state=state,
+            ctx=ctx,
+            records=target_records,
+            ability_id_to_name=ability_id_to_name,
+            ability_headers=ability_headers,
+            round_ability_api=round_ability_api,
+            read_limiter=read_limiter,
+            power_up_clan_api=power_up_clan_api,
+        )
+        if enq > 0:
+            queued_ops += enq
+            repaired_rounds += len(target_records)
+        log_info(
+            "sync.reconcile_sheet",
+            sheet=ctx.title,
+            league_id=ctx.league_id,
+            latest_seen=latest_round,
+            lookback_from=from_round,
+            targets=len(target_records),
+            queued=enq,
+        )
+    return {
+        "sheets_with_gaps": sheets_with_gaps,
+        "queued_ops": queued_ops,
+        "repaired_rounds": repaired_rounds,
+    }
+
+
+def log_main_sheet_summaries(state: StateStore, main_contexts: Dict[int, SheetContext]) -> None:
+    for ws_id, ctx in main_contexts.items():
+        latest_seen = state.fetch_latest_api_completed_round_id(ctx.league_id)
+        latest_written = state.get_last_synced_round(ws_id)
+        lag_rounds = None
+        if latest_seen is not None and latest_written is not None:
+            lag_rounds = max(0, int(latest_seen) - int(latest_written))
+        from_round = 0
+        to_round = 0
+        gap_count = 0
+        if latest_seen is not None:
+            from_round = max(0, int(latest_seen) - int(GAP_SCAN_LOOKBACK_ROUNDS))
+            to_round = int(latest_seen)
+            gap_count = state.count_missing_rows_for_range(ws_id, ctx.league_id, from_round, to_round)
+        retry_backlog = len(state.list_retryable_round_states(ctx.league_id, limit=500))
+        log_info(
+            "sync.sheet_summary",
+            sheet=ctx.title,
+            league_id=ctx.league_id,
+            latest_seen=latest_seen,
+            latest_written=latest_written,
+            lag_rounds=lag_rounds,
+            gap_count=gap_count,
+            retry_queue_depth=retry_backlog,
+            lookback_from=from_round,
+            lookback_to=to_round,
+        )
+
+
+def main(once_reconcile: bool = False) -> None:
     lock = SingleInstanceLock(LOCK_FILE_PATH)
     lock.acquire()
     state: Optional[StateStore] = None
@@ -5073,6 +5716,7 @@ def main() -> None:
         write_limiter = TokenBucket(GS_WRITE_REQ_PER_MIN, name="sheets_write")
         read_limiter = TokenBucket(GS_READ_REQ_PER_MIN, name="sheets_read")
         gomining_limiter = TokenBucket(GOMINING_API_REQ_PER_MIN, name="gomining_api")
+        rate_controller = AdaptiveRateController(gomining_limiter, ADAPTIVE_RPM_MIN, ADAPTIVE_RPM_MAX)
         if ENABLE_DB_FALLBACK_RAW:
             _warn_db_deprecated("ENABLE_DB_FALLBACK env")
         token_fetcher: Optional[Callable[[], Optional[str]]] = None
@@ -5097,6 +5741,7 @@ def main() -> None:
             timeout_seconds=CLAN_API_TIMEOUT_SECONDS,
             max_retries=CLAN_API_MAX_RETRIES,
             token_fetcher=token_fetcher,
+            rate_controller=rate_controller,
         )
         clan_api: Optional[GoMiningClanApiClient] = power_up_clan_api if ENABLE_CLAN_SYNC else None
         round_metrics_api = GoMiningRoundMetricsApiClient(
@@ -5113,6 +5758,7 @@ def main() -> None:
             timeout_seconds=ROUND_METRICS_TIMEOUT_SECONDS,
             max_retries=ROUND_METRICS_MAX_RETRIES,
             token_fetcher=token_fetcher,
+            rate_controller=rate_controller,
         )
         round_ability_api = GoMiningRoundAbilityApiClient(
             effective_bearer,
@@ -5122,6 +5768,7 @@ def main() -> None:
             timeout_seconds=ROUND_API_TIMEOUT_SECONDS,
             max_retries=ROUND_API_MAX_RETRIES,
             token_fetcher=token_fetcher,
+            rate_controller=rate_controller,
         )
 
         sh = open_spreadsheet()
@@ -5183,10 +5830,6 @@ def main() -> None:
             round_api_page_limit=ROUND_API_PAGE_LIMIT,
             round_api_timeout_s=ROUND_API_TIMEOUT_SECONDS,
             round_api_max_retries=ROUND_API_MAX_RETRIES,
-            round_user_503_max_retries=ROUND_USER_503_MAX_RETRIES,
-            round_user_backoff_max_s=ROUND_USER_BACKOFF_MAX_SECONDS,
-            round_user_adaptive_min_rpm=ROUND_USER_ADAPTIVE_MIN_RPM,
-            ability_fetch_hybrid_continue_on_error=ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR,
             leagues_api_poll_s=LEAGUES_API_POLL_SECONDS,
             league_index_lookback_days=LEAGUE_INDEX_LOOKBACK_DAYS,
             league_index_try_without_calculated_at=LEAGUE_INDEX_TRY_WITHOUT_CALCULATED_AT,
@@ -5195,6 +5838,15 @@ def main() -> None:
             token_verify_ssl=TOKEN_VERIFY_SSL,
             api_only_mode=True,
             enqueue_flush_every_s=ENQUEUE_FLUSH_EVERY_SECONDS,
+            reconcile_interval_s=RECONCILE_INTERVAL_SECONDS,
+            round_soft_fail_max_attempts=ROUND_SOFT_FAIL_MAX_ATTEMPTS,
+            round_retry_backoff_min_s=ROUND_RETRY_BACKOFF_MIN_SECONDS,
+            round_retry_backoff_max_s=ROUND_RETRY_BACKOFF_MAX_SECONDS,
+            gap_scan_lookback_rounds=GAP_SCAN_LOOKBACK_ROUNDS,
+            adaptive_rpm_enabled=ADAPTIVE_RPM_ENABLE,
+            adaptive_rpm_min=ADAPTIVE_RPM_MIN,
+            adaptive_rpm_max=ADAPTIVE_RPM_MAX,
+            once_reconcile=bool(once_reconcile),
             dry_run=DRY_RUN,
             log_level=LOG_LEVEL,
             debug_verbose=DEBUG_VERBOSE,
@@ -5219,7 +5871,27 @@ def main() -> None:
         last_refresh = time.time()
         last_poll = 0.0
         last_league_api_poll = 0.0
+        last_reconcile_poll = 0.0
         last_heartbeat = 0.0
+
+        if once_reconcile:
+            rec_stats = run_reconcile_pass(
+                state=state,
+                main_contexts=main_contexts,
+                ability_id_to_name=ability_id_to_name,
+                ability_headers=ability_headers,
+                round_ability_api=round_ability_api,
+                read_limiter=read_limiter,
+                power_up_clan_api=power_up_clan_api,
+            )
+            flushed_total = 0
+            while True:
+                done = flush_sheet_queue_with_rate_limit(state, contexts_all, write_limiter)
+                if done <= 0:
+                    break
+                flushed_total += int(done)
+            log_info("sync.once_reconcile_done", stats=rec_stats, flushed=flushed_total, queue_total=state.queue_total_count())
+            return
 
         while True:
             now = time.time()
@@ -5318,6 +5990,20 @@ def main() -> None:
                         queue_due=state.queue_due_count(),
                     )
 
+            if now - last_reconcile_poll >= RECONCILE_INTERVAL_SECONDS:
+                rec_stats = run_reconcile_pass(
+                    state=state,
+                    main_contexts=main_contexts,
+                    ability_id_to_name=ability_id_to_name,
+                    ability_headers=ability_headers,
+                    round_ability_api=round_ability_api,
+                    read_limiter=read_limiter,
+                    power_up_clan_api=power_up_clan_api,
+                )
+                last_reconcile_poll = now
+                if rec_stats.get("queued_ops", 0) > 0 or DEBUG_VERBOSE:
+                    log_info("sync.reconcile_done", **rec_stats, queue_total=state.queue_total_count(), queue_due=state.queue_due_count())
+
             done = flush_sheet_queue_with_rate_limit(state, contexts_all, write_limiter)
             if done > 0:
                 log_info("queue.flushed", processed=done)
@@ -5335,6 +6021,7 @@ def main() -> None:
                     read_limiter=read_limiter.snapshot(),
                     gomining_limiter=gomining_limiter.snapshot(),
                 )
+                log_main_sheet_summaries(state, main_contexts)
                 last_heartbeat = now
 
             time.sleep(1.0)
@@ -5349,4 +6036,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Hashrate Hunter continuous sync service")
+    parser.add_argument(
+        "--once-reconcile",
+        action="store_true",
+        help="Run one reconcile pass (plus queue flush) and exit.",
+    )
+    args = parser.parse_args()
+    main(once_reconcile=bool(args.once_reconcile))
