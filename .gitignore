@@ -12,3 +12,9 @@ sync_debug.log
 sync_state.sqlite
 sync.lock
 
+sync_debug.log
+sync_state.sqlite
+sync_state.sqlite-shm
+sync_state.sqlite-wal
+sync_state.sqlite.bak.*
+api_debug/
