@@ -44,7 +44,7 @@ if dotenv is not None:
 SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "service_acc.json")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1bq5Sy2pV35x33Q12G5_EJ2S0Kb1iXo1Y2FCxL7QIxGg")
 
-SYNC_POLL_SECONDS = int(os.getenv("SYNC_POLL_SECONDS", "120"))
+SYNC_POLL_SECONDS = int(os.getenv("SYNC_POLL_SECONDS", "5"))
 SHEET_REFRESH_SECONDS = int(os.getenv("SHEET_REFRESH_SECONDS", "1800"))
 GS_WRITE_REQ_PER_MIN = int(os.getenv("GS_WRITE_REQ_PER_MIN", "45"))
 GS_READ_REQ_PER_MIN = int(os.getenv("GS_READ_REQ_PER_MIN", "20"))
@@ -115,6 +115,7 @@ ENABLE_DB_FALLBACK_RAW = os.getenv("ENABLE_DB_FALLBACK", "").strip()
 
 STABILIZATION_ROUNDS = int(os.getenv("STABILIZATION_ROUNDS", "2"))
 MAX_ROUNDS_PER_POLL = int(os.getenv("MAX_ROUNDS_PER_POLL", "250"))
+SYNC_API_GAP_FILL_MAX = max(0, int(os.getenv("SYNC_API_GAP_FILL_MAX", "20")))
 QUEUE_FETCH_LIMIT = int(os.getenv("QUEUE_FETCH_LIMIT", "200"))
 APPEND_BATCH_SIZE = int(os.getenv("APPEND_BATCH_SIZE", "25"))
 ROW_MAP_KEEP_PER_SHEET = int(os.getenv("ROW_MAP_KEEP_PER_SHEET", "500"))
@@ -2257,6 +2258,103 @@ class GoMiningRoundMetricsApiClient:
             "round_duration_sec": round_duration_sec,
         }
 
+    def fetch_round_metrics_by_round_id(
+        self,
+        league_id: int,
+        round_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        requested_league_id = int(league_id)
+        target_round_id = int(round_id)
+
+        round_body = self._fetch_round_clan_leaderboard_by_round_id(requested_league_id, target_round_id)
+        if not isinstance(round_body, dict):
+            return None
+        round_data = self._payload_data(round_body)
+        if not isinstance(round_data, dict):
+            return None
+
+        resolved_round_id = safe_int(round_data.get("roundId"))
+        if resolved_round_id is None:
+            resolved_round_id = safe_int(round_data.get("id"))
+        if resolved_round_id != target_round_id:
+            return None
+
+        payload_league_id = safe_int(round_data.get("leagueId"))
+        if payload_league_id != requested_league_id:
+            return None
+
+        if round_data.get("active") is not False:
+            return None
+
+        ended_at = to_iso_utc(round_data.get("endedAt"))
+        if not ended_at:
+            return None
+        round_duration_sec = self._compute_round_duration_sec(round_data, ended_at)
+        if round_duration_sec is None:
+            return None
+
+        calculated_at = _to_api_calculated_at(ended_at)
+        snapshot_ts = utc_now_iso()
+
+        user_body = self._request_json_with_retry(
+            "POST",
+            self.player_leaderboard_url,
+            json_payload={
+                "pagination": {"skip": 0, "limit": self.user_page_limit},
+                "calculatedAt": calculated_at,
+                "leagueId": requested_league_id,
+            },
+            op="gap_fill_user_leaderboard",
+            league_id=requested_league_id,
+            round_id=target_round_id,
+        )
+        if not isinstance(user_body, dict):
+            return None
+        user_data = self._payload_data(user_body)
+        if not isinstance(user_data, dict):
+            return None
+
+        clan_body = self._request_json_with_retry(
+            "POST",
+            self.clan_leaderboard_url,
+            json_payload={
+                "pagination": {"skip": 0, "limit": self.clan_page_limit},
+                "calculatedAt": calculated_at,
+                "leagueId": requested_league_id,
+            },
+            op="gap_fill_clan_leaderboard",
+            league_id=requested_league_id,
+            round_id=target_round_id,
+        )
+        if not isinstance(clan_body, dict):
+            return None
+        clan_data = self._payload_data(clan_body)
+        if not isinstance(clan_data, dict):
+            return None
+
+        gmt_fund = safe_float(user_data.get("gmtFund"))
+        user_blocks_mined = safe_int(user_data.get("totalMinedBlocks"))
+        clan_blocks_mined = safe_int(clan_data.get("totalMinedBlocks"))
+        blocks_mined = user_blocks_mined if user_blocks_mined is not None else clan_blocks_mined
+        gmt_per_block: Optional[float] = None
+        if gmt_fund is not None and blocks_mined is not None and blocks_mined > 0:
+            gmt_per_block = gmt_fund / float(blocks_mined)
+
+        return {
+            "snapshot_ts": snapshot_ts,
+            "league_id": requested_league_id,
+            "round_id": target_round_id,
+            "block_number": safe_int(round_data.get("blockNumber")),
+            "multiplier": safe_float(round_data.get("multiplier")),
+            "gmt_fund": gmt_fund,
+            "gmt_per_block": gmt_per_block,
+            "league_th": safe_float(clan_data.get("totalPower")),
+            "blocks_mined": blocks_mined,
+            "efficiency_league": safe_float(clan_data.get("weightedEnergyEfficiencyPerTh")),
+            "ended_at": ended_at,
+            "round_duration_sec": round_duration_sec,
+        }
+
 
 class GoMiningRoundAbilityApiClient:
     def __init__(
@@ -4263,10 +4361,11 @@ def sync_api_round_cache(
             log_warn("sync.api_round_cache_league_skip", league_id=league_id, reason="missing_round_id")
             continue
 
-        if ROUND_CLOSE_ON_ROLLOVER:
-            prev = state.fetch_latest_api_round_record(league_id)
-            if isinstance(prev, dict):
-                prev_round_id = safe_int(prev.get("round_id"))
+        prev = state.fetch_latest_api_round_record(league_id)
+        prev_round_id: Optional[int] = None
+        if isinstance(prev, dict):
+            prev_round_id = safe_int(prev.get("round_id"))
+            if ROUND_CLOSE_ON_ROLLOVER:
                 prev_ended_at = to_iso_utc(prev.get("ended_at"))
                 if prev_round_id is not None and round_id > prev_round_id and not prev_ended_at:
                     ended_at_synth = to_iso_utc(rec.get("snapshot_ts")) or utc_now_iso()
@@ -4279,6 +4378,26 @@ def sync_api_round_cache(
                             next_round_id=round_id,
                             ended_at=ended_at_synth,
                         )
+
+        if SYNC_API_GAP_FILL_MAX > 0 and prev_round_id is not None and round_id > prev_round_id + 1:
+            gap_start = prev_round_id + 1
+            gap_end = round_id
+            gap_ids = list(range(gap_start, min(gap_end, gap_start + SYNC_API_GAP_FILL_MAX)))
+            gap_ok = 0
+            for gap_rid in gap_ids:
+                gap_rec = round_metrics_api.fetch_round_metrics_by_round_id(league_id, gap_rid)
+                if isinstance(gap_rec, dict):
+                    records.append(gap_rec)
+                    gap_ok += 1
+            log_info(
+                "sync.api_round_gap_fill",
+                league_id=league_id,
+                gap_start=gap_start,
+                gap_end=gap_end - 1,
+                fetched=gap_ok,
+                attempted=len(gap_ids),
+                capped=len(gap_ids) < (gap_end - gap_start),
+            )
 
         records.append(rec)
 
