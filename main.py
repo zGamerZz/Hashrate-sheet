@@ -4613,7 +4613,7 @@ def sync_api_round_cache(
                             round_id=gap_round_id,
                             reason="round_metrics_unavailable",
                         )
-                        break
+                        continue
                     gap_round_id_resolved = safe_int(gap_rec.get("round_id"))
                     if gap_round_id_resolved != gap_round_id:
                         log_warn(
@@ -4623,7 +4623,7 @@ def sync_api_round_cache(
                             reason="round_id_mismatch",
                             payload_round_id=gap_round_id_resolved,
                         )
-                        break
+                        continue
                     league_records.append(gap_rec)
                     fetched += 1
             else:
@@ -4647,8 +4647,7 @@ def sync_api_round_cache(
                 capped=capped,
                 remaining=remaining_missing,
             )
-            if remaining_missing <= 0:
-                league_records.append(rec)
+            league_records.append(rec)
         else:
             league_records.append(rec)
 

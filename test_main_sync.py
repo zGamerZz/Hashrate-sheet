@@ -2361,7 +2361,7 @@ class SyncCoreTests(unittest.TestCase):
             except OSError:
                 pass
 
-    def test_sync_api_round_cache_gap_fill_capped_defers_latest(self) -> None:
+    def test_sync_api_round_cache_gap_fill_capped_still_writes_latest(self) -> None:
         class StubRoundMetricsAPI:
             def __init__(self) -> None:
                 self.by_round_calls: List[int] = []
@@ -2415,11 +2415,11 @@ class SyncCoreTests(unittest.TestCase):
             main.SYNC_API_GAP_FILL_MAX = 2
             main.log_info = lambda msg, **fields: info_events.append({"msg": msg, "fields": dict(fields)})  # type: ignore[assignment]
             written, seen = main.sync_api_round_cache(st, stub, [1])
-            self.assertEqual((written, seen), (2, 2))
+            self.assertEqual((written, seen), (3, 3))
             self.assertEqual(stub.by_round_calls, [101, 102])
             latest = st.fetch_latest_api_round_record(1)
             self.assertIsNotNone(latest)
-            self.assertEqual(latest["round_id"], 102)
+            self.assertEqual(latest["round_id"], 104)
             gap_logs = [e for e in info_events if e["msg"] == "sync.api_round_gap_fill"]
             self.assertEqual(len(gap_logs), 1)
             self.assertTrue(bool(gap_logs[0]["fields"].get("capped")))
@@ -2427,6 +2427,64 @@ class SyncCoreTests(unittest.TestCase):
         finally:
             main.SYNC_API_GAP_FILL_MAX = orig_gap_max
             main.log_info = orig_log_info  # type: ignore[assignment]
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def test_sync_api_round_cache_gap_fill_failure_still_writes_latest(self) -> None:
+        class StubRoundMetricsAPI:
+            @staticmethod
+            def _build_record(round_id: int) -> Dict[str, Any]:
+                return {
+                    "snapshot_ts": "2026-04-18T10:30:00+00:00",
+                    "league_id": 1,
+                    "round_id": round_id,
+                    "block_number": 100 + round_id,
+                    "multiplier": 1.0,
+                    "gmt_fund": 10.0,
+                    "blocks_mined": 2,
+                    "gmt_per_block": 5.0,
+                    "league_th": 1500.0,
+                    "efficiency_league": 20.0,
+                    "ended_at": "2026-04-18T10:30:00+00:00",
+                    "round_duration_sec": 60,
+                }
+
+            def fetch_round_metrics_triplet(
+                self,
+                league_id: int,
+                strict_league_validation: bool = False,
+            ) -> Dict[str, Any] | None:
+                _ = (league_id, strict_league_validation)
+                return self._build_record(104)
+
+            def fetch_round_metrics_by_round_id(self, league_id: int, round_id: int) -> Dict[str, Any] | None:
+                _ = (league_id, round_id)
+                return None
+
+        fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
+        os.close(fd)
+        orig_gap_max = main.SYNC_API_GAP_FILL_MAX
+        try:
+            st = main.StateStore(path)
+            st.upsert_api_round_record(
+                {
+                    "snapshot_ts": "2026-04-18T10:20:00+00:00",
+                    "league_id": 1,
+                    "round_id": 100,
+                    "ended_at": "2026-04-18T10:21:00+00:00",
+                }
+            )
+            main.SYNC_API_GAP_FILL_MAX = 2
+            written, seen = main.sync_api_round_cache(st, StubRoundMetricsAPI(), [1])
+            self.assertEqual((written, seen), (1, 1))
+            latest = st.fetch_latest_api_round_record(1)
+            self.assertIsNotNone(latest)
+            self.assertEqual(latest["round_id"], 104)
+            st.close()
+        finally:
+            main.SYNC_API_GAP_FILL_MAX = orig_gap_max
             try:
                 os.remove(path)
             except OSError:
