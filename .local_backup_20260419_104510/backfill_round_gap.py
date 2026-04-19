@@ -1,0 +1,1603 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import threading
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+import logging
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import main
+import requests
+
+
+DEFAULT_FROM_ROUND = 945485
+DEFAULT_TO_ROUND = "latest"
+BACKFILL_PROFILE_PRESETS: Dict[str, Dict[str, int]] = {
+    "stable": {"workers": 4, "gomining_rpm": 240, "prefetch_attempts": 5},
+    "balanced": {"workers": 8, "gomining_rpm": 420, "prefetch_attempts": 4},
+    "aggressive": {"workers": 16, "gomining_rpm": max(main.GOMINING_API_REQ_PER_MIN, 1200), "prefetch_attempts": 4},
+}
+DEFAULT_BACKFILL_PROFILE = str(os.getenv("BACKFILL_PROFILE", "stable") or "stable").strip().lower()
+if DEFAULT_BACKFILL_PROFILE not in BACKFILL_PROFILE_PRESETS:
+    DEFAULT_BACKFILL_PROFILE = "stable"
+DEFAULT_WORKERS = int(BACKFILL_PROFILE_PRESETS[DEFAULT_BACKFILL_PROFILE]["workers"])
+DEFAULT_MAX_CYCLES = 200
+DEFAULT_BACKFILL_GOMINING_RPM = int(BACKFILL_PROFILE_PRESETS[DEFAULT_BACKFILL_PROFILE]["gomining_rpm"])
+DEFAULT_PREFETCH_ATTEMPTS = int(BACKFILL_PROFILE_PRESETS[DEFAULT_BACKFILL_PROFILE]["prefetch_attempts"])
+DEFAULT_DISCORD_PROGRESS_SECONDS = 30.0
+BENIGN_ROUND_RECORD_ERRORS = {
+    "round_not_in_target_leagues",
+    "round_record_unavailable_or_not_finalized",
+}
+
+
+@dataclass
+class PrefetchRoundResult:
+    league_id: int
+    round_id: int
+    ok: bool
+    counts: Optional[Dict[str, int]] = None
+    power_up_users: List[Dict[str, Any]] = field(default_factory=list)
+    clan_power_up_users: List[Dict[str, Any]] = field(default_factory=list)
+    excluded_user_boosts: Dict[str, int] = field(default_factory=dict)
+    error: str = ""
+
+
+@dataclass
+class RoundRecordFetchResult:
+    league_id: int
+    round_id: int
+    ok: bool
+    record: Optional[Dict[str, Any]] = None
+    error: str = ""
+
+
+def _resolve_backfill_profile(profile_raw: Any) -> Tuple[str, Dict[str, int]]:
+    profile = str(profile_raw or "").strip().lower() or "stable"
+    if profile not in BACKFILL_PROFILE_PRESETS:
+        profile = "stable"
+    cfg = BACKFILL_PROFILE_PRESETS[profile]
+    return profile, {"workers": int(cfg["workers"]), "gomining_rpm": int(cfg["gomining_rpm"]), "prefetch_attempts": int(cfg["prefetch_attempts"])}
+
+
+def _normalize_round_records(records: Sequence[Any], *, context: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    invalid = 0
+    for idx, item in enumerate(records):
+        if isinstance(item, dict):
+            out.append(item)
+            continue
+        invalid += 1
+        main.log_warn(
+            "backfill.round_record_invalid_item",
+            context=context,
+            index=idx,
+            typ=type(item).__name__,
+            preview=str(item)[:160],
+        )
+    if invalid > 0:
+        main.log_warn(
+            "backfill.round_record_invalid_items",
+            context=context,
+            invalid=invalid,
+            valid=len(out),
+            total=len(records),
+        )
+    return out
+
+
+def _fmt_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "--:--:--"
+    sec = max(0, int(round(float(seconds))))
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _build_bar(done: int, total: int, width: int = 28) -> str:
+    w = max(8, int(width))
+    t = max(1, int(total))
+    d = max(0, min(int(done), t))
+    filled = int(round((d / float(t)) * w))
+    filled = max(0, min(filled, w))
+    return "[" + ("#" * filled) + ("-" * (w - filled)) + "]"
+
+
+class _ProgressMeter:
+    def __init__(
+        self,
+        stage: str,
+        total: int,
+        log_every_seconds: float = 4.0,
+        reporter: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
+        self.stage = str(stage or "progress")
+        self.total = max(0, int(total))
+        self._log_every = max(0.5, float(log_every_seconds))
+        self._start = time.monotonic()
+        self._last_log = 0.0
+        self._reporter = reporter
+
+    def tick(self, done: int, **fields: Any) -> None:
+        now = time.monotonic()
+        d = max(0, int(done))
+        should_log = d >= self.total or (now - self._last_log) >= self._log_every
+        if not should_log:
+            return
+        self._last_log = now
+        elapsed = max(0.001, now - self._start)
+        rate = float(d) / elapsed
+        remaining = max(0, self.total - d)
+        eta_s: Optional[float] = None
+        if remaining > 0 and rate > 0:
+            eta_s = float(remaining) / rate
+        pct = 100.0 if self.total <= 0 else (float(d) / float(max(1, self.total))) * 100.0
+        main.log_info(
+            "backfill.progress",
+            stage=self.stage,
+            done=d,
+            total=self.total,
+            pct=round(pct, 2),
+            bar=_build_bar(d, self.total),
+            elapsed=_fmt_duration(elapsed),
+            eta=_fmt_duration(eta_s),
+            rate_rps=round(rate, 2),
+            **fields,
+        )
+        if self._reporter is not None:
+            payload: Dict[str, Any] = {
+                "stage": self.stage,
+                "done": d,
+                "total": self.total,
+                "pct": round(pct, 2),
+                "bar": _build_bar(d, self.total),
+                "elapsed": _fmt_duration(elapsed),
+                "eta": _fmt_duration(eta_s),
+                "rate_rps": round(rate, 2),
+            }
+            payload.update(fields)
+            try:
+                self._reporter(payload)
+            except Exception:
+                pass
+
+
+class DiscordWebhookNotifier:
+    def __init__(
+        self,
+        webhook_url: str,
+        *,
+        username: str = "BackfillBot",
+        timeout_seconds: int = 10,
+        min_progress_interval_seconds: float = DEFAULT_DISCORD_PROGRESS_SECONDS,
+    ) -> None:
+        self.webhook_url = str(webhook_url or "").strip()
+        self.username = str(username or "BackfillBot").strip() or "BackfillBot"
+        self.timeout_seconds = max(1, int(timeout_seconds))
+        self.min_progress_interval_seconds = max(2.0, float(min_progress_interval_seconds))
+        self._last_by_key: Dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def _allow(self, key: Optional[str], force: bool) -> bool:
+        if force or not key:
+            return True
+        now = time.monotonic()
+        with self._lock:
+            prev = self._last_by_key.get(key, 0.0)
+            if (now - prev) < self.min_progress_interval_seconds:
+                return False
+            self._last_by_key[key] = now
+        return True
+
+    def send(self, content: str, *, key: Optional[str] = None, force: bool = False) -> None:
+        if not self.webhook_url:
+            return
+        text = str(content or "").strip()
+        if not text:
+            return
+        if not self._allow(key=key, force=force):
+            return
+        payload = {"username": self.username, "content": text[:1900]}
+        try:
+            resp = requests.post(self.webhook_url, json=payload, timeout=self.timeout_seconds)
+            if resp.status_code < 200 or resp.status_code >= 300:
+                main.log_warn(
+                    "backfill.discord_webhook_http_error",
+                    status=resp.status_code,
+                    body_preview=(resp.text or "")[:160],
+                )
+        except Exception as e:
+            main.log_warn("backfill.discord_webhook_failed", err=repr(e))
+
+
+class ThreadSafeRateGuard:
+    """
+    Thread-safe global pacer for GoMining requests.
+    Unlike a classic token bucket, this guard does not allow large bursts
+    after idle time, which avoids API overload under high worker counts.
+    """
+
+    def __init__(self, per_minute: int, name: str = "gomining_api_threadsafe") -> None:
+        self.name = str(name or "gomining_api_threadsafe")
+        self.per_minute = max(1, int(per_minute))
+        self._rate_per_sec = float(self.per_minute) / 60.0
+        self._next_allowed_ts = time.monotonic()
+        self._lock = threading.Lock()
+        self.total_acquired = 0
+        self.total_wait_s = 0.0
+        self.wait_events = 0
+
+    def wait_for_token(self, amount: float = 1.0) -> None:
+        amt = max(0.001, float(amount))
+        now = time.monotonic()
+        with self._lock:
+            now = time.monotonic()
+            slot = self._next_allowed_ts
+            if slot < now:
+                slot = now
+            self._next_allowed_ts = slot + (amt / self._rate_per_sec)
+
+        wait_s = slot - now
+        if wait_s > 0:
+            time.sleep(wait_s)
+
+        with self._lock:
+            self.total_acquired += int(max(1.0, amt))
+            if wait_s > 0:
+                self.total_wait_s += wait_s
+                self.wait_events += 1
+            if main.DEBUG_VERBOSE and main.LOGGER.isEnabledFor(logging.DEBUG):
+                # Keep debug output sparse for large backfills.
+                if wait_s >= 0.25 or (self.total_acquired % 200 == 0):
+                    main.log_debug(
+                        "rate.acquire",
+                        bucket=self.name,
+                        amount=amt,
+                        waited_s=f"{wait_s:.4f}",
+                        total_acquired=self.total_acquired,
+                        total_wait_s=f"{self.total_wait_s:.3f}",
+                        next_slot_in_s=f"{max(0.0, self._next_allowed_ts - time.monotonic()):.4f}",
+                    )
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "name": self.name,
+                "capacity_per_min": self.per_minute,
+                "total_acquired": self.total_acquired,
+                "total_wait_s": round(self.total_wait_s, 3),
+                "wait_events": self.wait_events,
+                "next_slot_in_s": round(max(0.0, self._next_allowed_ts - time.monotonic()), 4),
+            }
+
+
+def resolve_to_round(to_round_arg: str, latest_completed: Optional[int]) -> Optional[int]:
+    val = str(to_round_arg or "").strip().lower()
+    if not val or val == "latest":
+        return main.safe_int(latest_completed)
+    parsed = main.safe_int(val)
+    if parsed is None:
+        raise ValueError(f"Invalid --to-round value: {to_round_arg!r}")
+    latest = main.safe_int(latest_completed)
+    if latest is None:
+        return parsed
+    return min(parsed, latest)
+
+
+def _fetch_latest_completed_round_from_api(
+    client: main.GoMiningRoundMetricsApiClient,
+    league_id: int,
+) -> Optional[Dict[str, Any]]:
+    rec = client.fetch_round_metrics_triplet(
+        int(league_id),
+        strict_league_validation=False,
+    )
+    if not isinstance(rec, dict):
+        return None
+    rid = main.safe_int(rec.get("round_id"))
+    ended_at = main.to_iso_utc(rec.get("ended_at"))
+    if rid is None or not ended_at:
+        return None
+    return rec
+
+
+def _fetch_round_record_for_round_id(
+    client: main.GoMiningRoundMetricsApiClient,
+    probe_league_id: int,
+    round_id: int,
+    expected_league_ids: Optional[set[int]] = None,
+) -> Optional[Dict[str, Any]]:
+    requested_round_id = int(round_id)
+    requested_probe_league_id = int(probe_league_id)
+
+    round_body = client._fetch_round_clan_leaderboard_by_round_id(requested_probe_league_id, requested_round_id)
+    if not isinstance(round_body, dict):
+        return None
+    round_data = client._payload_data(round_body)
+    if not isinstance(round_data, dict):
+        return None
+
+    payload_round_id = main.safe_int(round_data.get("roundId"))
+    if payload_round_id is None:
+        payload_round_id = main.safe_int(round_data.get("id"))
+    if payload_round_id != requested_round_id:
+        return None
+
+    payload_league_id = main.safe_int(round_data.get("leagueId"))
+    if payload_league_id is None:
+        return None
+    if expected_league_ids is not None and int(payload_league_id) not in expected_league_ids:
+        return None
+
+    if round_data.get("active") is not False:
+        return None
+
+    ended_at = main.to_iso_utc(round_data.get("endedAt"))
+    if not ended_at:
+        return None
+    round_duration_sec = client._compute_round_duration_sec(round_data, ended_at)
+    if round_duration_sec is None:
+        return None
+
+    calculated_at = main._to_api_calculated_at(ended_at)
+    snapshot_ts = main.utc_now_iso()
+
+    user_payload = {
+        "pagination": {"skip": 0, "limit": client.user_page_limit},
+        "calculatedAt": calculated_at,
+        "leagueId": int(payload_league_id),
+    }
+    user_body = client._request_json_with_retry(
+        "POST",
+        client.player_leaderboard_url,
+        json_payload=user_payload,
+        op="backfill_user_leaderboard_index",
+        league_id=int(payload_league_id),
+        round_id=requested_round_id,
+    )
+    if not isinstance(user_body, dict):
+        return None
+    user_data = client._payload_data(user_body)
+    if not isinstance(user_data, dict):
+        return None
+
+    clan_payload = {
+        "pagination": {"skip": 0, "limit": client.clan_page_limit},
+        "calculatedAt": calculated_at,
+        "leagueId": int(payload_league_id),
+    }
+    clan_body = client._request_json_with_retry(
+        "POST",
+        client.clan_leaderboard_url,
+        json_payload=clan_payload,
+        op="backfill_clan_leaderboard_index_v2",
+        league_id=int(payload_league_id),
+        round_id=requested_round_id,
+    )
+    if not isinstance(clan_body, dict):
+        return None
+    clan_data = client._payload_data(clan_body)
+    if not isinstance(clan_data, dict):
+        return None
+
+    gmt_fund = main.safe_float(user_data.get("gmtFund"))
+    user_blocks_mined = main.safe_int(user_data.get("totalMinedBlocks"))
+    clan_blocks_mined = main.safe_int(clan_data.get("totalMinedBlocks"))
+    blocks_mined = user_blocks_mined if user_blocks_mined is not None else clan_blocks_mined
+
+    gmt_per_block: Optional[float] = None
+    if gmt_fund is not None and blocks_mined is not None and blocks_mined > 0:
+        gmt_per_block = gmt_fund / float(blocks_mined)
+
+    rec: Dict[str, Any] = {
+        "snapshot_ts": snapshot_ts,
+        "league_id": int(payload_league_id),
+        "round_id": requested_round_id,
+        "block_number": main.safe_int(round_data.get("blockNumber")),
+        "multiplier": main.safe_float(round_data.get("multiplier")),
+        "gmt_fund": gmt_fund,
+        "blocks_mined": blocks_mined,
+        "gmt_per_block": gmt_per_block,
+        "league_th": main.safe_float(clan_data.get("totalPower")),
+        "efficiency_league": main.safe_float(clan_data.get("weightedEnergyEfficiencyPerTh")),
+        "ended_at": ended_at,
+        "round_duration_sec": round_duration_sec,
+    }
+    return rec
+
+
+def collect_missing_round_records(
+    records: Sequence[Dict[str, Any]],
+    existing_round_ids: Iterable[int],
+    from_round: int,
+    to_round: int,
+) -> List[Dict[str, Any]]:
+    existing = {int(x) for x in existing_round_ids if main.safe_int(x) is not None}
+    out: List[Dict[str, Any]] = []
+    for rec in records:
+        rid = main.safe_int(rec.get("round_id"))
+        if rid is None:
+            continue
+        if rid < from_round or rid > to_round:
+            continue
+        if rid in existing:
+            continue
+        out.append(rec)
+    out.sort(key=lambda r: main.safe_int(r.get("round_id")) or -1)
+    return out
+
+
+def filter_records_for_prefetch_failures(
+    records: Sequence[Dict[str, Any]],
+    failed_round_ids: Iterable[int],
+) -> Tuple[List[Dict[str, Any]], List[int]]:
+    failed = {int(x) for x in failed_round_ids if main.safe_int(x) is not None}
+    kept: List[Dict[str, Any]] = []
+    skipped: List[int] = []
+    for rec in records:
+        rid = main.safe_int(rec.get("round_id"))
+        if rid is None:
+            continue
+        if rid in failed:
+            skipped.append(rid)
+            continue
+        kept.append(rec)
+    kept.sort(key=lambda r: main.safe_int(r.get("round_id")) or -1)
+    skipped.sort()
+    return kept, skipped
+
+
+def merge_prefetch_results_into_client(
+    client: main.GoMiningRoundAbilityApiClient,
+    results: Sequence[PrefetchRoundResult],
+) -> Tuple[int, int]:
+    ok_count = 0
+    fail_count = 0
+    for res in results:
+        if not res.ok or res.counts is None:
+            fail_count += 1
+            continue
+        rid = int(res.round_id)
+        client.round_counts_cache[rid] = dict(res.counts)
+        client.round_ability_users_cache[rid] = {
+            main.POWER_UP_ABILITY_ID: [u for u in res.power_up_users if isinstance(u, dict)],
+            main.CLAN_POWER_UP_ABILITY_ID: [u for u in res.clan_power_up_users if isinstance(u, dict)],
+        }
+        client.round_excluded_user_boosts_cache[rid] = {
+            str(k): int(v)
+            for k, v in (res.excluded_user_boosts or {}).items()
+            if str(k).strip() and main.safe_int(v) is not None and int(v) > 0
+        }
+        ok_count += 1
+    return ok_count, fail_count
+
+
+def _resolve_effective_bearer() -> Tuple[str, Optional[Callable[[], Optional[str]]]]:
+    token_fetcher: Optional[Callable[[], Optional[str]]] = None
+    effective_bearer = main.GOMINING_BEARER_TOKEN.strip()
+    if main.TOKEN_URL and main.TOKEN_X_AUTH:
+        token_fetcher = main.fetch_bearer_token_from_auth_api
+        fetched = (token_fetcher() or "").strip()
+        if fetched:
+            effective_bearer = fetched
+        elif not effective_bearer:
+            raise RuntimeError("Failed to fetch bearer token from TOKEN_URL and no GOMINING_BEARER_TOKEN fallback is set.")
+        else:
+            main.log_warn("token_api.startup_failed_using_fallback", token_url=main.TOKEN_URL)
+    if not effective_bearer:
+        raise RuntimeError("GOMINING_BEARER_TOKEN is required when TOKEN_URL/TOKEN_X_AUTH is not configured.")
+    return effective_bearer, token_fetcher
+
+
+def _parse_league_ids(raw: str) -> Optional[set[int]]:
+    txt = str(raw or "").strip()
+    if not txt:
+        return None
+    out: set[int] = set()
+    for piece in txt.split(","):
+        p = piece.strip()
+        if not p:
+            continue
+        league_id = main.safe_int(p)
+        if league_id is None:
+            raise ValueError(f"Invalid league id value: {piece!r}")
+        out.add(int(league_id))
+    return out or None
+
+
+def _load_main_contexts(sh: Any, read_limiter: main.TokenBucket, expected_cols: int) -> Dict[int, main.SheetContext]:
+    contexts: Dict[int, main.SheetContext] = {}
+    worksheets = sh.worksheets()
+    selectors = main.read_sheet_selectors(sh, worksheets, read_limiter)
+    for ws in worksheets:
+        sel = selectors.get(ws.id, {})
+        marker = str(sel.get("marker") or "")
+        league_id = main.safe_int(sel.get("league_id"))
+        if marker != main.MAIN_SHEET_MARKER or league_id is None:
+            continue
+        ctx = main.SheetContext(
+            ws_id=ws.id,
+            title=ws.title,
+            ws=ws,
+            league_id=int(league_id),
+            kind="main",
+            expected_cols=expected_cols,
+            round_col_idx=6,
+        )
+        ctx.next_row = main._detect_next_row(ws, read_limiter, round_col_index=(ctx.round_col_idx or 6) + 1)
+        contexts[ws.id] = ctx
+    return contexts
+
+
+def _read_existing_round_ids(ctx: main.SheetContext, read_limiter: main.TokenBucket) -> set[int]:
+    if ctx.ws is None:
+        return set()
+    idx = main._read_round_row_index(ctx.ws, read_limiter, round_col_index=(ctx.round_col_idx or 6) + 1)
+    return {int(rid) for rid in idx.keys() if main.safe_int(rid) is not None}
+
+
+def _fetch_completed_round_records_in_range(
+    state: main.StateStore,
+    league_id: int,
+    from_round: int,
+    to_round: int,
+    page_size: int = 1000,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    cursor = int(from_round) - 1
+    page_lim = max(1, int(page_size))
+    while True:
+        rows = state.fetch_api_completed_rounds(league_id, since_round=cursor, limit=page_lim)
+        if not rows:
+            break
+        reached_end = False
+        for rec in rows:
+            rid = main.safe_int(rec.get("round_id"))
+            if rid is None:
+                continue
+            if rid > to_round:
+                reached_end = True
+                break
+            if rid >= from_round:
+                out.append(rec)
+            if rid > cursor:
+                cursor = rid
+        if reached_end or len(rows) < page_lim:
+            break
+    out.sort(key=lambda r: main.safe_int(r.get("round_id")) or -1)
+    return out
+
+
+def _fetch_round_record_worker(
+    round_id: int,
+    probe_league_id: int,
+    expected_league_ids: set[int],
+    bearer_token: str,
+    token_fetcher: Optional[Callable[[], Optional[str]]],
+    limiter: ThreadSafeRateGuard,
+) -> RoundRecordFetchResult:
+    try:
+        client = main.GoMiningRoundMetricsApiClient(
+            bearer_token=bearer_token,
+            limiter=limiter,
+            base_url=main.GOMINING_API_BASE_URL,
+            multiplier_path=main.MULTIPLIER_PATH,
+            round_clan_leaderboard_path=main.ROUND_CLAN_LEADERBOARD_PATH,
+            player_leaderboard_path=main.PLAYER_LEADERBOARD_PATH,
+            clan_leaderboard_path=main.ROUND_METRICS_CLAN_PATH,
+            user_page_limit=main.ROUND_METRICS_USER_PAGE_LIMIT,
+            clan_page_limit=main.ROUND_METRICS_CLAN_PAGE_LIMIT,
+            round_scan_lookback=main.ROUND_GET_LAST_SCAN_LOOKBACK,
+            timeout_seconds=main.ROUND_METRICS_TIMEOUT_SECONDS,
+            max_retries=main.ROUND_METRICS_MAX_RETRIES,
+            token_fetcher=token_fetcher,
+        )
+        rec = _fetch_round_record_for_round_id(
+            client,
+            probe_league_id=probe_league_id,
+            round_id=round_id,
+            expected_league_ids=expected_league_ids,
+        )
+        if not isinstance(rec, dict):
+            return RoundRecordFetchResult(
+                league_id=probe_league_id,
+                round_id=round_id,
+                ok=False,
+                error="round_record_unavailable_or_not_finalized",
+            )
+        rec_league_id = main.safe_int(rec.get("league_id"))
+        if rec_league_id is not None and rec_league_id not in expected_league_ids:
+            return RoundRecordFetchResult(
+                league_id=probe_league_id,
+                round_id=round_id,
+                ok=False,
+                error="round_not_in_target_leagues",
+            )
+        return RoundRecordFetchResult(
+            league_id=main.safe_int(rec.get("league_id")) or probe_league_id,
+            round_id=round_id,
+            ok=True,
+            record=rec,
+        )
+    except Exception as e:
+        return RoundRecordFetchResult(
+            league_id=probe_league_id,
+            round_id=round_id,
+            ok=False,
+            error=repr(e),
+        )
+
+
+def _fetch_round_records_parallel(
+    tasks: Sequence[int],
+    workers: int,
+    probe_league_id: int,
+    expected_league_ids: set[int],
+    bearer_token: str,
+    token_fetcher: Optional[Callable[[], Optional[str]]],
+    limiter: ThreadSafeRateGuard,
+    progress_reporter: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> List[RoundRecordFetchResult]:
+    if not tasks:
+        return []
+    max_workers = max(1, int(workers))
+    out: List[RoundRecordFetchResult] = []
+    meter = _ProgressMeter("round_record_fetch", total=len(tasks), reporter=progress_reporter)
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="backfill-round-records") as pool:
+        fut_to_task = {
+            pool.submit(
+                _fetch_round_record_worker,
+                rid,
+                probe_league_id,
+                expected_league_ids,
+                bearer_token,
+                token_fetcher,
+                limiter,
+            ): rid
+            for rid in tasks
+        }
+        done = 0
+        for fut in as_completed(fut_to_task):
+            round_id = fut_to_task[fut]
+            try:
+                res = fut.result()
+            except Exception as e:
+                res = RoundRecordFetchResult(
+                    league_id=probe_league_id,
+                    round_id=round_id,
+                    ok=False,
+                    error=repr(e),
+                )
+            out.append(res)
+            done += 1
+            meter.tick(done, workers=max_workers)
+    out.sort(key=lambda r: (r.league_id, r.round_id))
+    return out
+
+
+def _prefetch_round_worker(
+    league_id: int,
+    round_id: int,
+    bearer_token: str,
+    token_fetcher: Optional[Callable[[], Optional[str]]],
+    limiter: ThreadSafeRateGuard,
+) -> PrefetchRoundResult:
+    try:
+        client = main.GoMiningRoundAbilityApiClient(
+            bearer_token=bearer_token,
+            limiter=limiter,
+            user_leaderboard_url=main.ROUND_USER_LEADERBOARD_API_URL,
+            page_limit=main.ROUND_API_PAGE_LIMIT,
+            timeout_seconds=main.ROUND_API_TIMEOUT_SECONDS,
+            max_retries=main.ROUND_API_MAX_RETRIES,
+            token_fetcher=token_fetcher,
+        )
+        counts = client.fetch_round_ability_counts(round_id, expected_league_id=league_id)
+        if counts is None:
+            return PrefetchRoundResult(
+                league_id=league_id,
+                round_id=round_id,
+                ok=False,
+                error="fetch_round_ability_counts returned None",
+            )
+        power_up_users = client.get_cached_ability_users_for_round(round_id, main.POWER_UP_ABILITY_ID)
+        clan_power_up_users = client.get_cached_ability_users_for_round(round_id, main.CLAN_POWER_UP_ABILITY_ID)
+        excluded = client.get_cached_excluded_user_boosts_for_round(round_id)
+        return PrefetchRoundResult(
+            league_id=league_id,
+            round_id=round_id,
+            ok=True,
+            counts=dict(counts),
+            power_up_users=[u for u in power_up_users if isinstance(u, dict)],
+            clan_power_up_users=[u for u in clan_power_up_users if isinstance(u, dict)],
+            excluded_user_boosts=dict(excluded),
+        )
+    except Exception as e:
+        return PrefetchRoundResult(
+            league_id=league_id,
+            round_id=round_id,
+            ok=False,
+            error=repr(e),
+        )
+
+
+def _prefetch_rounds_parallel(
+    tasks: Sequence[Tuple[int, int]],
+    workers: int,
+    bearer_token: str,
+    token_fetcher: Optional[Callable[[], Optional[str]]],
+    limiter: ThreadSafeRateGuard,
+    progress_reporter: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> List[PrefetchRoundResult]:
+    if not tasks:
+        return []
+    max_workers = max(1, int(workers))
+    out: List[PrefetchRoundResult] = []
+    meter = _ProgressMeter("ability_prefetch", total=len(tasks), reporter=progress_reporter)
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="backfill-prefetch") as pool:
+        fut_to_task = {
+            pool.submit(_prefetch_round_worker, lg, rid, bearer_token, token_fetcher, limiter): (lg, rid)
+            for lg, rid in tasks
+        }
+        done = 0
+        for fut in as_completed(fut_to_task):
+            league_id, round_id = fut_to_task[fut]
+            try:
+                res = fut.result()
+            except Exception as e:
+                res = PrefetchRoundResult(league_id=league_id, round_id=round_id, ok=False, error=repr(e))
+            out.append(res)
+            done += 1
+            meter.tick(done, workers=max_workers)
+    out.sort(key=lambda r: (r.league_id, r.round_id))
+    return out
+
+
+def _prefetch_rounds_with_retries(
+    tasks: Sequence[Tuple[int, int]],
+    workers: int,
+    attempts: int,
+    bearer_token: str,
+    token_fetcher: Optional[Callable[[], Optional[str]]],
+    limiter: ThreadSafeRateGuard,
+    progress_reporter: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> List[PrefetchRoundResult]:
+    if not tasks:
+        return []
+
+    ordered_tasks: List[Tuple[int, int]] = sorted({(int(lg), int(rid)) for lg, rid in tasks})
+    latest_result_by_key: Dict[Tuple[int, int], PrefetchRoundResult] = {}
+    remaining: List[Tuple[int, int]] = list(ordered_tasks)
+    max_attempts = max(1, int(attempts))
+
+    for attempt in range(1, max_attempts + 1):
+        if not remaining:
+            break
+        # Start wide, then reduce pressure on retries to survive API saturation.
+        attempt_workers = max(1, int(workers) // (2 ** (attempt - 1)))
+        try:
+            results = _prefetch_rounds_parallel(
+                tasks=remaining,
+                workers=attempt_workers,
+                bearer_token=bearer_token,
+                token_fetcher=token_fetcher,
+                limiter=limiter,
+                progress_reporter=progress_reporter,
+            )
+        except TypeError:
+            # Backward-compat for monkeypatched tests/workers with old signature.
+            results = _prefetch_rounds_parallel(
+                tasks=remaining,
+                workers=attempt_workers,
+                bearer_token=bearer_token,
+                token_fetcher=token_fetcher,
+                limiter=limiter,
+            )
+        next_remaining: List[Tuple[int, int]] = []
+        ok_count = 0
+        fail_count = 0
+        for res in results:
+            key = (int(res.league_id), int(res.round_id))
+            latest_result_by_key[key] = res
+            if res.ok and isinstance(res.counts, dict):
+                ok_count += 1
+                continue
+            fail_count += 1
+            next_remaining.append(key)
+        main.log_info(
+            "backfill.prefetch_attempt_done",
+            attempt=attempt,
+            attempts=max_attempts,
+            workers=attempt_workers,
+            total=len(results),
+            ok=ok_count,
+            failed=fail_count,
+            remaining=len(next_remaining),
+        )
+        remaining = next_remaining
+        if remaining and attempt < max_attempts:
+            time.sleep(min(6.0, 0.8 * float(attempt)))
+
+    final: List[PrefetchRoundResult] = []
+    for league_id, round_id in ordered_tasks:
+        key = (int(league_id), int(round_id))
+        res = latest_result_by_key.get(key)
+        if res is None:
+            res = PrefetchRoundResult(
+                league_id=int(league_id),
+                round_id=int(round_id),
+                ok=False,
+                error="prefetch_result_missing",
+            )
+        final.append(res)
+    return final
+
+
+def _run_enqueue_flush_for_sheet(
+    state: main.StateStore,
+    ctx: main.SheetContext,
+    records_for_sheet: Sequence[Dict[str, Any]],
+    round_ability_api: main.GoMiningRoundAbilityApiClient,
+    power_up_clan_api: main.GoMiningClanApiClient,
+    ability_id_to_name: Dict[str, str],
+    ability_headers: List[str],
+    write_limiter: main.TokenBucket,
+    read_limiter: main.TokenBucket,
+    max_cycles: int,
+) -> Tuple[int, int, int, bool]:
+    normalized_records = _normalize_round_records(records_for_sheet, context=f"enqueue:{ctx.title}")
+    if not normalized_records:
+        return 0, 0, 0, True
+    target_round_ids = sorted(
+        {
+            int(rid)
+            for rid in (main.safe_int(r.get("round_id")) for r in normalized_records)
+            if rid is not None
+        }
+    )
+    if not target_round_ids:
+        return 0, 0, 0, True
+    target_max_round = int(target_round_ids[-1])
+
+    # Monkeypatch fetch source for this run so enqueue processes only this sheet's target records.
+    orig_fetch = main.fetch_completed_rounds_prefer_api
+
+    recs_sorted = sorted(normalized_records, key=lambda r: main.safe_int(r.get("round_id")) or -1)
+
+    def _patched_fetch(
+        db: Optional[main.DBClient],
+        _state: main.StateStore,
+        league_id: int,
+        since_round: int,
+        limit: int = main.MAX_ROUNDS_PER_POLL,
+    ) -> List[Dict[str, Any]]:
+        _ = (db, _state)
+        if league_id != ctx.league_id:
+            return []
+        out: List[Dict[str, Any]] = []
+        for rec in recs_sorted:
+            rid = main.safe_int(rec.get("round_id"))
+            if rid is None or rid <= since_round:
+                continue
+            out.append(rec)
+            if len(out) >= max(1, int(limit)):
+                break
+        return out
+
+    main.fetch_completed_rounds_prefer_api = _patched_fetch  # type: ignore[assignment]
+    try:
+        total_enqueued = 0
+        total_flushed = 0
+        completed = False
+        stagnant_cycles = 0
+        prev_last_synced = main.safe_int(state.get_last_synced_round(ctx.ws_id)) or 0
+        last_cycle = 0
+        for cycle in range(1, max(1, int(max_cycles)) + 1):
+            last_cycle = cycle
+            enq = main.enqueue_main_sheet_ops(
+                None,
+                state,
+                {ctx.ws_id: ctx},
+                ability_id_to_name,
+                ability_headers,
+                round_ability_api,
+                read_limiter,
+                power_up_clan_api=power_up_clan_api,
+                flush_tick=None,
+            )
+            total_enqueued += enq
+
+            flushed_cycle = 0
+            while True:
+                done = main.flush_sheet_queue_with_rate_limit(state, {ctx.ws_id: ctx}, write_limiter)
+                if done <= 0:
+                    break
+                flushed_cycle += done
+                total_flushed += done
+
+            queue_total = state.queue_total_count()
+            queue_due = state.queue_due_count()
+            current_last_synced = main.safe_int(state.get_last_synced_round(ctx.ws_id)) or 0
+            main.log_info(
+                "backfill.flushed",
+                sheet=ctx.title,
+                league_id=ctx.league_id,
+                cycle=cycle,
+                enqueued=enq,
+                flushed=flushed_cycle,
+                queue_total=queue_total,
+                queue_due=queue_due,
+                last_synced=current_last_synced,
+                target_max_round=target_max_round,
+            )
+            if queue_due == 0 and current_last_synced >= target_max_round:
+                completed = True
+                return total_enqueued, total_flushed, cycle, completed
+            if current_last_synced > prev_last_synced:
+                prev_last_synced = current_last_synced
+                stagnant_cycles = 0
+            elif enq == 0 and queue_due == 0:
+                stagnant_cycles += 1
+                # API can transiently fail on a round; keep retrying a few cycles before giving up.
+                if stagnant_cycles >= 5:
+                    break
+
+        return total_enqueued, total_flushed, max(1, int(last_cycle)), completed
+    finally:
+        main.fetch_completed_rounds_prefer_api = orig_fetch  # type: ignore[assignment]
+
+
+def _utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def main_cli() -> int:
+    parser = argparse.ArgumentParser(
+        description="Backfill missing main rounds in a configured round window with parallel ability prefetch.",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=sorted(BACKFILL_PROFILE_PRESETS.keys()),
+        default=DEFAULT_BACKFILL_PROFILE,
+        help=f"Backfill load profile (default: {DEFAULT_BACKFILL_PROFILE}).",
+    )
+    parser.add_argument("--from-round", type=int, default=DEFAULT_FROM_ROUND, help=f"Inclusive start round (default: {DEFAULT_FROM_ROUND})")
+    parser.add_argument(
+        "--to-round",
+        type=str,
+        default=DEFAULT_TO_ROUND,
+        help="Inclusive end round or 'latest' (default: latest)",
+    )
+    parser.add_argument("--workers", type=int, default=None, help=f"Prefetch workers (profile default: {DEFAULT_WORKERS})")
+    parser.add_argument(
+        "--gomining-rpm",
+        type=int,
+        default=None,
+        help=f"GoMining API rate limit for this backfill run (profile default: {DEFAULT_BACKFILL_GOMINING_RPM})",
+    )
+    parser.add_argument(
+        "--prefetch-attempts",
+        type=int,
+        default=None,
+        help=f"Ability prefetch retry passes with reduced concurrency (profile default: {DEFAULT_PREFETCH_ATTEMPTS})",
+    )
+    parser.add_argument(
+        "--discord-webhook",
+        type=str,
+        default=os.getenv("DISCORD_WEBHOOK_URL", ""),
+        help="Optional Discord webhook URL for progress notifications.",
+    )
+    parser.add_argument(
+        "--discord-username",
+        type=str,
+        default=os.getenv("DISCORD_WEBHOOK_USERNAME", "BackfillBot"),
+        help="Discord webhook username (default: BackfillBot).",
+    )
+    parser.add_argument(
+        "--discord-progress-seconds",
+        type=float,
+        default=DEFAULT_DISCORD_PROGRESS_SECONDS,
+        help=f"Min seconds between Discord progress messages per stage (default: {DEFAULT_DISCORD_PROGRESS_SECONDS}).",
+    )
+    parser.add_argument("--league-ids", type=str, default="", help="Optional comma-separated league IDs, e.g. 1,3,4")
+    parser.add_argument("--max-cycles", type=int, default=DEFAULT_MAX_CYCLES, help=f"Max enqueue/flush cycles per sheet (default: {DEFAULT_MAX_CYCLES})")
+    parser.add_argument(
+        "--continue-on-error",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Continue with successful rounds when some prefetches fail (default: true)",
+    )
+    parser.add_argument("--execute", action="store_true", help="Apply DB/queue/sheet mutations. Without this flag script runs as dry-run.")
+    args = parser.parse_args()
+
+    profile_name, profile_cfg = _resolve_backfill_profile(args.profile)
+    args.profile = profile_name
+    if args.workers is None:
+        args.workers = int(profile_cfg["workers"])
+    if args.gomining_rpm is None:
+        args.gomining_rpm = int(profile_cfg["gomining_rpm"])
+    if args.prefetch_attempts is None:
+        args.prefetch_attempts = int(profile_cfg["prefetch_attempts"])
+
+    if args.from_round <= 0:
+        raise ValueError("--from-round must be > 0")
+    if args.workers <= 0:
+        raise ValueError("--workers must be > 0")
+    if args.gomining_rpm <= 0:
+        raise ValueError("--gomining-rpm must be > 0")
+    if args.prefetch_attempts <= 0:
+        raise ValueError("--prefetch-attempts must be > 0")
+    if args.max_cycles <= 0:
+        raise ValueError("--max-cycles must be > 0")
+    if args.discord_progress_seconds <= 0:
+        raise ValueError("--discord-progress-seconds must be > 0")
+
+    selected_leagues = _parse_league_ids(args.league_ids)
+    discord_notifier: Optional[DiscordWebhookNotifier] = None
+    webhook_url = str(args.discord_webhook or "").strip()
+    if webhook_url:
+        discord_notifier = DiscordWebhookNotifier(
+            webhook_url=webhook_url,
+            username=str(args.discord_username or "BackfillBot"),
+            min_progress_interval_seconds=float(args.discord_progress_seconds),
+        )
+
+    def _discord_progress(event: Dict[str, Any]) -> None:
+        if discord_notifier is None:
+            return
+        stage = str(event.get("stage") or "progress")
+        msg = (
+            f"**{stage}** {event.get('bar','')} "
+            f"`{event.get('done',0)}/{event.get('total',0)}` ({event.get('pct',0)}%)"
+            f" | ETA `{event.get('eta','--:--:--')}`"
+            f" | Elapsed `{event.get('elapsed','--:--:--')}`"
+            f" | `{event.get('rate_rps',0)} r/s`"
+        )
+        discord_notifier.send(msg, key=f"progress:{stage}", force=False)
+
+    lock = main.SingleInstanceLock(main.LOCK_FILE_PATH)
+    state: Optional[main.StateStore] = None
+    exit_code = 0
+    lock.acquire()
+    try:
+        state = main.StateStore(main.STATE_DB_PATH)
+        write_limiter = main.TokenBucket(main.GS_WRITE_REQ_PER_MIN, name="sheets_write")
+        read_limiter = main.TokenBucket(main.GS_READ_REQ_PER_MIN, name="sheets_read")
+        gomining_guard = ThreadSafeRateGuard(int(args.gomining_rpm), name="gomining_api")
+
+        effective_bearer, token_fetcher = _resolve_effective_bearer()
+
+        ability_id_to_name = main.build_ability_id_to_header(main.ABILITY_DIM_STATIC)
+        ability_headers = list(main.ABILITY_HEADER_ORDER)
+        expected_cols = len(main.BASE_HEADERS) + len(ability_headers) + 6
+
+        sh = main.open_spreadsheet()
+        contexts = _load_main_contexts(sh, read_limiter, expected_cols=expected_cols)
+        if selected_leagues is not None:
+            contexts = {ws_id: ctx for ws_id, ctx in contexts.items() if ctx.league_id in selected_leagues}
+        if not contexts:
+            print("[INFO] No matching main sheets found. Nothing to do.")
+            return 0
+
+        plan_rows: List[Dict[str, Any]] = []
+        missing_by_sheet: Dict[int, List[Dict[str, Any]]] = {}
+        latest_by_sheet: Dict[int, int] = {}
+        candidate_round_ids_by_sheet: Dict[int, List[int]] = {}
+        cached_record_map_by_sheet: Dict[int, Dict[int, Dict[str, Any]]] = {}
+        round_record_seed_by_sheet: Dict[int, Optional[Dict[str, Any]]] = {}
+        metric_failed_rounds_by_sheet: Dict[int, List[int]] = {}
+        round_record_tasks: List[int] = []
+        seen_round_record_tasks: set[int] = set()
+
+        round_metrics_discovery_api = main.GoMiningRoundMetricsApiClient(
+            bearer_token=effective_bearer,
+            limiter=gomining_guard,
+            base_url=main.GOMINING_API_BASE_URL,
+            multiplier_path=main.MULTIPLIER_PATH,
+            round_clan_leaderboard_path=main.ROUND_CLAN_LEADERBOARD_PATH,
+            player_leaderboard_path=main.PLAYER_LEADERBOARD_PATH,
+            clan_leaderboard_path=main.ROUND_METRICS_CLAN_PATH,
+            user_page_limit=main.ROUND_METRICS_USER_PAGE_LIMIT,
+            clan_page_limit=main.ROUND_METRICS_CLAN_PAGE_LIMIT,
+            round_scan_lookback=main.ROUND_GET_LAST_SCAN_LOOKBACK,
+            timeout_seconds=main.ROUND_METRICS_TIMEOUT_SECONDS,
+            max_retries=main.ROUND_METRICS_MAX_RETRIES,
+            token_fetcher=token_fetcher,
+        )
+
+        to_round_is_latest = str(args.to_round or "").strip().lower() in {"", "latest"}
+        for ws_id, ctx in contexts.items():
+            existing_round_ids = _read_existing_round_ids(ctx, read_limiter)
+            latest_completed_cache = state.fetch_latest_api_completed_round_id(ctx.league_id)
+            latest_completed = latest_completed_cache
+            latest_source = "cache"
+            latest_seed_record: Optional[Dict[str, Any]] = None
+            if to_round_is_latest and latest_completed is None:
+                if existing_round_ids:
+                    latest_completed = max(existing_round_ids)
+                    latest_source = "sheet_existing_max"
+                else:
+                    latest_seed_record = _fetch_latest_completed_round_from_api(round_metrics_discovery_api, ctx.league_id)
+                    latest_seed_round = main.safe_int((latest_seed_record or {}).get("round_id"))
+                    if latest_seed_round is not None:
+                        latest_completed = latest_seed_round
+                        latest_source = "live_api"
+                    else:
+                        latest_source = "missing"
+
+            to_round = resolve_to_round(args.to_round, latest_completed)
+            prev_state = state.get_sheet_state(ws_id) or {}
+            prev_last_synced = main.safe_int(prev_state.get("last_synced_round"))
+            prev_price_cutover = main.safe_int(prev_state.get("price_cutover_round"))
+            round_record_seed_by_sheet[ws_id] = latest_seed_record
+
+            if to_round is None or to_round < args.from_round:
+                plan_rows.append(
+                    {
+                        "ws_id": ws_id,
+                        "sheet": ctx.title,
+                        "league_id": ctx.league_id,
+                        "from_round": args.from_round,
+                        "to_round": to_round,
+                        "latest_completed": latest_completed,
+                        "latest_source": latest_source,
+                        "prev_last_synced": prev_last_synced,
+                        "prev_price_cutover": prev_price_cutover,
+                        "existing_rounds": len(existing_round_ids),
+                        "candidate_rounds": 0,
+                        "cached_round_records": 0,
+                        "unresolved_round_records": 0,
+                        "missing_rounds": 0,
+                        "planned": False,
+                        "reason": "no_completed_rounds_in_window",
+                    }
+                )
+                continue
+
+            latest_by_sheet[ws_id] = int(to_round)
+            cached_records = _fetch_completed_round_records_in_range(
+                state,
+                league_id=ctx.league_id,
+                from_round=args.from_round,
+                to_round=int(to_round),
+            )
+            cached_record_map: Dict[int, Dict[str, Any]] = {}
+            for rec in cached_records:
+                rid = main.safe_int(rec.get("round_id"))
+                if rid is None:
+                    continue
+                cached_record_map[int(rid)] = rec
+
+            if isinstance(latest_seed_record, dict):
+                seed_rid = main.safe_int(latest_seed_record.get("round_id"))
+                if (
+                    seed_rid is not None
+                    and seed_rid >= int(args.from_round)
+                    and seed_rid <= int(to_round)
+                    and int(seed_rid) not in cached_record_map
+                ):
+                    cached_record_map[int(seed_rid)] = latest_seed_record
+
+            candidate_round_ids = [
+                rid
+                for rid in range(int(args.from_round), int(to_round) + 1)
+                if rid not in existing_round_ids
+            ]
+            unresolved_round_ids = [rid for rid in candidate_round_ids if rid not in cached_record_map]
+            for rid in unresolved_round_ids:
+                rid_int = int(rid)
+                if rid_int in seen_round_record_tasks:
+                    continue
+                seen_round_record_tasks.add(rid_int)
+                round_record_tasks.append(rid_int)
+
+            candidate_records_seeded = _normalize_round_records(
+                [cached_record_map[rid] for rid in candidate_round_ids if rid in cached_record_map],
+                context=f"plan_seed:{ctx.title}",
+            )
+            missing_by_sheet[ws_id] = candidate_records_seeded
+            candidate_round_ids_by_sheet[ws_id] = candidate_round_ids
+            cached_record_map_by_sheet[ws_id] = cached_record_map
+            metric_failed_rounds_by_sheet[ws_id] = []
+            plan_rows.append(
+                {
+                    "ws_id": ws_id,
+                    "sheet": ctx.title,
+                    "league_id": ctx.league_id,
+                    "from_round": args.from_round,
+                    "to_round": int(to_round),
+                    "latest_completed": latest_completed,
+                    "latest_source": latest_source,
+                    "prev_last_synced": prev_last_synced,
+                    "prev_price_cutover": prev_price_cutover,
+                    "existing_rounds": len(existing_round_ids),
+                    "candidate_rounds": len(candidate_round_ids),
+                    "cached_round_records": len(candidate_records_seeded),
+                    "unresolved_round_records": len(unresolved_round_ids),
+                    "missing_rounds": len(candidate_round_ids),
+                    "planned": True,
+                    "reason": "",
+                }
+            )
+        round_record_tasks.sort()
+
+        main.log_info(
+            "backfill.planned",
+            sheets=len(contexts),
+            rounds=sum(len(candidate_round_ids_by_sheet.get(ws_id, [])) for ws_id in contexts.keys()),
+            unresolved_round_records=len(round_record_tasks),
+            from_round=args.from_round,
+            to_round=args.to_round,
+            profile=args.profile,
+            workers=args.workers,
+            gomining_rpm=args.gomining_rpm,
+            prefetch_attempts=args.prefetch_attempts,
+            execute=bool(args.execute),
+            continue_on_error=bool(args.continue_on_error),
+        )
+        if discord_notifier is not None:
+            discord_notifier.send(
+                (
+                    f"Backfill gestartet\n"
+                    f"from `{args.from_round}` to `{args.to_round}` | execute=`{bool(args.execute)}`\n"
+                    f"sheets=`{len(contexts)}` rounds=`{sum(len(candidate_round_ids_by_sheet.get(ws_id, [])) for ws_id in contexts.keys())}`\n"
+                    f"profile=`{args.profile}` workers=`{args.workers}` rpm=`{args.gomining_rpm}`"
+                ),
+                key="start",
+                force=True,
+            )
+
+        round_record_results = _fetch_round_records_parallel(
+            tasks=round_record_tasks,
+            workers=args.workers,
+            probe_league_id=min(ctx.league_id for ctx in contexts.values()),
+            expected_league_ids={ctx.league_id for ctx in contexts.values()},
+            bearer_token=effective_bearer,
+            token_fetcher=token_fetcher,
+            limiter=gomining_guard,
+            progress_reporter=_discord_progress if discord_notifier is not None else None,
+        )
+        round_record_by_round_id: Dict[int, RoundRecordFetchResult] = {
+            r.round_id: r for r in round_record_results
+        }
+        round_records_ok = len([r for r in round_record_results if r.ok and isinstance(r.record, dict)])
+        round_records_benign = len([r for r in round_record_results if (not r.ok) and r.error in BENIGN_ROUND_RECORD_ERRORS])
+        round_records_failed = len(round_record_results) - round_records_ok - round_records_benign
+        main.log_info(
+            "backfill.round_record_fetch_done",
+            total=len(round_record_results),
+            fetched_ok=round_records_ok,
+            fetched_benign=round_records_benign,
+            fetched_failed=round_records_failed,
+        )
+
+        fetched_round_records_for_cache = [r.record for r in round_record_results if r.ok and isinstance(r.record, dict)]
+        if args.execute and fetched_round_records_for_cache:
+            state.upsert_api_round_records(
+                fetched_round_records_for_cache,  # type: ignore[arg-type]
+                source="backfill_round_gap",
+            )
+
+        for ws_id, ctx in contexts.items():
+            candidate_round_ids = candidate_round_ids_by_sheet.get(ws_id, [])
+            rec_map = dict(cached_record_map_by_sheet.get(ws_id, {}))
+            failed_rounds: List[int] = []
+            for rid in candidate_round_ids:
+                if rid in rec_map:
+                    continue
+                res = round_record_by_round_id.get(int(rid))
+                if res is None:
+                    failed_rounds.append(int(rid))
+                    continue
+                if res.ok and isinstance(res.record, dict):
+                    rec_league_id = main.safe_int(res.record.get("league_id"))
+                    if rec_league_id == ctx.league_id:
+                        rec_map[int(rid)] = res.record
+                    continue
+                if res.error in BENIGN_ROUND_RECORD_ERRORS:
+                    continue
+                failed_rounds.append(int(rid))
+            metric_failed_rounds_by_sheet[ws_id] = sorted(set(failed_rounds))
+            missing_by_sheet[ws_id] = _normalize_round_records(
+                [rec_map[rid] for rid in candidate_round_ids if rid in rec_map],
+                context=f"round_record_merge:{ctx.title}",
+            )
+
+        ability_tasks: List[Tuple[int, int]] = []
+        seen_ability_tasks: set[Tuple[int, int]] = set()
+        for ws_id, ctx in contexts.items():
+            normalized_missing = _normalize_round_records(
+                missing_by_sheet.get(ws_id, []),
+                context=f"ability_tasks:{ctx.title}",
+            )
+            missing_by_sheet[ws_id] = normalized_missing
+            for rec in normalized_missing:
+                rid = main.safe_int(rec.get("round_id"))
+                if rid is None:
+                    continue
+                key = (ctx.league_id, int(rid))
+                if key in seen_ability_tasks:
+                    continue
+                seen_ability_tasks.add(key)
+                ability_tasks.append(key)
+        ability_tasks.sort()
+
+        prefetch_results = _prefetch_rounds_with_retries(
+            tasks=ability_tasks,
+            workers=args.workers,
+            attempts=args.prefetch_attempts,
+            bearer_token=effective_bearer,
+            token_fetcher=token_fetcher,
+            limiter=gomining_guard,
+            progress_reporter=_discord_progress if discord_notifier is not None else None,
+        )
+        prefetch_by_key: Dict[Tuple[int, int], PrefetchRoundResult] = {
+            (r.league_id, r.round_id): r for r in prefetch_results
+        }
+        prefetch_ok = len([r for r in prefetch_results if r.ok])
+        prefetch_failed = len(prefetch_results) - prefetch_ok
+        main.log_info(
+            "backfill.prefetch_done",
+            total=len(prefetch_results),
+            prefetched_ok=prefetch_ok,
+            prefetched_failed=prefetch_failed,
+        )
+
+        round_ability_api = main.GoMiningRoundAbilityApiClient(
+            bearer_token=effective_bearer,
+            limiter=gomining_guard,
+            user_leaderboard_url=main.ROUND_USER_LEADERBOARD_API_URL,
+            page_limit=main.ROUND_API_PAGE_LIMIT,
+            timeout_seconds=main.ROUND_API_TIMEOUT_SECONDS,
+            max_retries=main.ROUND_API_MAX_RETRIES,
+            token_fetcher=token_fetcher,
+        )
+        power_up_clan_api = main.GoMiningClanApiClient(
+            bearer_token=effective_bearer,
+            limiter=gomining_guard,
+            leaderboard_url=main.CLAN_LEADERBOARD_API_URL,
+            clan_get_by_id_url=main.CLAN_GET_BY_ID_API_URL,
+            page_limit=main.CLAN_API_PAGE_LIMIT,
+            timeout_seconds=main.CLAN_API_TIMEOUT_SECONDS,
+            max_retries=main.CLAN_API_MAX_RETRIES,
+            token_fetcher=token_fetcher,
+        )
+        merge_prefetch_results_into_client(round_ability_api, prefetch_results)
+
+        report_rows: List[Dict[str, Any]] = []
+        any_partial = False
+
+        for ws_id, ctx in contexts.items():
+            base_plan = next((p for p in plan_rows if int(p.get("ws_id") or -1) == ws_id), None)
+            if base_plan is None or not base_plan.get("planned"):
+                if base_plan is not None:
+                    report_rows.append(dict(base_plan))
+                continue
+
+            missing_records = _normalize_round_records(
+                missing_by_sheet.get(ws_id, []),
+                context=f"sheet_report:{ctx.title}",
+            )
+            metric_failed_round_ids = metric_failed_rounds_by_sheet.get(ws_id, [])
+            if metric_failed_round_ids and not args.continue_on_error:
+                raise RuntimeError(
+                    f"Round record fetch failed for sheet={ctx.title} league={ctx.league_id} "
+                    f"rounds={metric_failed_round_ids[:20]} (total_failed={len(metric_failed_round_ids)}). "
+                    "Re-run with --continue-on-error."
+                )
+
+            failed_round_ids: List[int] = []
+            for rec in missing_records:
+                rid = main.safe_int(rec.get("round_id"))
+                if rid is None:
+                    continue
+                res = prefetch_by_key.get((ctx.league_id, int(rid)))
+                if res is None or not res.ok:
+                    failed_round_ids.append(int(rid))
+
+            if failed_round_ids and not args.continue_on_error:
+                raise RuntimeError(
+                    f"Prefetch failed for sheet={ctx.title} league={ctx.league_id} rounds={failed_round_ids[:20]} "
+                    f"(total_failed={len(failed_round_ids)}). Re-run with --continue-on-error."
+                )
+
+            # Prefetch is an optimization only.
+            # Even when a round prefetch fails, enqueue should still process that
+            # round via the normal API path to maximize fill reliability.
+            records_to_process = list(missing_records)
+            skipped_rounds = sorted(set(int(x) for x in failed_round_ids))
+
+            sheet_report: Dict[str, Any] = dict(base_plan)
+            prefetch_ok_for_sheet = max(0, len(missing_records) - len(skipped_rounds))
+            sheet_report.update(
+                {
+                    "records_ok": len(missing_records),
+                    "records_failed": len(metric_failed_round_ids),
+                    "record_failed_round_ids": metric_failed_round_ids,
+                    "prefetched_ok": prefetch_ok_for_sheet,
+                    "prefetched_failed": len(skipped_rounds),
+                    "ability_failed_round_ids": skipped_rounds,
+                    "enqueued": 0,
+                    "flushed": 0,
+                    "cycles": 0,
+                    "completed": True,
+                    "status": "planned_only",
+                }
+            )
+
+            if skipped_rounds:
+                # In execute mode these rounds are still processed via on-demand fetch.
+                if not args.execute:
+                    any_partial = True
+                main.log_warn(
+                    "backfill.prefetch_failed_rounds",
+                    sheet=ctx.title,
+                    league_id=ctx.league_id,
+                    failed_rounds=len(skipped_rounds),
+                    failed_round_ids=skipped_rounds[:20],
+                )
+            if metric_failed_round_ids:
+                any_partial = True
+                main.log_warn(
+                    "backfill.round_record_failed_rounds",
+                    sheet=ctx.title,
+                    league_id=ctx.league_id,
+                    failed_rounds=len(metric_failed_round_ids),
+                    failed_round_ids=metric_failed_round_ids[:20],
+                )
+
+            if args.execute:
+                target_to_round = latest_by_sheet.get(ws_id)
+                min_target_round = args.from_round - 1
+                to_round_for_cleanup = main.safe_int(base_plan.get("to_round"))
+                if to_round_for_cleanup is not None and to_round_for_cleanup >= args.from_round:
+                    state.conn.execute(
+                        "DELETE FROM pending_ops "
+                        "WHERE sheet_id=? "
+                        "AND op_type IN ('append_round','update_round') "
+                        "AND round_id>=? AND round_id<=?",
+                        (ws_id, int(args.from_round), int(to_round_for_cleanup)),
+                    )
+                    state.conn.commit()
+                if records_to_process:
+                    rids = [main.safe_int(r.get("round_id")) for r in records_to_process]
+                    rids = [int(x) for x in rids if x is not None]
+                    if rids:
+                        min_target_round = min(rids) - 1
+
+                state.upsert_sheet_meta(ws_id, ctx.title, ctx.league_id, layout_sig=None)
+                prev_last_before = main.safe_int(base_plan.get("prev_last_synced"))
+                if records_to_process:
+                    state.set_last_synced_round(ws_id, max(0, min_target_round))
+
+                enqueued = 0
+                flushed = 0
+                cycles = 0
+                completed = True
+                if records_to_process:
+                    enqueued, flushed, cycles, completed = _run_enqueue_flush_for_sheet(
+                        state=state,
+                        ctx=ctx,
+                        records_for_sheet=records_to_process,
+                        round_ability_api=round_ability_api,
+                        power_up_clan_api=power_up_clan_api,
+                        ability_id_to_name=ability_id_to_name,
+                        ability_headers=ability_headers,
+                        write_limiter=write_limiter,
+                        read_limiter=read_limiter,
+                        max_cycles=args.max_cycles,
+                    )
+
+                had_sheet_failures = bool(metric_failed_round_ids)
+                if target_to_round is not None and completed and not had_sheet_failures:
+                    final_last = max(int(target_to_round), int(prev_last_before or 0))
+                    state.set_last_synced_round(ws_id, final_last)
+                elif prev_last_before is not None and not records_to_process:
+                    state.set_last_synced_round(ws_id, int(prev_last_before))
+                sheet_report.update(
+                    {
+                        "enqueued": enqueued,
+                        "flushed": flushed,
+                        "cycles": cycles,
+                        "completed": completed,
+                        "status": "executed" if completed else "max_cycles_reached",
+                        "queue_total": state.queue_total_count(),
+                        "queue_due": state.queue_due_count(),
+                    }
+                )
+                if not completed:
+                    any_partial = True
+            report_rows.append(sheet_report)
+
+        report = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "execute": bool(args.execute),
+            "from_round": int(args.from_round),
+            "to_round_arg": str(args.to_round),
+            "workers": int(args.workers),
+            "gomining_rpm": int(args.gomining_rpm),
+            "prefetch_attempts": int(args.prefetch_attempts),
+            "continue_on_error": bool(args.continue_on_error),
+            "round_record_fetch_total": len(round_record_results),
+            "round_record_fetch_ok": round_records_ok,
+            "round_record_fetch_benign": round_records_benign,
+            "round_record_fetch_failed": round_records_failed,
+            "prefetch_total": len(prefetch_results),
+            "prefetch_ok": prefetch_ok,
+            "prefetch_failed": prefetch_failed,
+            "rows": report_rows,
+        }
+        os.makedirs("api_debug", exist_ok=True)
+        report_path = os.path.join("api_debug", f"backfill_report_{_utc_stamp()}.json")
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+
+        print(f"[REPORT] {report_path}")
+        print(
+            f"[SUMMARY] execute={args.execute} sheets={len(report_rows)} "
+            f"profile={args.profile} gomining_rpm={args.gomining_rpm} prefetch_attempts={args.prefetch_attempts} "
+            f"round_records_ok={round_records_ok} round_records_benign={round_records_benign} round_records_failed={round_records_failed} "
+            f"prefetch_ok={prefetch_ok} prefetch_failed={prefetch_failed}"
+        )
+        if any_partial:
+            exit_code = 2
+            print("[RESULT] completed with partial failures (exit=2).")
+            if discord_notifier is not None:
+                discord_notifier.send(
+                    (
+                        f"Backfill fertig mit Partials (exit=2)\n"
+                        f"sheets=`{len(report_rows)}` round_record_failed=`{round_records_failed}` prefetch_failed=`{prefetch_failed}`\n"
+                        f"report: `{report_path}`"
+                    ),
+                    key="finish",
+                    force=True,
+                )
+        else:
+            exit_code = 0
+            print("[RESULT] completed successfully (exit=0).")
+            if discord_notifier is not None:
+                discord_notifier.send(
+                    (
+                        f"Backfill erfolgreich (exit=0)\n"
+                        f"sheets=`{len(report_rows)}` round_record_ok=`{round_records_ok}` prefetch_ok=`{prefetch_ok}`\n"
+                        f"report: `{report_path}`"
+                    ),
+                    key="finish",
+                    force=True,
+                )
+        return exit_code
+    except Exception as e:
+        tb_text = traceback.format_exc()
+        main.log_warn("backfill.fatal", err=repr(e), traceback=tb_text[:8000])
+        print(f"[ERROR] {e!r}")
+        print(tb_text)
+        if discord_notifier is not None:
+            discord_notifier.send(
+                f"Backfill fatal error: `{repr(e)[:500]}`\n```{tb_text[:1200]}```",
+                key="fatal",
+                force=True,
+            )
+        return 1
+    finally:
+        try:
+            if state is not None:
+                state.close()
+        except Exception:
+            pass
+        lock.release()
+
+
+if __name__ == "__main__":
+    sys.exit(main_cli())
