@@ -86,6 +86,19 @@ ROUND_USER_LEADERBOARD_API_URL = os.getenv(
 ROUND_API_PAGE_LIMIT = max(1, min(50, int(os.getenv("ROUND_API_PAGE_LIMIT", "50"))))
 ROUND_API_TIMEOUT_SECONDS = int(os.getenv("ROUND_API_TIMEOUT_SECONDS", "45"))
 ROUND_API_MAX_RETRIES = max(1, int(os.getenv("ROUND_API_MAX_RETRIES", "4")))
+ROUND_USER_503_MAX_RETRIES = max(1, int(os.getenv("ROUND_USER_503_MAX_RETRIES", "8")))
+try:
+    ROUND_USER_BACKOFF_MAX_SECONDS = max(1.0, float(os.getenv("ROUND_USER_BACKOFF_MAX_SECONDS", "30")))
+except Exception:
+    ROUND_USER_BACKOFF_MAX_SECONDS = 30.0
+try:
+    ROUND_USER_ADAPTIVE_MIN_RPM = max(1.0, float(os.getenv("ROUND_USER_ADAPTIVE_MIN_RPM", "60")))
+except Exception:
+    ROUND_USER_ADAPTIVE_MIN_RPM = 60.0
+ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR = os.getenv(
+    "ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR",
+    "1",
+).strip() in {"1", "true", "TRUE", "yes", "YES"}
 GOMINING_API_REQ_PER_MIN = int(os.getenv("GOMINING_API_REQ_PER_MIN", "120"))
 TOKEN_URL = os.getenv("TOKEN_URL", "").strip()
 TOKEN_X_AUTH = os.getenv("TOKEN_X_AUTH", "").strip()
@@ -2280,6 +2293,10 @@ class GoMiningRoundAbilityApiClient:
         self.round_counts_cache: Dict[int, Dict[str, int]] = {}
         # Cache excluded user's per-round ability usage for audit output in sheet.
         self.round_excluded_user_boosts_cache: Dict[int, Dict[str, int]] = {}
+        self._round_user_503_streak = 0
+        self._adaptive_round_user_throttle_active = False
+        self._adaptive_round_user_next_ts = 0.0
+        self._adaptive_round_user_effective_rpm = float(max(1, GOMINING_API_REQ_PER_MIN))
 
     def _set_bearer(self, token: str) -> None:
         self.bearer_token = token.strip()
@@ -2296,10 +2313,79 @@ class GoMiningRoundAbilityApiClient:
         self._set_bearer(tok)
         return True
 
+    def _limiter_per_minute(self) -> float:
+        for attr in ("capacity", "per_minute", "capacity_per_min"):
+            val = safe_float(getattr(self.limiter, attr, None))
+            if val is not None and val > 0:
+                return float(val)
+        return float(max(1, GOMINING_API_REQ_PER_MIN))
+
+    def _adaptive_effective_rpm(self) -> float:
+        base_rpm = max(1.0, self._limiter_per_minute())
+        if self._round_user_503_streak <= 0:
+            return base_rpm
+        scale = float(2 ** min(6, self._round_user_503_streak))
+        return max(float(ROUND_USER_ADAPTIVE_MIN_RPM), base_rpm / scale)
+
+    def _adaptive_wait_before_round_user_request(self) -> None:
+        if not self._adaptive_round_user_throttle_active:
+            return
+        effective_rpm = max(float(ROUND_USER_ADAPTIVE_MIN_RPM), self._adaptive_effective_rpm())
+        slot_s = 60.0 / effective_rpm
+        now = time.monotonic()
+        if self._adaptive_round_user_next_ts < now:
+            self._adaptive_round_user_next_ts = now
+        wait_s = self._adaptive_round_user_next_ts - now
+        self._adaptive_round_user_next_ts += slot_s
+        if wait_s > 0:
+            time.sleep(wait_s)
+
+    def _on_round_user_503_retry(self, attempt: int, **ctx: Any) -> None:
+        self._round_user_503_streak += 1
+        effective_rpm = max(float(ROUND_USER_ADAPTIVE_MIN_RPM), self._adaptive_effective_rpm())
+        self._adaptive_round_user_effective_rpm = effective_rpm
+        if self._round_user_503_streak >= 2 and not self._adaptive_round_user_throttle_active:
+            self._adaptive_round_user_throttle_active = True
+            self._adaptive_round_user_next_ts = time.monotonic()
+            log_warn(
+                "gomining_api.round_user_adaptive_throttle_enter",
+                streak=self._round_user_503_streak,
+                effective_rpm=round(effective_rpm, 2),
+                attempt=attempt,
+                **ctx,
+            )
+        elif self._adaptive_round_user_throttle_active:
+            log_warn(
+                "gomining_api.round_user_adaptive_throttle_update",
+                streak=self._round_user_503_streak,
+                effective_rpm=round(effective_rpm, 2),
+                attempt=attempt,
+                **ctx,
+            )
+
+    def _on_round_user_success(self, attempt: int, **ctx: Any) -> None:
+        if self._adaptive_round_user_throttle_active:
+            log_info(
+                "gomining_api.round_user_adaptive_throttle_exit",
+                streak=self._round_user_503_streak,
+                effective_rpm=round(self._adaptive_round_user_effective_rpm, 2),
+                attempt=attempt,
+                **ctx,
+            )
+        self._round_user_503_streak = 0
+        self._adaptive_round_user_throttle_active = False
+        self._adaptive_round_user_next_ts = 0.0
+        self._adaptive_round_user_effective_rpm = float(max(1, self._limiter_per_minute()))
+
     def _post_json_with_retry(self, payload: Dict[str, Any], **ctx: Any) -> Optional[Dict[str, Any]]:
         self._refresh_bearer(force=False)
         delay_s = 0.6
-        for attempt in range(1, self.max_retries + 1):
+        attempt = 0
+        max_attempts_default = max(1, int(self.max_retries))
+        max_attempts_503 = max(max_attempts_default, int(ROUND_USER_503_MAX_RETRIES))
+        while True:
+            attempt += 1
+            self._adaptive_wait_before_round_user_request()
             self.limiter.wait_for_token(1.0)
             try:
                 resp = self.session.post(
@@ -2309,7 +2395,7 @@ class GoMiningRoundAbilityApiClient:
                     timeout=self.timeout_seconds,
                 )
             except Exception as e:
-                if attempt >= self.max_retries:
+                if attempt >= max_attempts_default:
                     log_warn("gomining_api.round_user_request_failed", attempt=attempt, err=repr(e), **ctx)
                     return None
                 sleep_s = delay_s + random.uniform(0.0, 0.2)
@@ -2321,13 +2407,14 @@ class GoMiningRoundAbilityApiClient:
                     **ctx,
                 )
                 time.sleep(sleep_s)
-                delay_s = min(8.0, delay_s * 2.0)
+                delay_s = min(float(ROUND_USER_BACKOFF_MAX_SECONDS), delay_s * 2.0)
                 continue
 
             if resp.status_code == 200:
                 try:
                     data = resp.json()
                     if isinstance(data, dict):
+                        self._on_round_user_success(attempt=attempt, **ctx)
                         return data
                     log_warn("gomining_api.round_user_invalid_json_type", attempt=attempt, typ=type(data).__name__, **ctx)
                     return None
@@ -2336,20 +2423,21 @@ class GoMiningRoundAbilityApiClient:
                     return None
 
             if resp.status_code == 401:
-                if attempt < self.max_retries and self._refresh_bearer(force=True):
+                if attempt < max_attempts_default and self._refresh_bearer(force=True):
                     log_warn("gomining_api.round_user_unauthorized_retry", attempt=attempt, **ctx)
                     continue
                 log_warn("gomining_api.round_user_unauthorized", attempt=attempt, **ctx)
                 return None
             if resp.status_code == 403 and _is_jwt_expired_response(resp):
-                if attempt < self.max_retries and self._refresh_bearer(force=True):
+                if attempt < max_attempts_default and self._refresh_bearer(force=True):
                     log_warn("gomining_api.round_user_forbidden_expired_retry", attempt=attempt, **ctx)
                     continue
                 log_warn("gomining_api.round_user_forbidden_expired", attempt=attempt, **ctx)
                 return None
 
             retryable = resp.status_code in {429, 500, 502, 503, 504}
-            if retryable and attempt < self.max_retries:
+            max_attempts_for_status = max_attempts_503 if resp.status_code == 503 else max_attempts_default
+            if retryable and attempt < max_attempts_for_status:
                 retry_after = None
                 try:
                     ra = resp.headers.get("Retry-After")
@@ -2357,16 +2445,27 @@ class GoMiningRoundAbilityApiClient:
                         retry_after = float(ra)
                 except Exception:
                     retry_after = None
-                sleep_s = max(delay_s, retry_after or 0.0) + random.uniform(0.0, 0.2)
+                if resp.status_code == 503:
+                    self._on_round_user_503_retry(attempt=attempt, **ctx)
+                sleep_base = delay_s
+                if resp.status_code in {429, 503}:
+                    sleep_base = min(float(ROUND_USER_BACKOFF_MAX_SECONDS), max(delay_s, 1.0))
+                sleep_s = min(
+                    float(ROUND_USER_BACKOFF_MAX_SECONDS),
+                    max(sleep_base, retry_after or 0.0) + random.uniform(0.0, 0.2),
+                )
                 log_warn(
                     "gomining_api.round_user_http_retry",
                     attempt=attempt,
                     status=resp.status_code,
                     sleep_s=round(sleep_s, 3),
+                    max_attempts=max_attempts_for_status,
+                    streak_503=self._round_user_503_streak,
+                    effective_rpm=round(self._adaptive_round_user_effective_rpm, 2),
                     **ctx,
                 )
                 time.sleep(sleep_s)
-                delay_s = min(8.0, delay_s * 2.0)
+                delay_s = min(float(ROUND_USER_BACKOFF_MAX_SECONDS), delay_s * 2.0)
                 continue
 
             log_warn(
@@ -2374,10 +2473,10 @@ class GoMiningRoundAbilityApiClient:
                 attempt=attempt,
                 status=resp.status_code,
                 body_preview=resp.text[:180],
+                max_attempts=max_attempts_for_status,
                 **ctx,
             )
             return None
-        return None
 
     def fetch_round_ability_counts(
         self,
@@ -2886,6 +2985,28 @@ class StateStore:
                 "finalized": int(r["finalized"]),
             }
         return out
+
+    def advance_last_synced_round_contiguous(self, sheet_id: int) -> Optional[int]:
+        cur = self.get_last_synced_round(sheet_id)
+        if cur is None:
+            return None
+        start = int(cur)
+        while True:
+            next_round = int(cur) + 1
+            row = self.conn.execute(
+                "SELECT 1 FROM round_row_map WHERE sheet_id=? AND round_id=? LIMIT 1",
+                (sheet_id, next_round),
+            ).fetchone()
+            if row is None:
+                break
+            cur = next_round
+        if cur > start:
+            self.conn.execute(
+                "UPDATE sheet_state SET last_synced_round=?, updated_at=? WHERE sheet_id=?",
+                (int(cur), time.time(), sheet_id),
+            )
+            self.conn.commit()
+        return int(cur)
 
     def get_max_row_idx(self, sheet_id: int) -> Optional[int]:
         row = self.conn.execute(
@@ -3882,7 +4003,6 @@ def flush_sheet_queue_with_rate_limit(state: StateStore, contexts: Dict[int, She
                     finalized = int(valid_payloads[k].get("finalized", 0))
                     row_idx = start_row + k
                     state.upsert_row_map(ws_id, rid, row_idx, checksum, finalized)
-                    state.set_last_synced_round(ws_id, rid)
                     state.delete_op(int(b["id"]))
                     processed += 1
                     if DEBUG_VERBOSE:
@@ -3895,6 +4015,7 @@ def flush_sheet_queue_with_rate_limit(state: StateStore, contexts: Dict[int, She
                             checksum=checksum[:12],
                         )
 
+                contiguous_last = state.advance_last_synced_round_contiguous(ws_id)
                 ctx.next_row = end_row + 1
                 state.prune_row_map(ws_id, ROW_MAP_KEEP_PER_SHEET)
                 log_info(
@@ -3906,6 +4027,7 @@ def flush_sheet_queue_with_rate_limit(state: StateStore, contexts: Dict[int, She
                     first_round=valid_batch[0]["round_id"],
                     last_round=valid_batch[-1]["round_id"],
                     next_row=ctx.next_row,
+                    contiguous_last_synced=contiguous_last,
                 )
 
             except Exception as e:
@@ -3974,7 +4096,7 @@ def flush_sheet_queue_with_rate_limit(state: StateStore, contexts: Dict[int, She
                 write_limiter.wait_for_token(1)
                 ctx.ws.update(range_name=f"A{row_idx}", values=[row], value_input_option="RAW")
                 state.upsert_row_map(ws_id, rid, row_idx, str(op["checksum"]), finalized)
-                state.set_last_synced_round(ws_id, rid)
+                contiguous_last = state.advance_last_synced_round_contiguous(ws_id)
                 state.delete_op(int(op["id"]))
                 processed += 1
                 if DEBUG_VERBOSE:
@@ -3985,6 +4107,7 @@ def flush_sheet_queue_with_rate_limit(state: StateStore, contexts: Dict[int, She
                         row_idx=row_idx,
                         finalized=finalized,
                         checksum=str(op["checksum"])[:12],
+                        contiguous_last_synced=contiguous_last,
                     )
             except Exception as e:
                 retryable, retry_after, status = classify_sheet_error(e)
@@ -4064,7 +4187,7 @@ def flush_sheet_queue_with_rate_limit(state: StateStore, contexts: Dict[int, She
                 write_limiter.wait_for_token(1)
                 ctx.ws.update(range_name=f"A{start_row}", values=rows, value_input_option="RAW")
                 state.upsert_row_map(ws_id, rid, start_row, str(op["checksum"]), 1)
-                state.set_last_synced_round(ws_id, rid)
+                contiguous_last = state.advance_last_synced_round_contiguous(ws_id)
                 state.delete_op(int(op["id"]))
                 ctx.next_row = end_row + 1
                 state.prune_row_map(ws_id, ROW_MAP_KEEP_PER_SHEET)
@@ -4077,6 +4200,7 @@ def flush_sheet_queue_with_rate_limit(state: StateStore, contexts: Dict[int, She
                     start_row=start_row,
                     end_row=end_row,
                     next_row=ctx.next_row,
+                    contiguous_last_synced=contiguous_last,
                 )
             except Exception as e:
                 retryable, retry_after, status = classify_sheet_error(e)
@@ -4408,6 +4532,7 @@ def enqueue_main_sheet_ops(
                 if existing_row_idx is not None:
                     # Reconstruct missing local mapping for rows already present in sheet.
                     state.upsert_row_map(ws_id, rid, existing_row_idx, "", 0)
+                    state.advance_last_synced_round_contiguous(ws_id)
                     mapped = {"row_idx": existing_row_idx, "checksum": "", "finalized": 0}
                     row_maps[rid] = mapped
                     if DEBUG_VERBOSE:
@@ -4449,8 +4574,6 @@ def enqueue_main_sheet_ops(
                 )
             if counts_by_id is None:
                 lag_to_latest = max_round - rid
-                # Strict gating: never write synthetic zero ability counts.
-                # If the API is unavailable for this round, stop this sheet and retry next poll.
                 log_warn(
                     "sync.round_wait_abilities_api",
                     sheet=ctx.title,
@@ -4459,7 +4582,10 @@ def enqueue_main_sheet_ops(
                     last_synced=last_synced,
                     max_round=max_round,
                     lag_to_latest=lag_to_latest,
+                    mode=("hybrid_continue" if ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR else "strict_block"),
                 )
+                if ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR:
+                    continue
                 break
 
             counts_by_name: Dict[str, int] = {}
@@ -5057,6 +5183,10 @@ def main() -> None:
             round_api_page_limit=ROUND_API_PAGE_LIMIT,
             round_api_timeout_s=ROUND_API_TIMEOUT_SECONDS,
             round_api_max_retries=ROUND_API_MAX_RETRIES,
+            round_user_503_max_retries=ROUND_USER_503_MAX_RETRIES,
+            round_user_backoff_max_s=ROUND_USER_BACKOFF_MAX_SECONDS,
+            round_user_adaptive_min_rpm=ROUND_USER_ADAPTIVE_MIN_RPM,
+            ability_fetch_hybrid_continue_on_error=ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR,
             leagues_api_poll_s=LEAGUES_API_POLL_SECONDS,
             league_index_lookback_days=LEAGUE_INDEX_LOOKBACK_DAYS,
             league_index_try_without_calculated_at=LEAGUE_INDEX_TRY_WITHOUT_CALCULATED_AT,

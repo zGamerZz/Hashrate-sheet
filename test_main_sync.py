@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from typing import Any, Dict, List
 
+import backfill_round_gap as backfill
 import main
 
 
@@ -1324,7 +1325,9 @@ class SyncCoreTests(unittest.TestCase):
 
         fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
         os.close(fd)
+        orig_hybrid = main.ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR
         try:
+            main.ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR = False
             st = main.StateStore(path)
             st.upsert_sheet_meta(11, "tab-main", 1)
             st.set_last_synced_round(11, 100)
@@ -1359,10 +1362,238 @@ class SyncCoreTests(unittest.TestCase):
             self.assertEqual(fake_round_api.calls, [101])
             st.close()
         finally:
+            main.ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR = orig_hybrid
             try:
                 os.remove(path)
             except OSError:
                 pass
+
+    def test_enqueue_main_sheet_ops_hybrid_continues_after_round_api_failure(self) -> None:
+        class FakeRoundAPI:
+            def __init__(self) -> None:
+                self.calls: List[int] = []
+
+            def fetch_round_ability_counts(
+                self,
+                round_id: int,
+                expected_league_id: int | None = None,
+                progress_hook: Any | None = None,
+            ) -> Dict[str, int] | None:
+                _ = (expected_league_id, progress_hook)
+                self.calls.append(round_id)
+                if round_id == 101:
+                    return None
+                return {"a1": 1}
+
+        fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
+        os.close(fd)
+        orig_hybrid = main.ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR
+        try:
+            main.ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR = True
+            st = main.StateStore(path)
+            st.upsert_sheet_meta(11, "tab-main", 1)
+            st.set_last_synced_round(11, 100)
+            st.set_price_cutover_round(11, 100)
+            self._seed_api_rounds(
+                st,
+                [
+                    {"round_id": 101, "league_id": 1, "snapshot_ts": "2026-04-01T22:00:00+00:00"},
+                    {"round_id": 102, "league_id": 1, "snapshot_ts": "2026-04-01T22:02:00+00:00"},
+                ],
+            )
+            ctx = main.SheetContext(
+                ws_id=11,
+                title="tab-main",
+                ws=None,
+                league_id=1,
+                kind="main",
+                expected_cols=len(main.BASE_HEADERS) + 1 + 6,
+                round_col_idx=6,
+            )
+            fake_round_api = FakeRoundAPI()
+            enq = main.enqueue_main_sheet_ops(
+                None,
+                st,
+                {11: ctx},
+                {"a1": "Power Up Boost"},
+                ["Power Up Boost"],
+                fake_round_api,  # type: ignore[arg-type]
+            )
+            self.assertEqual(enq, 1)
+            self.assertEqual(fake_round_api.calls, [101, 102])
+            due = st.fetch_due_ops(limit=10)
+            self.assertEqual(len(due), 1)
+            self.assertEqual(due[0]["round_id"], 102)
+            st.close()
+        finally:
+            main.ABILITY_FETCH_HYBRID_CONTINUE_ON_ERROR = orig_hybrid
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def test_state_advance_last_synced_round_contiguous(self) -> None:
+        fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
+        os.close(fd)
+        try:
+            st = main.StateStore(path)
+            st.upsert_sheet_meta(11, "tab-main", 1)
+            st.set_last_synced_round(11, 100)
+            st.upsert_row_map(11, 102, 10, "x102", 1)
+            st.upsert_row_map(11, 103, 11, "x103", 1)
+            advanced = st.advance_last_synced_round_contiguous(11)
+            self.assertEqual(advanced, 100)
+            self.assertEqual(st.get_last_synced_round(11), 100)
+            st.upsert_row_map(11, 101, 9, "x101", 1)
+            advanced = st.advance_last_synced_round_contiguous(11)
+            self.assertEqual(advanced, 103)
+            self.assertEqual(st.get_last_synced_round(11), 103)
+            st.close()
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def test_flush_queue_advances_last_synced_only_when_contiguous(self) -> None:
+        class FakeWorksheet:
+            def __init__(self) -> None:
+                self.row_count = 100
+                self.writes: List[Dict[str, Any]] = []
+
+            def update(self, range_name: str, values: List[List[Any]], value_input_option: str = "RAW") -> None:
+                self.writes.append({"range_name": range_name, "values": values, "value_input_option": value_input_option})
+
+            def add_rows(self, n: int) -> None:
+                self.row_count += int(n)
+
+        fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
+        os.close(fd)
+        try:
+            st = main.StateStore(path)
+            st.upsert_sheet_meta(11, "tab-main", 1)
+            st.set_last_synced_round(11, 100)
+            ws = FakeWorksheet()
+            ctx = main.SheetContext(
+                ws_id=11,
+                title="tab-main",
+                ws=ws,
+                league_id=1,
+                kind="main",
+                expected_cols=len(main.BASE_HEADERS) + 1 + 6,
+                round_col_idx=6,
+            )
+            row_102 = [""] * ctx.expected_cols
+            checksum_102 = main.row_checksum(row_102)
+            st.enqueue_op(
+                11,
+                "update_round",
+                102,
+                checksum_102,
+                {"row_idx": 6, "row": row_102, "finalized": 1},
+            )
+            processed = main.flush_sheet_queue_with_rate_limit(
+                st,
+                {11: ctx},
+                main.TokenBucket(9999, name="test_write"),
+            )
+            self.assertEqual(processed, 1)
+            self.assertEqual(st.get_last_synced_round(11), 100)
+
+            row_101 = [""] * ctx.expected_cols
+            checksum_101 = main.row_checksum(row_101)
+            st.enqueue_op(
+                11,
+                "update_round",
+                101,
+                checksum_101,
+                {"row_idx": 5, "row": row_101, "finalized": 1},
+            )
+            processed = main.flush_sheet_queue_with_rate_limit(
+                st,
+                {11: ctx},
+                main.TokenBucket(9999, name="test_write"),
+            )
+            self.assertEqual(processed, 1)
+            self.assertEqual(st.get_last_synced_round(11), 102)
+            st.close()
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def test_round_ability_api_503_retry_uses_extended_budget_and_adaptive_throttle(self) -> None:
+        class FakeResponse:
+            def __init__(self, status_code: int, body: Dict[str, Any]) -> None:
+                self.status_code = status_code
+                self._body = body
+                self.text = json.dumps(body)
+                self.headers: Dict[str, str] = {}
+
+            def json(self) -> Dict[str, Any]:
+                return self._body
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.calls: List[int] = []
+
+            def post(self, url: str, headers: Dict[str, str], json: Dict[str, Any], timeout: int) -> FakeResponse:
+                _ = (url, headers, json, timeout)
+                self.calls.append(1)
+                if len(self.calls) < 3:
+                    return FakeResponse(503, {"statusCode": 503, "message": "Service unavailable"})
+                return FakeResponse(200, {"data": {"ok": True}})
+
+        orig_503_retries = main.ROUND_USER_503_MAX_RETRIES
+        orig_backoff_max = main.ROUND_USER_BACKOFF_MAX_SECONDS
+        orig_adaptive_min = main.ROUND_USER_ADAPTIVE_MIN_RPM
+        orig_sleep = main.time.sleep
+        orig_uniform = main.random.uniform
+        orig_log_warn = main.log_warn
+        orig_log_info = main.log_info
+        warn_events: List[str] = []
+        info_events: List[str] = []
+        sleep_calls: List[float] = []
+        try:
+            main.ROUND_USER_503_MAX_RETRIES = 4
+            main.ROUND_USER_BACKOFF_MAX_SECONDS = 1.5
+            main.ROUND_USER_ADAPTIVE_MIN_RPM = 30.0
+            main.time.sleep = lambda x: sleep_calls.append(float(x))  # type: ignore[assignment]
+            main.random.uniform = lambda _a, _b: 0.0  # type: ignore[assignment]
+
+            def fake_log_warn(msg: str, **fields: Any) -> None:
+                _ = fields
+                warn_events.append(msg)
+
+            def fake_log_info(msg: str, **fields: Any) -> None:
+                _ = fields
+                info_events.append(msg)
+
+            main.log_warn = fake_log_warn  # type: ignore[assignment]
+            main.log_info = fake_log_info  # type: ignore[assignment]
+
+            client = main.GoMiningRoundAbilityApiClient(
+                bearer_token="token",
+                limiter=main.TokenBucket(9999, name="test"),
+                max_retries=1,
+            )
+            fake_session = FakeSession()
+            client.session = fake_session  # type: ignore[assignment]
+            body = client._post_json_with_retry({"roundId": 901204}, round_id=901204, skip=0)
+            self.assertEqual(body, {"data": {"ok": True}})
+            self.assertEqual(len(fake_session.calls), 3)
+            self.assertIn("gomining_api.round_user_adaptive_throttle_enter", warn_events)
+            self.assertIn("gomining_api.round_user_adaptive_throttle_exit", info_events)
+            self.assertGreaterEqual(len(sleep_calls), 2)
+        finally:
+            main.ROUND_USER_503_MAX_RETRIES = orig_503_retries
+            main.ROUND_USER_BACKOFF_MAX_SECONDS = orig_backoff_max
+            main.ROUND_USER_ADAPTIVE_MIN_RPM = orig_adaptive_min
+            main.time.sleep = orig_sleep  # type: ignore[assignment]
+            main.random.uniform = orig_uniform  # type: ignore[assignment]
+            main.log_warn = orig_log_warn  # type: ignore[assignment]
+            main.log_info = orig_log_info  # type: ignore[assignment]
 
     def test_enqueue_main_sheet_ops_updates_when_abilities_arrive(self) -> None:
         rec = {
@@ -2208,6 +2439,22 @@ class SyncCoreTests(unittest.TestCase):
         row3 = ["ts", 1, 2, 3]
         norm3 = main._normalize_payload_row(row3, expected_cols=6, round_id=77, round_col_idx=2)
         self.assertEqual(norm3[2], 77)
+
+    def test_backfill_normalize_round_records_skips_non_dict(self) -> None:
+        items: List[Any] = [{"round_id": 1}, "bad", 42, {"round_id": 2}]
+        normalized = backfill._normalize_round_records(items, context="test")
+        self.assertEqual(len(normalized), 2)
+        self.assertEqual([main.safe_int(x.get("round_id")) for x in normalized], [1, 2])
+
+    def test_backfill_profile_resolution_defaults_to_stable(self) -> None:
+        name, cfg = backfill._resolve_backfill_profile("unknown-profile")
+        self.assertEqual(name, "stable")
+        self.assertEqual(cfg["workers"], backfill.BACKFILL_PROFILE_PRESETS["stable"]["workers"])
+        self.assertEqual(cfg["gomining_rpm"], backfill.BACKFILL_PROFILE_PRESETS["stable"]["gomining_rpm"])
+        self.assertEqual(cfg["prefetch_attempts"], backfill.BACKFILL_PROFILE_PRESETS["stable"]["prefetch_attempts"])
+        name2, cfg2 = backfill._resolve_backfill_profile("aggressive")
+        self.assertEqual(name2, "aggressive")
+        self.assertEqual(cfg2["workers"], backfill.BACKFILL_PROFILE_PRESETS["aggressive"]["workers"])
 
 
 if __name__ == "__main__":

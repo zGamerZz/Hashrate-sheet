@@ -9,6 +9,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -21,10 +22,18 @@ import requests
 
 DEFAULT_FROM_ROUND = 945485
 DEFAULT_TO_ROUND = "latest"
-DEFAULT_WORKERS = 16
+BACKFILL_PROFILE_PRESETS: Dict[str, Dict[str, int]] = {
+    "stable": {"workers": 4, "gomining_rpm": 240, "prefetch_attempts": 5},
+    "balanced": {"workers": 8, "gomining_rpm": 420, "prefetch_attempts": 4},
+    "aggressive": {"workers": 16, "gomining_rpm": max(main.GOMINING_API_REQ_PER_MIN, 1200), "prefetch_attempts": 4},
+}
+DEFAULT_BACKFILL_PROFILE = str(os.getenv("BACKFILL_PROFILE", "stable") or "stable").strip().lower()
+if DEFAULT_BACKFILL_PROFILE not in BACKFILL_PROFILE_PRESETS:
+    DEFAULT_BACKFILL_PROFILE = "stable"
+DEFAULT_WORKERS = int(BACKFILL_PROFILE_PRESETS[DEFAULT_BACKFILL_PROFILE]["workers"])
 DEFAULT_MAX_CYCLES = 200
-DEFAULT_BACKFILL_GOMINING_RPM = max(main.GOMINING_API_REQ_PER_MIN, 1200)
-DEFAULT_PREFETCH_ATTEMPTS = 4
+DEFAULT_BACKFILL_GOMINING_RPM = int(BACKFILL_PROFILE_PRESETS[DEFAULT_BACKFILL_PROFILE]["gomining_rpm"])
+DEFAULT_PREFETCH_ATTEMPTS = int(BACKFILL_PROFILE_PRESETS[DEFAULT_BACKFILL_PROFILE]["prefetch_attempts"])
 DEFAULT_DISCORD_PROGRESS_SECONDS = 30.0
 BENIGN_ROUND_RECORD_ERRORS = {
     "round_not_in_target_leagues",
@@ -51,6 +60,40 @@ class RoundRecordFetchResult:
     ok: bool
     record: Optional[Dict[str, Any]] = None
     error: str = ""
+
+
+def _resolve_backfill_profile(profile_raw: Any) -> Tuple[str, Dict[str, int]]:
+    profile = str(profile_raw or "").strip().lower() or "stable"
+    if profile not in BACKFILL_PROFILE_PRESETS:
+        profile = "stable"
+    cfg = BACKFILL_PROFILE_PRESETS[profile]
+    return profile, {"workers": int(cfg["workers"]), "gomining_rpm": int(cfg["gomining_rpm"]), "prefetch_attempts": int(cfg["prefetch_attempts"])}
+
+
+def _normalize_round_records(records: Sequence[Any], *, context: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    invalid = 0
+    for idx, item in enumerate(records):
+        if isinstance(item, dict):
+            out.append(item)
+            continue
+        invalid += 1
+        main.log_warn(
+            "backfill.round_record_invalid_item",
+            context=context,
+            index=idx,
+            typ=type(item).__name__,
+            preview=str(item)[:160],
+        )
+    if invalid > 0:
+        main.log_warn(
+            "backfill.round_record_invalid_items",
+            context=context,
+            invalid=invalid,
+            valid=len(out),
+            total=len(records),
+        )
+    return out
 
 
 def _fmt_duration(seconds: Optional[float]) -> str:
@@ -814,12 +857,13 @@ def _run_enqueue_flush_for_sheet(
     read_limiter: main.TokenBucket,
     max_cycles: int,
 ) -> Tuple[int, int, int, bool]:
-    if not records_for_sheet:
+    normalized_records = _normalize_round_records(records_for_sheet, context=f"enqueue:{ctx.title}")
+    if not normalized_records:
         return 0, 0, 0, True
     target_round_ids = sorted(
         {
             int(rid)
-            for rid in (main.safe_int(r.get("round_id")) for r in records_for_sheet)
+            for rid in (main.safe_int(r.get("round_id")) for r in normalized_records)
             if rid is not None
         }
     )
@@ -830,7 +874,7 @@ def _run_enqueue_flush_for_sheet(
     # Monkeypatch fetch source for this run so enqueue processes only this sheet's target records.
     orig_fetch = main.fetch_completed_rounds_prefer_api
 
-    recs_sorted = sorted(records_for_sheet, key=lambda r: main.safe_int(r.get("round_id")) or -1)
+    recs_sorted = sorted(normalized_records, key=lambda r: main.safe_int(r.get("round_id")) or -1)
 
     def _patched_fetch(
         db: Optional[main.DBClient],
@@ -923,6 +967,12 @@ def main_cli() -> int:
     parser = argparse.ArgumentParser(
         description="Backfill missing main rounds in a configured round window with parallel ability prefetch.",
     )
+    parser.add_argument(
+        "--profile",
+        choices=sorted(BACKFILL_PROFILE_PRESETS.keys()),
+        default=DEFAULT_BACKFILL_PROFILE,
+        help=f"Backfill load profile (default: {DEFAULT_BACKFILL_PROFILE}).",
+    )
     parser.add_argument("--from-round", type=int, default=DEFAULT_FROM_ROUND, help=f"Inclusive start round (default: {DEFAULT_FROM_ROUND})")
     parser.add_argument(
         "--to-round",
@@ -930,18 +980,18 @@ def main_cli() -> int:
         default=DEFAULT_TO_ROUND,
         help="Inclusive end round or 'latest' (default: latest)",
     )
-    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Prefetch workers (default: {DEFAULT_WORKERS})")
+    parser.add_argument("--workers", type=int, default=None, help=f"Prefetch workers (profile default: {DEFAULT_WORKERS})")
     parser.add_argument(
         "--gomining-rpm",
         type=int,
-        default=DEFAULT_BACKFILL_GOMINING_RPM,
-        help=f"GoMining API rate limit for this backfill run (default: {DEFAULT_BACKFILL_GOMINING_RPM})",
+        default=None,
+        help=f"GoMining API rate limit for this backfill run (profile default: {DEFAULT_BACKFILL_GOMINING_RPM})",
     )
     parser.add_argument(
         "--prefetch-attempts",
         type=int,
-        default=DEFAULT_PREFETCH_ATTEMPTS,
-        help=f"Ability prefetch retry passes with reduced concurrency (default: {DEFAULT_PREFETCH_ATTEMPTS})",
+        default=None,
+        help=f"Ability prefetch retry passes with reduced concurrency (profile default: {DEFAULT_PREFETCH_ATTEMPTS})",
     )
     parser.add_argument(
         "--discord-webhook",
@@ -971,6 +1021,15 @@ def main_cli() -> int:
     )
     parser.add_argument("--execute", action="store_true", help="Apply DB/queue/sheet mutations. Without this flag script runs as dry-run.")
     args = parser.parse_args()
+
+    profile_name, profile_cfg = _resolve_backfill_profile(args.profile)
+    args.profile = profile_name
+    if args.workers is None:
+        args.workers = int(profile_cfg["workers"])
+    if args.gomining_rpm is None:
+        args.gomining_rpm = int(profile_cfg["gomining_rpm"])
+    if args.prefetch_attempts is None:
+        args.prefetch_attempts = int(profile_cfg["prefetch_attempts"])
 
     if args.from_round <= 0:
         raise ValueError("--from-round must be > 0")
@@ -1144,7 +1203,10 @@ def main_cli() -> int:
                 seen_round_record_tasks.add(rid_int)
                 round_record_tasks.append(rid_int)
 
-            candidate_records_seeded = [cached_record_map[rid] for rid in candidate_round_ids if rid in cached_record_map]
+            candidate_records_seeded = _normalize_round_records(
+                [cached_record_map[rid] for rid in candidate_round_ids if rid in cached_record_map],
+                context=f"plan_seed:{ctx.title}",
+            )
             missing_by_sheet[ws_id] = candidate_records_seeded
             candidate_round_ids_by_sheet[ws_id] = candidate_round_ids
             cached_record_map_by_sheet[ws_id] = cached_record_map
@@ -1178,6 +1240,7 @@ def main_cli() -> int:
             unresolved_round_records=len(round_record_tasks),
             from_round=args.from_round,
             to_round=args.to_round,
+            profile=args.profile,
             workers=args.workers,
             gomining_rpm=args.gomining_rpm,
             prefetch_attempts=args.prefetch_attempts,
@@ -1190,7 +1253,7 @@ def main_cli() -> int:
                     f"Backfill gestartet\n"
                     f"from `{args.from_round}` to `{args.to_round}` | execute=`{bool(args.execute)}`\n"
                     f"sheets=`{len(contexts)}` rounds=`{sum(len(candidate_round_ids_by_sheet.get(ws_id, [])) for ws_id in contexts.keys())}`\n"
-                    f"workers=`{args.workers}` rpm=`{args.gomining_rpm}`"
+                    f"profile=`{args.profile}` workers=`{args.workers}` rpm=`{args.gomining_rpm}`"
                 ),
                 key="start",
                 force=True,
@@ -1247,12 +1310,20 @@ def main_cli() -> int:
                     continue
                 failed_rounds.append(int(rid))
             metric_failed_rounds_by_sheet[ws_id] = sorted(set(failed_rounds))
-            missing_by_sheet[ws_id] = [rec_map[rid] for rid in candidate_round_ids if rid in rec_map]
+            missing_by_sheet[ws_id] = _normalize_round_records(
+                [rec_map[rid] for rid in candidate_round_ids if rid in rec_map],
+                context=f"round_record_merge:{ctx.title}",
+            )
 
         ability_tasks: List[Tuple[int, int]] = []
         seen_ability_tasks: set[Tuple[int, int]] = set()
         for ws_id, ctx in contexts.items():
-            for rec in missing_by_sheet.get(ws_id, []):
+            normalized_missing = _normalize_round_records(
+                missing_by_sheet.get(ws_id, []),
+                context=f"ability_tasks:{ctx.title}",
+            )
+            missing_by_sheet[ws_id] = normalized_missing
+            for rec in normalized_missing:
                 rid = main.safe_int(rec.get("round_id"))
                 if rid is None:
                     continue
@@ -1315,7 +1386,10 @@ def main_cli() -> int:
                     report_rows.append(dict(base_plan))
                 continue
 
-            missing_records = missing_by_sheet.get(ws_id, [])
+            missing_records = _normalize_round_records(
+                missing_by_sheet.get(ws_id, []),
+                context=f"sheet_report:{ctx.title}",
+            )
             metric_failed_round_ids = metric_failed_rounds_by_sheet.get(ws_id, [])
             if metric_failed_round_ids and not args.continue_on_error:
                 raise RuntimeError(
@@ -1473,7 +1547,7 @@ def main_cli() -> int:
         print(f"[REPORT] {report_path}")
         print(
             f"[SUMMARY] execute={args.execute} sheets={len(report_rows)} "
-            f"gomining_rpm={args.gomining_rpm} prefetch_attempts={args.prefetch_attempts} "
+            f"profile={args.profile} gomining_rpm={args.gomining_rpm} prefetch_attempts={args.prefetch_attempts} "
             f"round_records_ok={round_records_ok} round_records_benign={round_records_benign} round_records_failed={round_records_failed} "
             f"prefetch_ok={prefetch_ok} prefetch_failed={prefetch_failed}"
         )
@@ -1505,11 +1579,13 @@ def main_cli() -> int:
                 )
         return exit_code
     except Exception as e:
-        main.log_warn("backfill.fatal", err=repr(e))
+        tb_text = traceback.format_exc()
+        main.log_warn("backfill.fatal", err=repr(e), traceback=tb_text[:8000])
         print(f"[ERROR] {e!r}")
+        print(tb_text)
         if discord_notifier is not None:
             discord_notifier.send(
-                f"Backfill fatal error: `{repr(e)[:1200]}`",
+                f"Backfill fatal error: `{repr(e)[:500]}`\n```{tb_text[:1200]}```",
                 key="fatal",
                 force=True,
             )
