@@ -11,8 +11,9 @@ import random
 import re
 import sqlite3
 import time
+from decimal import Decimal, ROUND_HALF_UP
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import requests
@@ -30,16 +31,6 @@ try:
     from google.oauth2.service_account import Credentials
 except Exception:  # pragma: no cover
     Credentials = None  # type: ignore
-
-try:
-    import psycopg  # type: ignore
-except Exception:
-    psycopg = None
-
-try:
-    import psycopg2  # type: ignore
-except Exception:
-    psycopg2 = None
 
 try:
     import dotenv
@@ -61,6 +52,21 @@ STATE_DB_PATH = os.getenv("STATE_DB_PATH", "./sync_state.sqlite")
 LOCK_FILE_PATH = os.getenv("LOCK_FILE_PATH", "./sync.lock")
 LEAGUES_API_URL = os.getenv("LEAGUES_API_URL", "https://api.gomining.com/api/nft-game/league/index")
 GOMINING_BEARER_TOKEN = os.getenv("GOMINING_BEARER_TOKEN", "")
+GOMINING_API_BASE_URL = os.getenv("GOMINING_API_BASE_URL", "https://api.gomining.com").rstrip("/")
+MULTIPLIER_PATH = os.getenv("MULTIPLIER_PATH", "/api/nft-game/round/get-last")
+PLAYER_LEADERBOARD_PATH = os.getenv("PLAYER_LEADERBOARD_PATH", "/api/nft-game/user-leaderboard/index")
+ROUND_METRICS_CLAN_PATH = os.getenv("ROUND_METRICS_CLAN_PATH", "/api/nft-game/clan-leaderboard/index-v2")
+ROUND_CLAN_LEADERBOARD_PATH = os.getenv("ROUND_CLAN_LEADERBOARD_PATH", "/api/nft-game/round/clan-leaderboard")
+ROUND_METRICS_TIMEOUT_SECONDS = int(os.getenv("ROUND_METRICS_TIMEOUT_SECONDS", "45"))
+ROUND_METRICS_MAX_RETRIES = max(1, int(os.getenv("ROUND_METRICS_MAX_RETRIES", "4")))
+ROUND_METRICS_USER_PAGE_LIMIT = max(1, min(50, int(os.getenv("ROUND_METRICS_USER_PAGE_LIMIT", "50"))))
+ROUND_METRICS_CLAN_PAGE_LIMIT = max(1, min(50, int(os.getenv("ROUND_METRICS_CLAN_PAGE_LIMIT", "1"))))
+ROUND_GET_LAST_SCAN_LOOKBACK = max(1, int(os.getenv("ROUND_GET_LAST_SCAN_LOOKBACK", "200")))
+ROUND_CLOSE_ON_ROLLOVER = os.getenv("ROUND_CLOSE_ON_ROLLOVER", "1").strip() in {"1", "true", "TRUE", "yes", "YES"}
+ROUND_GET_LAST_STRICT_LEAGUE_VALIDATION = os.getenv(
+    "ROUND_GET_LAST_STRICT_LEAGUE_VALIDATION",
+    "0",
+).strip() in {"1", "true", "TRUE", "yes", "YES"}
 CLAN_LEADERBOARD_API_URL = os.getenv(
     "CLAN_LEADERBOARD_API_URL",
     "https://api.gomining.com/api/nft-game/clan-leaderboard/index-v2",
@@ -72,6 +78,14 @@ CLAN_GET_BY_ID_API_URL = os.getenv(
 CLAN_API_PAGE_LIMIT = max(1, min(50, int(os.getenv("CLAN_API_PAGE_LIMIT", "50"))))
 CLAN_API_TIMEOUT_SECONDS = int(os.getenv("CLAN_API_TIMEOUT_SECONDS", "45"))
 CLAN_API_MAX_RETRIES = max(1, int(os.getenv("CLAN_API_MAX_RETRIES", "4")))
+ENABLE_CLAN_SYNC = os.getenv("ENABLE_CLAN_SYNC", "0").strip() in {"1", "true", "TRUE", "yes", "YES"}
+ROUND_USER_LEADERBOARD_API_URL = os.getenv(
+    "ROUND_USER_LEADERBOARD_API_URL",
+    "https://api.gomining.com/api/nft-game/round/user-leaderboard",
+)
+ROUND_API_PAGE_LIMIT = max(1, min(50, int(os.getenv("ROUND_API_PAGE_LIMIT", "50"))))
+ROUND_API_TIMEOUT_SECONDS = int(os.getenv("ROUND_API_TIMEOUT_SECONDS", "45"))
+ROUND_API_MAX_RETRIES = max(1, int(os.getenv("ROUND_API_MAX_RETRIES", "4")))
 GOMINING_API_REQ_PER_MIN = int(os.getenv("GOMINING_API_REQ_PER_MIN", "120"))
 TOKEN_URL = os.getenv("TOKEN_URL", "").strip()
 TOKEN_X_AUTH = os.getenv("TOKEN_X_AUTH", "").strip()
@@ -79,6 +93,12 @@ TOKEN_METHOD = os.getenv("TOKEN_METHOD", "GET").strip().upper()
 TOKEN_TIMEOUT_SECONDS = max(1, int(os.getenv("TOKEN_TIMEOUT_SECONDS", "20")))
 TOKEN_VERIFY_SSL = os.getenv("TOKEN_VERIFY_SSL", "1").strip() in {"1", "true", "TRUE", "yes", "YES"}
 LEAGUES_API_POLL_SECONDS = int(os.getenv("LEAGUES_API_POLL_SECONDS", str(SHEET_REFRESH_SECONDS)))
+LEAGUE_INDEX_LOOKBACK_DAYS = max(0, int(os.getenv("LEAGUE_INDEX_LOOKBACK_DAYS", "7")))
+LEAGUE_INDEX_TRY_WITHOUT_CALCULATED_AT = os.getenv(
+    "LEAGUE_INDEX_TRY_WITHOUT_CALCULATED_AT",
+    "1",
+).strip() in {"1", "true", "TRUE", "yes", "YES"}
+ENABLE_DB_FALLBACK_RAW = os.getenv("ENABLE_DB_FALLBACK", "").strip()
 
 STABILIZATION_ROUNDS = int(os.getenv("STABILIZATION_ROUNDS", "2"))
 MAX_ROUNDS_PER_POLL = int(os.getenv("MAX_ROUNDS_PER_POLL", "250"))
@@ -95,22 +115,35 @@ DEBUG_VERBOSE = os.getenv("DEBUG_VERBOSE", "1").strip() in {"1", "true", "TRUE",
 LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", "")
 QUEUE_DEBUG_PREVIEW = int(os.getenv("QUEUE_DEBUG_PREVIEW", "180"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "30"))
+try:
+    ENQUEUE_FLUSH_EVERY_SECONDS = max(0.0, float(os.getenv("ENQUEUE_FLUSH_EVERY_SECONDS", "5")))
+except Exception:
+    ENQUEUE_FLUSH_EVERY_SECONDS = 5.0
 
 CONFIG_CELL = "B1"
 LOG_START_ROW = 4
 
 MAIN_SHEET_MARKER = "leagueId_to_log"
-CLAN_SHEET_MARKER = "leagueId_to_log_clan_shield"
-CLAN_TAB_SUFFIX = " - Clan Shield"
+CLAN_SHEET_MARKER = "leagueId_to_log_clan"
+CLAN_TAB_SUFFIX = " - Clan"
 
 LEAGUE_TH_HEADER = "League global TH"
 LEAGUE_TH_COL_INDEX = 7  # 0-based index, column H in the sheet.
+CLAN_LEGACY_GMT_COL_INDEX = 11  # 0-based index, legacy column L in clan tabs.
 MIGRATION_CHECKED_SHEETS: set[int] = set()
 POWER_UP_PRICE_HEADER = "Power Up GMT Price"
+POWER_UP_PRICE_SENTINEL_HEADER = "Power Up GMT Price (Sentinel)"
+CLAN_POWER_UP_PRICE_HEADER = "Clan Power Up GMT Price"
+CLAN_POWER_UP_PRICE_SENTINEL_HEADER = "Clan Power Up GMT Price (Sentinel)"
+MISSING_HEADER = "missing"
+EXCLUDED_USER_BOOST_AUDIT_HEADER = "Excluded User 2144425 Boosts (Audit)"
+EXCLUDED_BOOST_USER_ID = 2144425
 
 PPS_FACTOR = 28.0
 POWER_UP_GMT_FACTOR = 0.0389
-CLAN_SHIELD_GMT_FACTOR = 0.000555
+POWER_UP_ABILITY_ID = "5d6f8166-0f20-486f-b920-e898ca94dcc1"
+CLAN_POWER_UP_ABILITY_ID = "8a9b57a9-8a17-4647-8b2f-a164dc52b1f4"
+CLAN_POWER_UP_GMT_FACTOR = 0.000555
 CLAN_EXACT_MEMBER_COVERAGE_THRESHOLD = float(os.getenv("CLAN_EXACT_MEMBER_COVERAGE_THRESHOLD", "0.90"))
 CLAN_EXACT_POWER_COVERAGE_THRESHOLD = float(os.getenv("CLAN_EXACT_POWER_COVERAGE_THRESHOLD", "0.90"))
 CLAN_SNAPSHOT_MIN_COVERAGE = float(os.getenv("CLAN_SNAPSHOT_MIN_COVERAGE", "0.50"))
@@ -143,7 +176,6 @@ CLAN_HEADERS: List[str] = [
     "member_coverage",
     "team_th",
     "team_pps",
-    "clan_shield_gmt",
     "calc_mode",
 ]
 
@@ -163,6 +195,26 @@ ABILITY_HEADER_ORDER: List[str] = [
     "Focus Boost (x1)",
     "Focus Boost (x10)",
     "Focus Boost (x100)",
+]
+
+# Static ability mapping source (API-only abilities path, independent from DB ability_dim).
+# Format: (ability_id, ability_name, sort_order)
+ABILITY_DIM_STATIC: List[Tuple[str, str, int]] = [
+    (CLAN_POWER_UP_ABILITY_ID, "Clan Power Up Boost", 1),
+    (POWER_UP_ABILITY_ID, "Power Up Boost", 2),
+    ("646d3c76-fe06-414f-8d39-eb0aa7da429a", "Echo Boost (x1)", 3),
+    ("2ebfd30d-2950-46fc-b3e9-498a924fd021", "Echo Boost (x10)", 4),
+    ("0ffad19c-8091-4527-a600-b7c2f238147d", "Echo Boost (x100)", 5),
+    ("370be7b3-d843-4e2f-a23a-eeea37648f99", "Instant Boost (x1)", 6),
+    ("a7554d7f-0e50-45e0-ab01-6ac8db629bfd", "Instant Boost (x10)", 7),
+    ("8b6fad11-cfc1-4922-ad17-30c41cee39b9", "Instant Boost (x100)", 8),
+    ("592724c5-1f59-43b2-af13-2de8d2c97a9d", "Focus Boost (x1)", 9),
+    ("a74dd2e0-14a9-46e3-86e5-1f1e8ab1f5c4", "Focus Boost (x10)", 10),
+    ("bea03b75-6dbf-4a99-a2c9-24dfe79a3ea1", "Focus Boost (x100)", 11),
+    ("3f735c47-cead-4d15-8dad-7db4a7b3f4e7", "Rocket (x1)", 12),
+    ("17831b5e-afdf-4cb7-98d7-3a60d81e19ae", "Boost (x10)", 13),
+    ("2ec728e7-f31f-4df3-b486-5e82a4976563", "Boost (x10)", 13),
+    ("e7af0c32-1409-4b22-9e0b-99e7ea4939df", "Rocket (x100)", 14),
 ]
 
 
@@ -297,6 +349,263 @@ def calc_power_up_gmt(league_th: Optional[float], efficiency_league: Optional[fl
     return pps * POWER_UP_GMT_FACTOR
 
 
+def round_gmt_2(value: float) -> Decimal:
+    return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def has_sentinel_avatar_discount(avatar_url: Any) -> bool:
+    s = str(avatar_url or "").strip()
+    if not s:
+        return False
+    base = s.split("?", 1)[0].rstrip("/")
+    m = re.search(r"(\d+)(?:\.[A-Za-z0-9]+)?$", base)
+    if not m:
+        return False
+    try:
+        n = int(m.group(1))
+    except Exception:
+        return False
+    return 200 <= n <= 299
+
+
+def has_sentinel_alias_discount(alias: Any) -> bool:
+    s = str(alias or "").strip().lower()
+    if not s:
+        return False
+    # Fallback marker used by some users/clans when avatar URL is unavailable.
+    return ("sentinel" in s) or ("\U0001F5B2" in s)
+
+
+def has_sentinel_user_discount(avatar_url: Any, alias: Any) -> bool:
+    return has_sentinel_avatar_discount(avatar_url) or has_sentinel_alias_discount(alias)
+
+
+def calc_boost_gmt_from_api_round(
+    rec: Dict[str, Any],
+    counts_by_name: Dict[str, int],
+    boost_header: str,
+) -> Optional[float]:
+    boost_count = int(counts_by_name.get(boost_header, 0) or 0)
+    if boost_count <= 0:
+        return 0.0
+    league_th = safe_float(rec.get("league_th"))
+    efficiency_league = safe_float(rec.get("efficiency_league"))
+    per_use = calc_power_up_gmt(league_th, efficiency_league)
+    if per_use is None:
+        return None
+    return float(boost_count) * per_use
+
+
+def calc_power_up_gmt_from_api_round(
+    rec: Dict[str, Any],
+    counts_by_name: Dict[str, int],
+) -> Optional[float]:
+    return calc_boost_gmt_from_api_round(rec, counts_by_name, "Power Up Boost")
+
+
+def calc_boost_gmt_pair_from_boost_users_api(
+    boost_users: Sequence[Dict[str, Any]],
+    clan_api: Optional["GoMiningClanApiClient"],
+) -> Tuple[Optional[float], Optional[float]]:
+    normal, sentinel, _missing_aliases = calc_boost_gmt_triplet_from_boost_users_api(
+        boost_users,
+        clan_api,
+    )
+    return normal, sentinel
+
+
+def calc_boost_gmt_triplet_from_boost_users_api(
+    boost_users: Sequence[Dict[str, Any]],
+    clan_api: Optional["GoMiningClanApiClient"],
+    resolution_stats: Optional[Dict[str, int]] = None,
+) -> Tuple[Optional[float], Optional[float], List[str]]:
+    """
+    Exact API-only calculation based on users who activated boost ability (boolean activation).
+    Each user is counted once per round regardless of API count.
+    Per-user price is rounded to 2 decimals before summation.
+    Returns (normal, sentinel_adjusted) where sentinel-adjusted applies 20% discount
+    for users with avatar id in [200..299] (or sentinel marker in alias).
+    Returns (None, None, missing_aliases) when no user can be resolved.
+    """
+    by_user_usage: Dict[int, Dict[str, Any]] = {}
+    clan_ids: List[int] = []
+    needed_users_by_clan: Dict[int, set[int]] = {}
+    for item in boost_users:
+        uid = safe_int(item.get("user_id"))
+        cnt = safe_int(item.get("count")) or 0
+        cid = safe_int(item.get("clan_id"))
+        avatar_url = str(item.get("avatar_url") or "")
+        alias = str(item.get("alias") or "")
+        if uid is None or cnt <= 0:
+            continue
+        usage = by_user_usage.get(uid)
+        sentinel = has_sentinel_user_discount(avatar_url, alias)
+        if usage is None:
+            by_user_usage[uid] = {
+                "clan_id": cid,
+                "sentinel": sentinel,
+                "alias": alias,
+            }
+        else:
+            if usage.get("clan_id") is None and cid is not None:
+                usage["clan_id"] = cid
+            usage["sentinel"] = bool(usage.get("sentinel")) or sentinel
+            if not str(usage.get("alias") or "").strip() and alias:
+                usage["alias"] = alias
+    if resolution_stats is not None:
+        resolution_stats["resolved_api"] = 0
+        resolution_stats["missing"] = 0
+        resolution_stats["total_users"] = len(by_user_usage)
+
+    if not by_user_usage:
+        return 0.0, 0.0, []
+    by_clan_user: Dict[Tuple[int, int], Tuple[float, float]] = {}
+    by_user: Dict[int, Tuple[float, float]] = {}
+    if clan_api is not None:
+        for uid, usage in by_user_usage.items():
+            cid = safe_int(usage.get("clan_id"))
+            if cid is not None:
+                clan_ids.append(cid)
+                needed_users_by_clan.setdefault(cid, set()).add(uid)
+        try:
+            by_clan_user, by_user = clan_api.fetch_user_power_ee_for_clans(
+                clan_ids,
+                needed_users_by_clan=needed_users_by_clan,
+            )
+        except TypeError:
+            # Backward-compatible fallback for stubs/tests without the new named arg.
+            by_clan_user, by_user = clan_api.fetch_user_power_ee_for_clans(clan_ids)
+
+    total_gmt = Decimal("0.00")
+    total_gmt_sentinel = Decimal("0.00")
+    resolved_users = 0
+    missing_aliases: List[str] = []
+
+    for uid, usage in by_user_usage.items():
+        cid = safe_int(usage.get("clan_id"))
+        sentinel = bool(usage.get("sentinel"))
+        alias = str(usage.get("alias") or "").strip() or f"user_{uid}"
+        power_ee: Optional[Tuple[float, float]] = None
+        resolved_source: Optional[str] = None
+        if cid is not None:
+            power_ee = by_clan_user.get((cid, uid))
+            if power_ee is not None:
+                resolved_source = "api"
+        if power_ee is None:
+            power_ee = by_user.get(uid)
+            if power_ee is not None:
+                resolved_source = "api"
+        if power_ee is None:
+            missing_aliases.append(alias)
+            continue
+        power, ee = power_ee
+        per_use = calc_power_up_gmt(power, ee)
+        if per_use is None:
+            missing_aliases.append(alias)
+            continue
+        user_price = round_gmt_2(float(per_use))
+        total_gmt += user_price
+        total_gmt_sentinel += round_gmt_2(float(user_price * Decimal("0.8"))) if sentinel else user_price
+        resolved_users += 1
+        if resolution_stats is not None:
+            if resolved_source == "api":
+                resolution_stats["resolved_api"] = int(resolution_stats.get("resolved_api", 0)) + 1
+
+    if resolution_stats is not None:
+        resolution_stats["missing"] = len(missing_aliases)
+
+    if resolved_users <= 0:
+        return None, None, missing_aliases
+    return float(total_gmt), float(total_gmt_sentinel), missing_aliases
+
+
+def calc_power_up_gmt_pair_from_power_up_users_api(
+    power_up_users: Sequence[Dict[str, Any]],
+    clan_api: Optional["GoMiningClanApiClient"],
+) -> Tuple[Optional[float], Optional[float]]:
+    return calc_boost_gmt_pair_from_boost_users_api(power_up_users, clan_api)
+
+
+def calc_power_up_gmt_triplet_from_power_up_users_api(
+    power_up_users: Sequence[Dict[str, Any]],
+    clan_api: Optional["GoMiningClanApiClient"],
+    resolution_stats: Optional[Dict[str, int]] = None,
+) -> Tuple[Optional[float], Optional[float], List[str]]:
+    return calc_boost_gmt_triplet_from_boost_users_api(
+        power_up_users,
+        clan_api,
+        resolution_stats=resolution_stats,
+    )
+
+
+def calc_clan_power_up_gmt_pair_from_boost_users_api(
+    clan_power_up_users: Sequence[Dict[str, Any]],
+    clan_api: Optional["GoMiningClanApiClient"],
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Exact clan-based calculation for Clan Power Up:
+      per_use_gmt(clan) = (SUM_over_clan_members(PPS_FACTOR * power / ee)) * CLAN_POWER_UP_GMT_FACTOR
+      total = SUM(per_user_once * per_use_gmt(user_clan))
+    Sentinel-adjusted value applies 20% discount for users with avatar id in [200..299]
+    (or sentinel marker in alias).
+    Returns (None, None) when users exist but clan pricing cannot be fully resolved.
+    """
+    by_user_usage: Dict[int, Dict[str, Any]] = {}
+    clan_ids: List[int] = []
+    for item in clan_power_up_users:
+        uid = safe_int(item.get("user_id"))
+        cnt = safe_int(item.get("count")) or 0
+        cid = safe_int(item.get("clan_id"))
+        avatar_url = str(item.get("avatar_url") or "")
+        alias = str(item.get("alias") or "")
+        if uid is None or cnt <= 0:
+            continue
+        usage = by_user_usage.get(uid)
+        sentinel = has_sentinel_user_discount(avatar_url, alias)
+        if usage is None:
+            by_user_usage[uid] = {
+                "clan_id": cid,
+                "sentinel": sentinel,
+            }
+        else:
+            if usage.get("clan_id") is None and cid is not None:
+                usage["clan_id"] = cid
+            usage["sentinel"] = bool(usage.get("sentinel")) or sentinel
+    if not by_user_usage:
+        return 0.0, 0.0
+    for usage in by_user_usage.values():
+        cid = safe_int(usage.get("clan_id"))
+        if cid is not None:
+            clan_ids.append(cid)
+    if clan_api is None:
+        return None, None
+    team_pps_by_clan = clan_api.fetch_clan_team_pps_for_clans(clan_ids)
+    if not team_pps_by_clan:
+        return None, None
+
+    total_gmt = Decimal("0.00")
+    total_gmt_sentinel = Decimal("0.00")
+    resolved_users = 0
+    for _uid, usage in by_user_usage.items():
+        cid = safe_int(usage.get("clan_id"))
+        sentinel = bool(usage.get("sentinel"))
+        if cid is None:
+            continue
+        team_pps = safe_float(team_pps_by_clan.get(cid))
+        if team_pps is None or team_pps <= 0:
+            continue
+        per_use = calc_clan_power_up_gmt(team_pps)
+        if per_use is None:
+            continue
+        user_price = round_gmt_2(float(per_use))
+        total_gmt += user_price
+        total_gmt_sentinel += round_gmt_2(float(user_price * Decimal("0.8"))) if sentinel else user_price
+        resolved_users += 1
+    if resolved_users <= 0:
+        return None, None
+    return float(total_gmt), float(total_gmt_sentinel)
+
+
 def calc_team_pps_exact(sum_th_over_w: Optional[float]) -> Optional[float]:
     if sum_th_over_w is None or sum_th_over_w <= 0:
         return None
@@ -309,10 +618,10 @@ def calc_team_pps_fallback(team_th: Optional[float], efficiency_league: Optional
     return calc_league_pps(team_th, efficiency_league)
 
 
-def calc_clan_shield_gmt(team_pps: Optional[float]) -> Optional[float]:
+def calc_clan_power_up_gmt(team_pps: Optional[float]) -> Optional[float]:
     if team_pps is None:
         return None
-    return team_pps * CLAN_SHIELD_GMT_FACTOR
+    return team_pps * CLAN_POWER_UP_GMT_FACTOR
 
 
 def canonical_ability_header(ability_name: str) -> Optional[str]:
@@ -371,12 +680,37 @@ def build_ability_id_to_header(catalog: Sequence[Tuple[str, str, int]]) -> Dict[
     return out
 
 
+def _extract_league_index_array(payload: Dict[str, Any]) -> List[Any]:
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    candidates: List[Any] = []
+    if isinstance(data, dict):
+        candidates.extend(
+            [
+                data.get("array"),
+                data.get("leagues"),
+                data.get("items"),
+                data.get("list"),
+            ]
+        )
+    candidates.extend(
+        [
+            payload.get("array"),
+            payload.get("leagues"),
+            payload.get("items"),
+            payload.get("list"),
+        ]
+    )
+    for arr in candidates:
+        if isinstance(arr, list):
+            return arr
+    return []
+
+
 def parse_league_index_response(payload: Dict[str, Any]) -> Dict[int, str]:
-    data = (payload or {}).get("data") or {}
-    arr = data.get("array") or []
+    arr = _extract_league_index_array(payload or {})
     out: Dict[int, str] = {}
-    if not isinstance(arr, list):
-        return out
     for item in arr:
         if not isinstance(item, dict):
             continue
@@ -385,6 +719,215 @@ def parse_league_index_response(payload: Dict[str, Any]) -> Dict[int, str]:
         if league_id is None:
             continue
         out[league_id] = league_name or f"league-{league_id}"
+    return out
+
+
+def _first_path_value(obj: Any, paths: Sequence[Sequence[str]]) -> Any:
+    for path in paths:
+        cur = obj
+        ok = True
+        for key in path:
+            if not isinstance(cur, dict) or key not in cur:
+                ok = False
+                break
+            cur = cur.get(key)
+        if ok and cur is not None:
+            return cur
+    return None
+
+
+def parse_league_round_records_from_index(payload: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+    arr = _extract_league_index_array(payload or {})
+    out: Dict[int, Dict[str, Any]] = {}
+
+    now_iso = utc_now_iso()
+    for item in arr:
+        if not isinstance(item, dict):
+            continue
+        league_id = safe_int(item.get("id"))
+        if league_id is None:
+            league_id = safe_int(_first_path_value(item, [("league", "id"), ("data", "leagueId")]))
+        if league_id is None:
+            continue
+
+        round_id = safe_int(
+            _first_path_value(
+                item,
+                [
+                    ("roundId",),
+                    ("currentRoundId",),
+                    ("round", "id"),
+                    ("currentRound", "id"),
+                    ("currentRound", "roundId"),
+                    ("multiplierSnapshot", "roundId"),
+                    ("snapshot", "roundId"),
+                    ("data", "roundId"),
+                ],
+            )
+        )
+        if round_id is None:
+            continue
+
+        active_raw = _first_path_value(
+            item,
+            [
+                ("active",),
+                ("isActive",),
+                ("round", "active"),
+                ("round", "isActive"),
+                ("currentRound", "active"),
+                ("currentRound", "isActive"),
+                ("multiplierSnapshot", "active"),
+                ("multiplierSnapshot", "isActive"),
+                ("data", "active"),
+                ("data", "isActive"),
+            ],
+        )
+        is_active: Optional[bool]
+        if isinstance(active_raw, bool):
+            is_active = active_raw
+        elif isinstance(active_raw, (int, float)):
+            is_active = bool(int(active_raw))
+        elif isinstance(active_raw, str) and active_raw.strip().lower() in {"0", "1", "true", "false"}:
+            is_active = active_raw.strip().lower() in {"1", "true"}
+        else:
+            is_active = None
+
+        ended_at = to_iso_utc(
+            _first_path_value(
+                item,
+                [
+                    ("endedAt",),
+                    ("roundEndedAt",),
+                    ("round", "endedAt"),
+                    ("currentRound", "endedAt"),
+                    ("multiplierSnapshot", "endedAt"),
+                    ("data", "endedAt"),
+                ],
+            )
+        )
+        if ended_at is None and is_active is False:
+            # Some payload variants omit endedAt for already closed rounds.
+            ended_at = now_iso
+
+        rec: Dict[str, Any] = {
+            "snapshot_ts": to_iso_utc(
+                _first_path_value(item, [("calculatedAt",), ("updatedAt",), ("snapshotAt",), ("data", "calculatedAt")])
+            )
+            or now_iso,
+            "league_id": league_id,
+            "round_id": round_id,
+            "block_number": safe_int(
+                _first_path_value(
+                    item,
+                    [
+                        ("blockNumber",),
+                        ("currentBlockNumber",),
+                        ("round", "blockNumber"),
+                        ("currentRound", "blockNumber"),
+                        ("multiplierSnapshot", "blockNumber"),
+                        ("data", "blockNumber"),
+                    ],
+                )
+            ),
+            "multiplier": safe_float(
+                _first_path_value(
+                    item,
+                    [
+                        ("multiplier",),
+                        ("round", "multiplier"),
+                        ("currentRound", "multiplier"),
+                        ("multiplierSnapshot", "multiplier"),
+                        ("data", "multiplier"),
+                    ],
+                )
+            ),
+            "gmt_fund": safe_float(
+                _first_path_value(
+                    item,
+                    [
+                        ("gmtFund",),
+                        ("round", "gmtFund"),
+                        ("currentRound", "gmtFund"),
+                        ("multiplierSnapshot", "gmtFund"),
+                        ("data", "gmtFund"),
+                    ],
+                )
+            ),
+            "gmt_per_block": safe_float(
+                _first_path_value(
+                    item,
+                    [
+                        ("gmtPerBlock",),
+                        ("round", "gmtPerBlock"),
+                        ("currentRound", "gmtPerBlock"),
+                        ("multiplierSnapshot", "gmtPerBlock"),
+                        ("data", "gmtPerBlock"),
+                    ],
+                )
+            ),
+            "league_th": safe_float(
+                _first_path_value(
+                    item,
+                    [
+                        ("totalPower",),
+                        ("leagueTh",),
+                        ("round", "totalPower"),
+                        ("currentRound", "totalPower"),
+                        ("multiplierSnapshot", "totalPower"),
+                        ("data", "totalPower"),
+                    ],
+                )
+            ),
+            "blocks_mined": safe_int(
+                _first_path_value(
+                    item,
+                    [
+                        ("blocksMined",),
+                        ("round", "blocksMined"),
+                        ("currentRound", "blocksMined"),
+                        ("multiplierSnapshot", "blocksMined"),
+                        ("data", "blocksMined"),
+                    ],
+                )
+            ),
+            "efficiency_league": safe_float(
+                _first_path_value(
+                    item,
+                    [
+                        ("efficiencyLeague",),
+                        ("effciencyLeague",),
+                        ("round", "efficiencyLeague"),
+                        ("round", "effciencyLeague"),
+                        ("currentRound", "efficiencyLeague"),
+                        ("currentRound", "effciencyLeague"),
+                        ("multiplierSnapshot", "efficiencyLeague"),
+                        ("multiplierSnapshot", "effciencyLeague"),
+                        ("data", "efficiencyLeague"),
+                        ("data", "effciencyLeague"),
+                    ],
+                )
+            ),
+            "ended_at": ended_at,
+            "round_duration_sec": safe_int(
+                _first_path_value(
+                    item,
+                    [
+                        ("roundTime",),
+                        ("roundDurationSec",),
+                        ("round", "roundTime"),
+                        ("round", "roundDurationSec"),
+                        ("currentRound", "roundTime"),
+                        ("currentRound", "roundDurationSec"),
+                        ("multiplierSnapshot", "roundTime"),
+                        ("multiplierSnapshot", "roundDurationSec"),
+                        ("data", "roundTime"),
+                        ("data", "roundDurationSec"),
+                    ],
+                )
+            ),
+        }
+        out[league_id] = rec
     return out
 
 
@@ -415,6 +958,39 @@ def _extract_token_candidate(value: Any) -> Optional[str]:
     if s.lower().startswith("bearer "):
         s = s[7:].strip()
     return s or None
+
+
+def _is_jwt_expired_response(resp: Any) -> bool:
+    """
+    Detect JWT-expired responses where API may return 403 instead of 401.
+    """
+    status = safe_int(getattr(resp, "status_code", None))
+    if status not in {401, 403}:
+        return False
+    text = str(getattr(resp, "text", "") or "")
+    text_up = text.upper()
+    if "JWT_TOKEN_EXPIRED" in text_up or "JWT TOKEN IS EXPIRED" in text_up:
+        return True
+    try:
+        body = resp.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        parts: List[str] = []
+        for key in ("statusMessage", "description", "message", "error"):
+            val = body.get(key)
+            if val is not None:
+                parts.append(str(val))
+        meta = body.get("meta")
+        if isinstance(meta, dict):
+            for key in ("statusMessage", "description", "message", "error"):
+                val = meta.get(key)
+                if val is not None:
+                    parts.append(str(val))
+        merged = " ".join(parts).upper()
+        if "JWT_TOKEN_EXPIRED" in merged or "JWT TOKEN IS EXPIRED" in merged:
+            return True
+    return False
 
 
 def fetch_bearer_token_from_auth_api() -> Optional[str]:
@@ -462,28 +1038,172 @@ def fetch_bearer_token_from_auth_api() -> Optional[str]:
     return token
 
 
-def fetch_league_catalog_from_api(bearer_token: Optional[str] = None) -> Dict[int, str]:
+def _league_index_calculated_at_candidates(now_utc: Optional[datetime] = None) -> List[Optional[str]]:
+    now_dt = now_utc or datetime.now(timezone.utc)
+    candidates: List[Optional[str]] = [
+        now_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+    ]
+    for day_shift in range(0, LEAGUE_INDEX_LOOKBACK_DAYS + 1):
+        dt = now_dt.astimezone(timezone.utc) - timedelta(days=day_shift)
+        candidates.append(dt.strftime("%Y-%m-%dT00:00:00.000Z"))
+    if LEAGUE_INDEX_TRY_WITHOUT_CALCULATED_AT:
+        candidates.append(None)
+
+    deduped: List[Optional[str]] = []
+    seen: set[Optional[str]] = set()
+    for item in candidates:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def fetch_league_index_payload_from_api(
+    bearer_token: Optional[str] = None,
+    *,
+    require_round_records: bool = False,
+) -> Optional[Dict[str, Any]]:
     token = str(bearer_token or GOMINING_BEARER_TOKEN).strip()
     if not token:
-        return {}
+        return None
     headers = {
         "accept": "application/json, text/plain, */*",
         "content-type": "application/json",
         "authorization": f"Bearer {token}",
         "x-device-type": "desktop",
     }
-    payload = {"calculatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00.000Z")}
-    try:
-        resp = requests.post(LEAGUES_API_URL, headers=headers, json=payload, timeout=20)
+    candidates = _league_index_calculated_at_candidates()
+    empty_body: Optional[Dict[str, Any]] = None
+    catalog_only_body: Optional[Dict[str, Any]] = None
+    catalog_only_attempts = 0
+    last_err: Optional[str] = None
+
+    for attempt, calculated_at in enumerate(candidates, start=1):
+        payload = {} if calculated_at is None else {"calculatedAt": calculated_at}
+        try:
+            resp = requests.post(LEAGUES_API_URL, headers=headers, json=payload, timeout=20)
+        except Exception as e:
+            last_err = repr(e)
+            log_warn(
+                "league_api.request_failed",
+                attempt=attempt,
+                calculated_at=(calculated_at or "<none>"),
+                err=repr(e),
+            )
+            continue
+
         if resp.status_code != 200:
-            log_warn("league_api.http_error", status=resp.status_code, body_preview=resp.text[:180])
-            return {}
-        parsed = parse_league_index_response(resp.json())
-        log_debug("league_api.ok", leagues=len(parsed))
-        return parsed
-    except Exception as e:
-        log_warn("league_api.failed", err=repr(e))
+            log_warn(
+                "league_api.http_error",
+                attempt=attempt,
+                calculated_at=(calculated_at or "<none>"),
+                status=resp.status_code,
+                body_preview=resp.text[:180],
+            )
+            if resp.status_code in {401, 403}:
+                return None
+            continue
+
+        try:
+            body = resp.json()
+        except Exception as e:
+            last_err = repr(e)
+            log_warn(
+                "league_api.bad_json",
+                attempt=attempt,
+                calculated_at=(calculated_at or "<none>"),
+                err=repr(e),
+                body_preview=resp.text[:180],
+            )
+            continue
+        if not isinstance(body, dict):
+            log_warn(
+                "league_api.bad_shape",
+                attempt=attempt,
+                calculated_at=(calculated_at or "<none>"),
+                typ=type(body).__name__,
+            )
+            continue
+
+        parsed = parse_league_index_response(body)
+        if parsed:
+            if require_round_records:
+                recs = parse_league_round_records_from_index(body)
+                if recs:
+                    log_debug(
+                        "league_api.ok_rounds",
+                        leagues=len(parsed),
+                        rounds=len(recs),
+                        attempt=attempt,
+                        calculated_at=(calculated_at or "<none>"),
+                    )
+                    return body
+                catalog_only_attempts += 1
+                if catalog_only_body is None:
+                    catalog_only_body = body
+                log_warn(
+                    "league_api.catalog_without_rounds",
+                    leagues=len(parsed),
+                    attempt=attempt,
+                    calculated_at=(calculated_at or "<none>"),
+                )
+                continue
+            log_debug(
+                "league_api.ok",
+                leagues=len(parsed),
+                attempt=attempt,
+                calculated_at=(calculated_at or "<none>"),
+            )
+            return body
+
+        if empty_body is None:
+            empty_body = body
+        log_debug(
+            "league_api.empty",
+            attempt=attempt,
+            calculated_at=(calculated_at or "<none>"),
+        )
+
+    if require_round_records and catalog_only_body is not None:
+        preview = [(x or "<none>") for x in candidates[:8]]
+        log_warn(
+            "league_api.rounds_missing_all_candidates",
+            attempts=len(candidates),
+            catalog_only_attempts=catalog_only_attempts,
+            lookback_days=LEAGUE_INDEX_LOOKBACK_DAYS,
+            try_without_calculated_at=LEAGUE_INDEX_TRY_WITHOUT_CALCULATED_AT,
+            calculated_at_preview=preview,
+        )
+        return None
+
+    if empty_body is not None:
+        preview = [(x or "<none>") for x in candidates[:8]]
+        log_warn(
+            "league_api.empty_all_candidates",
+            attempts=len(candidates),
+            lookback_days=LEAGUE_INDEX_LOOKBACK_DAYS,
+            try_without_calculated_at=LEAGUE_INDEX_TRY_WITHOUT_CALCULATED_AT,
+            calculated_at_preview=preview,
+        )
+        return empty_body
+
+    if last_err is not None:
+        log_warn(
+            "league_api.failed_all_candidates",
+            attempts=len(candidates),
+            err=last_err,
+        )
+    return None
+
+
+def fetch_league_catalog_from_api(bearer_token: Optional[str] = None) -> Dict[int, str]:
+    payload = fetch_league_index_payload_from_api(bearer_token)
+    if not isinstance(payload, dict):
         return {}
+    parsed = parse_league_index_response(payload)
+    log_debug("league_api.ok", leagues=len(parsed))
+    return parsed
 
 
 def _to_api_calculated_at(value: Any) -> str:
@@ -550,6 +1270,10 @@ class GoMiningClanApiClient:
         }
         if self.bearer_token:
             self._set_bearer(self.bearer_token)
+        # Cache exact user power/ee by (clan_id, user_id) to avoid repeated full clan scans.
+        self._user_power_ee_cache: Dict[Tuple[int, int], Tuple[float, float]] = {}
+        # Cache clan team PPS (derived from full clan/get-by-id user lists).
+        self._clan_team_pps_cache: Dict[int, float] = {}
 
     def _set_bearer(self, token: str) -> None:
         self.bearer_token = token.strip()
@@ -614,6 +1338,12 @@ class GoMiningClanApiClient:
                     log_warn("gomining_api.http_unauthorized_retry", op=op, attempt=attempt, **ctx)
                     continue
                 log_warn("gomining_api.http_unauthorized", op=op, attempt=attempt, **ctx)
+                return None
+            if resp.status_code == 403 and _is_jwt_expired_response(resp):
+                if attempt < self.max_retries and self._refresh_bearer(force=True):
+                    log_warn("gomining_api.http_forbidden_expired_retry", op=op, attempt=attempt, **ctx)
+                    continue
+                log_warn("gomining_api.http_forbidden_expired", op=op, attempt=attempt, **ctx)
                 return None
 
             retryable = resp.status_code in {429, 500, 502, 503, 504}
@@ -805,12 +1535,1058 @@ class GoMiningClanApiClient:
                     "member_coverage": member_cov,
                     "team_th": team_th,
                     "team_pps": team_pps,
-                    "clan_shield_gmt": calc_clan_shield_gmt(team_pps),
                     "calc_mode": "api_exact",
                 }
             )
         rows.sort(key=lambda x: (-(safe_float(x.get("team_pps")) or 0.0), safe_int(x.get("clan_id")) or 0))
         return rows
+
+    def _extract_user_power_ee_from_clan_row(self, user: Dict[str, Any]) -> Optional[Tuple[int, float, float]]:
+        uid = safe_int(user.get("id"))
+        if uid is None:
+            nested = user.get("user")
+            if isinstance(nested, dict):
+                uid = safe_int(nested.get("id"))
+        if uid is None:
+            uid = safe_int(user.get("userId"))
+        power = safe_float(user.get("power"))
+        ee = safe_float(user.get("ee"))
+        if ee is None:
+            ee = safe_float(user.get("meanEnergyEfficiency"))
+        if ee is None:
+            ee = safe_float(user.get("efficiency"))
+        if uid is None or power is None or power <= 0 or ee is None or ee <= 0:
+            return None
+        return uid, power, ee
+
+    def _fetch_clan_user_power_ee_partial(
+        self,
+        clan_id: int,
+        needed_user_ids: Optional[set[int]],
+    ) -> Dict[int, Tuple[float, float]]:
+        """
+        Fetch only the needed users' power/ee for one clan.
+        Stops pagination early as soon as all needed users are found.
+        """
+        needed = set(int(x) for x in (needed_user_ids or set()) if safe_int(x) is not None)
+        # If caller asked for a concrete set and it is empty, nothing to do.
+        if needed_user_ids is not None and not needed:
+            return {}
+
+        out: Dict[int, Tuple[float, float]] = {}
+        skip = 0
+        page_no = 0
+        max_pages = 400
+        while True:
+            payload = {
+                "clanId": clan_id,
+                "pagination": {"limit": self.page_limit, "skip": skip, "count": 0},
+                "filters": {"filterType": "none"},
+                "sort": {"sortType": "none"},
+            }
+            body = self._post_json_with_retry(
+                self.clan_get_by_id_url,
+                payload,
+                op="clan_get_by_id_partial",
+                clan_id=clan_id,
+                skip=skip,
+            )
+            if body is None:
+                return out
+            data = body.get("data")
+            if not isinstance(data, dict):
+                log_warn("gomining_api.clan_bad_shape", clan_id=clan_id, skip=skip)
+                return out
+
+            chunk = data.get("usersForClient") or []
+            if not isinstance(chunk, list):
+                chunk = []
+
+            for raw_user in chunk:
+                if not isinstance(raw_user, dict):
+                    continue
+                parsed = self._extract_user_power_ee_from_clan_row(raw_user)
+                if parsed is None:
+                    continue
+                uid, power, ee = parsed
+                if needed_user_ids is not None and uid not in needed:
+                    continue
+                out[uid] = (power, ee)
+
+            if needed_user_ids is not None and len(out) >= len(needed):
+                break
+
+            users_count = safe_int(data.get("usersCount"))
+            if len(chunk) < self.page_limit:
+                break
+            if users_count is not None and users_count >= 0 and (skip + len(chunk)) >= users_count:
+                break
+
+            skip += self.page_limit
+            page_no += 1
+            if page_no >= max_pages:
+                log_warn("gomining_api.clan_partial_pagination_guard", clan_id=clan_id, pages=page_no)
+                break
+        return out
+
+    def fetch_user_power_ee_for_clans(
+        self,
+        clan_ids: Sequence[int],
+        needed_users_by_clan: Optional[Dict[int, set[int]]] = None,
+    ) -> Tuple[Dict[Tuple[int, int], Tuple[float, float]], Dict[int, Tuple[float, float]]]:
+        """
+        Build user power/eff indexes from clan/get-by-id (API-only source).
+        Returns:
+          - by_clan_user[(clan_id, user_id)] = (power, ee)
+          - by_user[user_id] = (power, ee)  # fallback index
+        """
+        by_clan_user: Dict[Tuple[int, int], Tuple[float, float]] = {}
+        by_user: Dict[int, Tuple[float, float]] = {}
+        clan_id_set = sorted({int(x) for x in clan_ids if safe_int(x) is not None})
+        needed_map: Dict[int, set[int]] = {}
+        if isinstance(needed_users_by_clan, dict):
+            for k, vals in needed_users_by_clan.items():
+                cid = safe_int(k)
+                if cid is None:
+                    continue
+                if isinstance(vals, set):
+                    uids = {int(x) for x in vals if safe_int(x) is not None}
+                else:
+                    try:
+                        uids = {int(x) for x in list(vals) if safe_int(x) is not None}  # type: ignore[arg-type]
+                    except Exception:
+                        uids = set()
+                if uids:
+                    needed_map[cid] = uids
+
+        for clan_id in clan_id_set:
+            needed_for_clan = needed_map.get(clan_id)
+
+            # Fast path: use cache when all required users are already known.
+            if needed_for_clan:
+                all_cached = True
+                for uid in needed_for_clan:
+                    pair = self._user_power_ee_cache.get((clan_id, uid))
+                    if pair is None:
+                        all_cached = False
+                        break
+                    by_clan_user[(clan_id, uid)] = pair
+                    by_user[uid] = pair
+                if all_cached:
+                    continue
+
+            fetched = self._fetch_clan_user_power_ee_partial(clan_id, needed_for_clan)
+            for uid, pair in fetched.items():
+                self._user_power_ee_cache[(clan_id, uid)] = pair
+                by_clan_user[(clan_id, uid)] = pair
+                by_user[uid] = pair
+        return by_clan_user, by_user
+
+    def fetch_clan_team_pps_for_clans(self, clan_ids: Sequence[int]) -> Dict[int, float]:
+        """
+        Compute team PPS per clan from full clan/get-by-id user lists:
+          team_pps = SUM(PPS_FACTOR * user_power / user_ee) for users with valid power/ee.
+        """
+        out: Dict[int, float] = {}
+        clan_id_set = sorted({int(x) for x in clan_ids if safe_int(x) is not None})
+        if not clan_id_set:
+            return out
+
+        missing: List[int] = []
+        for clan_id in clan_id_set:
+            cached = self._clan_team_pps_cache.get(clan_id)
+            if cached is None:
+                missing.append(clan_id)
+                continue
+            out[clan_id] = float(cached)
+
+        for clan_id in missing:
+            detail = self._fetch_clan_detail_all_pages(clan_id)
+            if detail is None:
+                continue
+            users_raw = detail.get("usersForClient") or []
+            users = [u for u in users_raw if isinstance(u, dict)] if isinstance(users_raw, list) else []
+            _team_th, team_pps = calc_team_th_and_pps_from_users(users)
+            self._clan_team_pps_cache[clan_id] = float(team_pps)
+            out[clan_id] = float(team_pps)
+        return out
+
+
+class GoMiningRoundMetricsApiClient:
+    def __init__(
+        self,
+        bearer_token: str,
+        limiter: TokenBucket,
+        base_url: str = GOMINING_API_BASE_URL,
+        multiplier_path: str = MULTIPLIER_PATH,
+        round_clan_leaderboard_path: str = ROUND_CLAN_LEADERBOARD_PATH,
+        player_leaderboard_path: str = PLAYER_LEADERBOARD_PATH,
+        clan_leaderboard_path: str = ROUND_METRICS_CLAN_PATH,
+        user_page_limit: int = ROUND_METRICS_USER_PAGE_LIMIT,
+        clan_page_limit: int = ROUND_METRICS_CLAN_PAGE_LIMIT,
+        round_scan_lookback: int = ROUND_GET_LAST_SCAN_LOOKBACK,
+        timeout_seconds: int = ROUND_METRICS_TIMEOUT_SECONDS,
+        max_retries: int = ROUND_METRICS_MAX_RETRIES,
+        token_fetcher: Optional[Callable[[], Optional[str]]] = None,
+    ) -> None:
+        self.bearer_token = bearer_token.strip()
+        self.token_fetcher = token_fetcher
+        self.limiter = limiter
+        self.base_url = str(base_url or "").strip().rstrip("/")
+        self.multiplier_url = self._build_url(multiplier_path)
+        self.round_clan_leaderboard_url = self._build_url(round_clan_leaderboard_path)
+        self.player_leaderboard_url = self._build_url(player_leaderboard_path)
+        self.clan_leaderboard_url = self._build_url(clan_leaderboard_path)
+        self.user_page_limit = max(1, min(50, int(user_page_limit)))
+        self.clan_page_limit = max(1, min(50, int(clan_page_limit)))
+        self.round_scan_lookback = max(1, int(round_scan_lookback))
+        self.timeout_seconds = max(1, int(timeout_seconds))
+        self.max_retries = max(1, int(max_retries))
+        self.session = requests.Session()
+        self.headers = {
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "x-device-type": "desktop",
+            "origin": "https://app.gomining.com",
+            "referer": "https://app.gomining.com/",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        }
+        if self.bearer_token:
+            self._set_bearer(self.bearer_token)
+
+    def _build_url(self, path: str) -> str:
+        s = str(path or "").strip()
+        if not s:
+            raise ValueError("GoMining round metrics path/url is empty")
+        if s.startswith("http://") or s.startswith("https://"):
+            return s
+        if not self.base_url:
+            raise ValueError("GOMINING_API_BASE_URL is required for relative round metrics paths")
+        if not s.startswith("/"):
+            s = "/" + s
+        return f"{self.base_url}{s}"
+
+    def _set_bearer(self, token: str) -> None:
+        self.bearer_token = token.strip()
+        self.headers["authorization"] = f"Bearer {self.bearer_token}"
+
+    def _refresh_bearer(self, force: bool = False) -> bool:
+        if not self.token_fetcher:
+            return bool(self.bearer_token)
+        if self.bearer_token and not force:
+            return True
+        tok = (self.token_fetcher() or "").strip()
+        if not tok:
+            return bool(self.bearer_token)
+        self._set_bearer(tok)
+        return True
+
+    def _request_json_with_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        json_payload: Optional[Dict[str, Any]] = None,
+        op: str,
+        **ctx: Any,
+    ) -> Optional[Dict[str, Any]]:
+        self._refresh_bearer(force=False)
+        delay_s = 0.6
+        method_upper = str(method or "GET").upper()
+        for attempt in range(1, self.max_retries + 1):
+            self.limiter.wait_for_token(1.0)
+            try:
+                resp = self.session.request(
+                    method_upper,
+                    url,
+                    headers=self.headers,
+                    params=params,
+                    json=json_payload,
+                    timeout=self.timeout_seconds,
+                )
+            except Exception as e:
+                if attempt >= self.max_retries:
+                    log_warn("gomining_api.round_metrics_request_failed", op=op, attempt=attempt, err=repr(e), **ctx)
+                    return None
+                sleep_s = delay_s + random.uniform(0.0, 0.2)
+                log_warn(
+                    "gomining_api.round_metrics_request_retry",
+                    op=op,
+                    attempt=attempt,
+                    sleep_s=round(sleep_s, 3),
+                    err=repr(e),
+                    **ctx,
+                )
+                time.sleep(sleep_s)
+                delay_s = min(8.0, delay_s * 2.0)
+                continue
+
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    log_warn("gomining_api.round_metrics_invalid_json", op=op, attempt=attempt, err=repr(e), **ctx)
+                    return None
+                if isinstance(data, dict):
+                    return data
+                log_warn(
+                    "gomining_api.round_metrics_invalid_json_type",
+                    op=op,
+                    attempt=attempt,
+                    typ=type(data).__name__,
+                    **ctx,
+                )
+                return None
+
+            if resp.status_code == 401:
+                if attempt < self.max_retries and self._refresh_bearer(force=True):
+                    log_warn("gomining_api.round_metrics_unauthorized_retry", op=op, attempt=attempt, **ctx)
+                    continue
+                log_warn("gomining_api.round_metrics_unauthorized", op=op, attempt=attempt, **ctx)
+                return None
+
+            if resp.status_code == 403 and _is_jwt_expired_response(resp):
+                if attempt < self.max_retries and self._refresh_bearer(force=True):
+                    log_warn("gomining_api.round_metrics_forbidden_expired_retry", op=op, attempt=attempt, **ctx)
+                    continue
+                log_warn("gomining_api.round_metrics_forbidden_expired", op=op, attempt=attempt, **ctx)
+                return None
+
+            retryable = resp.status_code in {429, 500, 502, 503, 504}
+            if retryable and attempt < self.max_retries:
+                retry_after = None
+                try:
+                    ra = resp.headers.get("Retry-After")
+                    if ra:
+                        retry_after = float(ra)
+                except Exception:
+                    retry_after = None
+                sleep_s = max(delay_s, retry_after or 0.0) + random.uniform(0.0, 0.2)
+                log_warn(
+                    "gomining_api.round_metrics_http_retry",
+                    op=op,
+                    attempt=attempt,
+                    status=resp.status_code,
+                    sleep_s=round(sleep_s, 3),
+                    **ctx,
+                )
+                time.sleep(sleep_s)
+                delay_s = min(8.0, delay_s * 2.0)
+                continue
+
+            log_warn(
+                "gomining_api.round_metrics_http_error",
+                op=op,
+                attempt=attempt,
+                status=resp.status_code,
+                body_preview=resp.text[:180],
+                **ctx,
+            )
+            return None
+        return None
+
+    @staticmethod
+    def _payload_data(body: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(body, dict):
+            return None
+        data = body.get("data")
+        if isinstance(data, dict):
+            return data
+        return body
+
+    @staticmethod
+    def _payload_round_id(body: Any) -> Optional[int]:
+        data = GoMiningRoundMetricsApiClient._payload_data(body)
+        if not isinstance(data, dict):
+            return None
+        rid = safe_int(data.get("roundId"))
+        if rid is None:
+            rid = safe_int(data.get("id"))
+        return rid
+
+    @staticmethod
+    def _payload_league_id(body: Any) -> Optional[int]:
+        data = GoMiningRoundMetricsApiClient._payload_data(body)
+        if not isinstance(data, dict):
+            return None
+        return safe_int(data.get("leagueId"))
+
+    def _fetch_round_clan_leaderboard_by_round_id(
+        self,
+        league_id: int,
+        round_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        return self._request_json_with_retry(
+            "POST",
+            self.round_clan_leaderboard_url,
+            json_payload={
+                "roundId": int(round_id),
+                "pagination": {"skip": 0, "limit": 1},
+            },
+            op="round_clan_leaderboard_by_round",
+            league_id=league_id,
+            round_id=round_id,
+        )
+
+    def _fetch_get_last_with_probe(
+        self,
+        requested_league_id: int,
+        strict_league_validation: bool = ROUND_GET_LAST_STRICT_LEAGUE_VALIDATION,
+    ) -> Tuple[Optional[Dict[str, Any]], bool]:
+        primary = self._request_json_with_retry(
+            "GET",
+            self.multiplier_url,
+            params={"leagueId": requested_league_id},
+            op="round_get_last",
+            league_id=requested_league_id,
+        )
+        if not isinstance(primary, dict):
+            return None, True
+
+        primary_league_id = self._payload_league_id(primary)
+        if primary_league_id == requested_league_id:
+            return primary, False
+
+        primary_round_id = self._payload_round_id(primary)
+        log_warn(
+            "gomining_api.round_get_last_league_mismatch",
+            requested_league_id=requested_league_id,
+            payload_league_id=primary_league_id,
+            strict=bool(strict_league_validation),
+            round_id=primary_round_id,
+            method="GET",
+        )
+
+        secondary = self._request_json_with_retry(
+            "POST",
+            self.multiplier_url,
+            json_payload={"leagueId": requested_league_id},
+            op="round_get_last_post_probe",
+            league_id=requested_league_id,
+        )
+        if not isinstance(secondary, dict):
+            log_warn(
+                "gomining_api.round_get_last_post_probe_failed",
+                requested_league_id=requested_league_id,
+            )
+            return primary, True
+
+        secondary_league_id = self._payload_league_id(secondary)
+        secondary_round_id = self._payload_round_id(secondary)
+        if secondary_league_id == requested_league_id:
+            log_info(
+                "gomining_api.round_get_last_post_probe_resolved",
+                requested_league_id=requested_league_id,
+                round_id=secondary_round_id,
+            )
+            return secondary, False
+
+        log_warn(
+            "gomining_api.round_get_last_league_mismatch",
+            requested_league_id=requested_league_id,
+            payload_league_id=secondary_league_id,
+            strict=bool(strict_league_validation),
+            round_id=secondary_round_id,
+            method="POST",
+        )
+        if primary_round_id is None:
+            return secondary, True
+        if secondary_round_id is None:
+            return primary, True
+        if secondary_round_id >= primary_round_id:
+            return secondary, True
+        return primary, True
+
+    def _scan_closed_round_for_league(
+        self,
+        requested_league_id: int,
+        start_round_id: int,
+        lookback: int,
+    ) -> Optional[int]:
+        min_round_id = max(1, int(start_round_id) - max(1, int(lookback)))
+        for rid in range(int(start_round_id), min_round_id - 1, -1):
+            body = self._fetch_round_clan_leaderboard_by_round_id(requested_league_id, rid)
+            if not isinstance(body, dict):
+                continue
+            data = self._payload_data(body)
+            if not isinstance(data, dict):
+                continue
+            found_league_id = safe_int(data.get("leagueId"))
+            found_round_id = safe_int(data.get("roundId"))
+            if found_round_id is None:
+                found_round_id = safe_int(data.get("id"))
+            active_flag = data.get("active")
+            if found_league_id == requested_league_id and found_round_id is not None and active_flag is False:
+                log_info(
+                    "gomining_api.round_scan_hit",
+                    league_id=requested_league_id,
+                    requested_round_id=rid,
+                    resolved_round_id=found_round_id,
+                )
+                return found_round_id
+        return None
+
+    def _compute_round_duration_sec(self, round_data: Dict[str, Any], ended_at_iso: str) -> Optional[int]:
+        ended_at_norm = to_iso_utc(ended_at_iso)
+        ended_dt: Optional[datetime] = None
+        if ended_at_norm:
+            try:
+                ended_dt = datetime.fromisoformat(str(ended_at_norm).replace("Z", "+00:00"))
+                if ended_dt.tzinfo is None:
+                    ended_dt = ended_dt.replace(tzinfo=timezone.utc)
+                ended_dt = ended_dt.astimezone(timezone.utc)
+            except Exception:
+                ended_dt = None
+
+        started_at_iso = to_iso_utc(round_data.get("startedAt"))
+        if ended_dt is not None and started_at_iso:
+            try:
+                started_dt = datetime.fromisoformat(str(started_at_iso).replace("Z", "+00:00"))
+                if started_dt.tzinfo is None:
+                    started_dt = started_dt.replace(tzinfo=timezone.utc)
+                started_dt = started_dt.astimezone(timezone.utc)
+                duration = int(round((ended_dt - started_dt).total_seconds()))
+                if duration >= 0:
+                    return duration
+                return None
+            except Exception:
+                pass
+
+        return safe_int(round_data.get("roundTime"))
+
+    def fetch_round_metrics_triplet(
+        self,
+        league_id: int,
+        strict_league_validation: bool = ROUND_GET_LAST_STRICT_LEAGUE_VALIDATION,
+    ) -> Optional[Dict[str, Any]]:
+        requested_league_id = int(league_id)
+        _ = strict_league_validation
+
+        get_last_body, unresolved_mismatch = self._fetch_get_last_with_probe(
+            requested_league_id,
+            strict_league_validation=strict_league_validation,
+        )
+        if not isinstance(get_last_body, dict):
+            return None
+        get_last_data = self._payload_data(get_last_body)
+        if not isinstance(get_last_data, dict):
+            log_warn("gomining_api.round_get_last_bad_shape", league_id=requested_league_id)
+            return None
+
+        previous_round_id = safe_int(get_last_data.get("previousRoundId"))
+        if previous_round_id is not None and previous_round_id <= 0:
+            previous_round_id = None
+
+        target_round_id: Optional[int]
+        if previous_round_id is not None and not unresolved_mismatch:
+            target_round_id = previous_round_id
+        else:
+            start_round_id = self._payload_round_id(get_last_body)
+            if start_round_id is None or start_round_id <= 0:
+                log_warn(
+                    "gomining_api.round_get_last_scan_missing_start_round",
+                    league_id=requested_league_id,
+                    previous_round_id=previous_round_id,
+                    unresolved_mismatch=bool(unresolved_mismatch),
+                )
+                return None
+            target_round_id = self._scan_closed_round_for_league(
+                requested_league_id,
+                start_round_id=start_round_id,
+                lookback=self.round_scan_lookback,
+            )
+            if target_round_id is None:
+                log_warn(
+                    "gomining_api.round_get_last_scan_failed",
+                    league_id=requested_league_id,
+                    start_round_id=start_round_id,
+                    lookback=self.round_scan_lookback,
+                    previous_round_id=previous_round_id,
+                    unresolved_mismatch=bool(unresolved_mismatch),
+                )
+                return None
+            log_info(
+                "gomining_api.round_get_last_scan_resolved",
+                league_id=requested_league_id,
+                start_round_id=start_round_id,
+                target_round_id=target_round_id,
+                lookback=self.round_scan_lookback,
+                unresolved_mismatch=bool(unresolved_mismatch),
+            )
+
+        round_body = self._fetch_round_clan_leaderboard_by_round_id(requested_league_id, target_round_id)
+        if not isinstance(round_body, dict):
+            return None
+        round_data = self._payload_data(round_body)
+        if not isinstance(round_data, dict):
+            log_warn(
+                "gomining_api.round_clan_leaderboard_bad_shape",
+                league_id=requested_league_id,
+                target_round_id=target_round_id,
+            )
+            return None
+
+        resolved_round_id = safe_int(round_data.get("roundId"))
+        if resolved_round_id is None:
+            resolved_round_id = safe_int(round_data.get("id"))
+        if resolved_round_id != target_round_id:
+            log_warn(
+                "gomining_api.round_clan_round_mismatch",
+                league_id=requested_league_id,
+                target_round_id=target_round_id,
+                payload_round_id=resolved_round_id,
+            )
+            return None
+
+        payload_league_id = safe_int(round_data.get("leagueId"))
+        if payload_league_id != requested_league_id:
+            log_warn(
+                "gomining_api.round_clan_league_mismatch",
+                league_id=requested_league_id,
+                target_round_id=target_round_id,
+                payload_league_id=payload_league_id,
+            )
+            return None
+
+        active_flag = round_data.get("active")
+        if active_flag is not False:
+            log_warn(
+                "gomining_api.round_clan_not_finalized",
+                league_id=requested_league_id,
+                round_id=target_round_id,
+                active=active_flag,
+            )
+            return None
+
+        ended_at = to_iso_utc(round_data.get("endedAt"))
+        if not ended_at:
+            log_warn(
+                "gomining_api.round_clan_missing_ended_at",
+                league_id=requested_league_id,
+                round_id=target_round_id,
+            )
+            return None
+        round_duration_sec = self._compute_round_duration_sec(round_data, ended_at)
+        if round_duration_sec is None:
+            log_warn(
+                "gomining_api.round_clan_missing_duration",
+                league_id=requested_league_id,
+                round_id=target_round_id,
+            )
+            return None
+
+        calculated_at = _to_api_calculated_at(ended_at)
+        snapshot_ts = utc_now_iso()
+
+        user_payload = {
+            "pagination": {"skip": 0, "limit": self.user_page_limit},
+            "calculatedAt": calculated_at,
+            "leagueId": requested_league_id,
+        }
+        user_body = self._request_json_with_retry(
+            "POST",
+            self.player_leaderboard_url,
+            json_payload=user_payload,
+            op="user_leaderboard_index",
+            league_id=requested_league_id,
+            round_id=target_round_id,
+        )
+        if not isinstance(user_body, dict):
+            return None
+        user_data = self._payload_data(user_body)
+        if not isinstance(user_data, dict):
+            log_warn("gomining_api.user_leaderboard_bad_shape", league_id=requested_league_id, round_id=target_round_id)
+            return None
+
+        clan_payload = {
+            "pagination": {"skip": 0, "limit": self.clan_page_limit},
+            "calculatedAt": calculated_at,
+            "leagueId": requested_league_id,
+        }
+        clan_body = self._request_json_with_retry(
+            "POST",
+            self.clan_leaderboard_url,
+            json_payload=clan_payload,
+            op="clan_leaderboard_index_v2",
+            league_id=requested_league_id,
+            round_id=target_round_id,
+        )
+        if not isinstance(clan_body, dict):
+            return None
+        clan_data = self._payload_data(clan_body)
+        if not isinstance(clan_data, dict):
+            log_warn("gomining_api.clan_leaderboard_bad_shape", league_id=requested_league_id, round_id=target_round_id)
+            return None
+
+        gmt_fund = safe_float(user_data.get("gmtFund"))
+        user_blocks_mined = safe_int(user_data.get("totalMinedBlocks"))
+        clan_blocks_mined = safe_int(clan_data.get("totalMinedBlocks"))
+        blocks_mined = user_blocks_mined if user_blocks_mined is not None else clan_blocks_mined
+
+        gmt_per_block: Optional[float] = None
+        if gmt_fund is not None and blocks_mined is not None and blocks_mined > 0:
+            gmt_per_block = gmt_fund / float(blocks_mined)
+
+        return {
+            "snapshot_ts": snapshot_ts,
+            "league_id": requested_league_id,
+            "round_id": target_round_id,
+            "block_number": safe_int(round_data.get("blockNumber")),
+            "multiplier": safe_float(round_data.get("multiplier")),
+            "gmt_fund": gmt_fund,
+            "gmt_per_block": gmt_per_block,
+            "league_th": safe_float(clan_data.get("totalPower")),
+            "blocks_mined": blocks_mined,
+            "efficiency_league": safe_float(clan_data.get("weightedEnergyEfficiencyPerTh")),
+            "ended_at": ended_at,
+            "round_duration_sec": round_duration_sec,
+        }
+
+
+class GoMiningRoundAbilityApiClient:
+    def __init__(
+        self,
+        bearer_token: str,
+        limiter: TokenBucket,
+        user_leaderboard_url: str = ROUND_USER_LEADERBOARD_API_URL,
+        page_limit: int = ROUND_API_PAGE_LIMIT,
+        timeout_seconds: int = ROUND_API_TIMEOUT_SECONDS,
+        max_retries: int = ROUND_API_MAX_RETRIES,
+        token_fetcher: Optional[Callable[[], Optional[str]]] = None,
+    ) -> None:
+        self.bearer_token = bearer_token.strip()
+        self.token_fetcher = token_fetcher
+        self.limiter = limiter
+        self.user_leaderboard_url = user_leaderboard_url
+        self.page_limit = max(1, min(50, int(page_limit)))
+        self.timeout_seconds = max(1, int(timeout_seconds))
+        self.max_retries = max(1, int(max_retries))
+        self.session = requests.Session()
+        self.headers = {
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "x-device-type": "desktop",
+            "origin": "https://app.gomining.com",
+            "referer": "https://app.gomining.com/",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        }
+        if self.bearer_token:
+            self._set_bearer(self.bearer_token)
+        self.round_ability_users_cache: Dict[int, Dict[str, List[Dict[str, Any]]]] = {}
+        # Cache aggregate ability counts per round_id to avoid re-fetching across poll cycles.
+        self.round_counts_cache: Dict[int, Dict[str, int]] = {}
+        # Cache excluded user's per-round ability usage for audit output in sheet.
+        self.round_excluded_user_boosts_cache: Dict[int, Dict[str, int]] = {}
+
+    def _set_bearer(self, token: str) -> None:
+        self.bearer_token = token.strip()
+        self.headers["authorization"] = f"Bearer {self.bearer_token}"
+
+    def _refresh_bearer(self, force: bool = False) -> bool:
+        if not self.token_fetcher:
+            return bool(self.bearer_token)
+        if self.bearer_token and not force:
+            return True
+        tok = (self.token_fetcher() or "").strip()
+        if not tok:
+            return bool(self.bearer_token)
+        self._set_bearer(tok)
+        return True
+
+    def _post_json_with_retry(self, payload: Dict[str, Any], **ctx: Any) -> Optional[Dict[str, Any]]:
+        self._refresh_bearer(force=False)
+        delay_s = 0.6
+        for attempt in range(1, self.max_retries + 1):
+            self.limiter.wait_for_token(1.0)
+            try:
+                resp = self.session.post(
+                    self.user_leaderboard_url,
+                    headers=self.headers,
+                    json=payload,
+                    timeout=self.timeout_seconds,
+                )
+            except Exception as e:
+                if attempt >= self.max_retries:
+                    log_warn("gomining_api.round_user_request_failed", attempt=attempt, err=repr(e), **ctx)
+                    return None
+                sleep_s = delay_s + random.uniform(0.0, 0.2)
+                log_warn(
+                    "gomining_api.round_user_request_retry",
+                    attempt=attempt,
+                    sleep_s=round(sleep_s, 3),
+                    err=repr(e),
+                    **ctx,
+                )
+                time.sleep(sleep_s)
+                delay_s = min(8.0, delay_s * 2.0)
+                continue
+
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        return data
+                    log_warn("gomining_api.round_user_invalid_json_type", attempt=attempt, typ=type(data).__name__, **ctx)
+                    return None
+                except Exception as e:
+                    log_warn("gomining_api.round_user_invalid_json", attempt=attempt, err=repr(e), **ctx)
+                    return None
+
+            if resp.status_code == 401:
+                if attempt < self.max_retries and self._refresh_bearer(force=True):
+                    log_warn("gomining_api.round_user_unauthorized_retry", attempt=attempt, **ctx)
+                    continue
+                log_warn("gomining_api.round_user_unauthorized", attempt=attempt, **ctx)
+                return None
+            if resp.status_code == 403 and _is_jwt_expired_response(resp):
+                if attempt < self.max_retries and self._refresh_bearer(force=True):
+                    log_warn("gomining_api.round_user_forbidden_expired_retry", attempt=attempt, **ctx)
+                    continue
+                log_warn("gomining_api.round_user_forbidden_expired", attempt=attempt, **ctx)
+                return None
+
+            retryable = resp.status_code in {429, 500, 502, 503, 504}
+            if retryable and attempt < self.max_retries:
+                retry_after = None
+                try:
+                    ra = resp.headers.get("Retry-After")
+                    if ra:
+                        retry_after = float(ra)
+                except Exception:
+                    retry_after = None
+                sleep_s = max(delay_s, retry_after or 0.0) + random.uniform(0.0, 0.2)
+                log_warn(
+                    "gomining_api.round_user_http_retry",
+                    attempt=attempt,
+                    status=resp.status_code,
+                    sleep_s=round(sleep_s, 3),
+                    **ctx,
+                )
+                time.sleep(sleep_s)
+                delay_s = min(8.0, delay_s * 2.0)
+                continue
+
+            log_warn(
+                "gomining_api.round_user_http_error",
+                attempt=attempt,
+                status=resp.status_code,
+                body_preview=resp.text[:180],
+                **ctx,
+            )
+            return None
+        return None
+
+    def fetch_round_ability_counts(
+        self,
+        round_id: int,
+        expected_league_id: Optional[int] = None,
+        progress_hook: Optional[Callable[[], Any]] = None,
+    ) -> Optional[Dict[str, int]]:
+        rid = int(round_id)
+        # Return cached counts only when both caches are consistent.
+        # If round_ability_users_cache is missing (e.g. trimmed), we must re-fetch
+        # to repopulate per-user data needed for exact Power Up GMT calculation.
+        cached_counts = self.round_counts_cache.get(rid)
+        if (
+            cached_counts is not None
+            and rid in self.round_ability_users_cache
+            and rid in self.round_excluded_user_boosts_cache
+        ):
+            return dict(cached_counts)
+        skip = 0
+        fetched = 0
+        total_count: Optional[int] = None
+        page_no = 0
+        max_pages = 10000
+        counts: Dict[str, int] = {}
+        excluded_user_counts: Dict[str, int] = {}
+        tracked_users_by_ability: Dict[str, Dict[Tuple[int, Optional[int]], Dict[str, Any]]] = {
+            POWER_UP_ABILITY_ID: {},
+            CLAN_POWER_UP_ABILITY_ID: {},
+        }
+
+        while True:
+            if progress_hook is not None:
+                try:
+                    progress_hook()
+                except Exception as e:
+                    log_warn("gomining_api.round_user_progress_hook_failed", round_id=rid, skip=skip, err=repr(e))
+            payload = {"roundId": rid, "pagination": {"limit": self.page_limit, "skip": skip, "count": 0}}
+            body = self._post_json_with_retry(payload, round_id=rid, skip=skip)
+            if body is None:
+                return None
+
+            data = body.get("data")
+            if not isinstance(data, dict):
+                log_warn("gomining_api.round_user_bad_shape", round_id=rid, skip=skip)
+                return None
+
+            payload_round_id = safe_int(data.get("roundId"))
+            if payload_round_id != rid:
+                log_warn(
+                    "gomining_api.round_user_round_mismatch",
+                    requested_round_id=rid,
+                    payload_round_id=payload_round_id,
+                    skip=skip,
+                )
+                return None
+
+            payload_league_id = safe_int(data.get("leagueId"))
+            if expected_league_id is not None and payload_league_id is not None and payload_league_id != expected_league_id:
+                log_warn(
+                    "gomining_api.round_user_league_mismatch",
+                    requested_round_id=rid,
+                    expected_league_id=expected_league_id,
+                    payload_league_id=payload_league_id,
+                    skip=skip,
+                )
+                return None
+
+            participants = data.get("participants")
+            if not isinstance(participants, list):
+                log_warn("gomining_api.round_user_participants_bad_shape", round_id=rid, skip=skip)
+                return None
+
+            if total_count is None:
+                total_count = safe_int(data.get("count"))
+                if total_count is None or total_count < 0:
+                    log_warn("gomining_api.round_user_count_invalid", round_id=rid, count=data.get("count"), skip=skip)
+                    return None
+                if total_count == 0:
+                    return {}
+
+            for participant in participants:
+                if not isinstance(participant, dict):
+                    continue
+                participant_user_id = None
+                participant_avatar_url = ""
+                participant_alias = ""
+                user_raw = participant.get("user")
+                if isinstance(user_raw, dict):
+                    participant_user_id = safe_int(user_raw.get("id"))
+                    participant_avatar_url = str(user_raw.get("avatar") or "")
+                    participant_alias = str(user_raw.get("alias") or "")
+                if participant_user_id is None:
+                    participant_user_id = safe_int(participant.get("userId"))
+                participant_clan_id = None
+                clan_raw = participant.get("clan")
+                if isinstance(clan_raw, dict):
+                    participant_clan_id = safe_int(clan_raw.get("id"))
+                if participant_clan_id is None:
+                    participant_clan_id = safe_int(participant.get("clanId"))
+                used = participant.get("usedAbilities") or []
+                if not isinstance(used, list):
+                    continue
+                for item in used:
+                    if not isinstance(item, dict):
+                        continue
+                    ability_id = str(item.get("nftGameAbilityId") or "").strip()
+                    if not ability_id:
+                        continue
+                    cnt = safe_int(item.get("count")) or 0
+                    if cnt <= 0:
+                        continue
+                    if participant_user_id == EXCLUDED_BOOST_USER_ID:
+                        excluded_user_counts[ability_id] = excluded_user_counts.get(ability_id, 0) + cnt
+                        continue
+                    counts[ability_id] = counts.get(ability_id, 0) + cnt
+                    if ability_id in tracked_users_by_ability and participant_user_id is not None:
+                        ability_users = tracked_users_by_ability[ability_id]
+                        key = (participant_user_id, participant_clan_id)
+                        bucket = ability_users.get(key)
+                        if bucket is None:
+                            bucket = {"count": 0, "avatar_url": participant_avatar_url, "alias": participant_alias}
+                            ability_users[key] = bucket
+                        bucket["count"] = int(bucket.get("count") or 0) + cnt
+                        if (not str(bucket.get("avatar_url") or "").strip()) and participant_avatar_url:
+                            bucket["avatar_url"] = participant_avatar_url
+                        if (not str(bucket.get("alias") or "").strip()) and participant_alias:
+                            bucket["alias"] = participant_alias
+
+            fetched += len(participants)
+            if len(participants) < self.page_limit:
+                break
+            if total_count is not None and fetched >= total_count:
+                break
+
+            skip += self.page_limit
+            page_no += 1
+            if page_no >= max_pages:
+                log_warn("gomining_api.round_user_pagination_guard", round_id=rid, pages=page_no)
+                return None
+
+        if total_count is not None and fetched < total_count:
+            log_warn(
+                "gomining_api.round_user_incomplete",
+                round_id=rid,
+                fetched=fetched,
+                expected=total_count,
+                page_limit=self.page_limit,
+            )
+            return None
+        users_payload_by_ability: Dict[str, List[Dict[str, Any]]] = {}
+        for ability_id, users_by_key in tracked_users_by_ability.items():
+            users_payload: List[Dict[str, Any]] = []
+            for (user_id, clan_id), meta in users_by_key.items():
+                users_payload.append(
+                    {
+                        "user_id": user_id,
+                        "clan_id": clan_id,
+                        "count": safe_int(meta.get("count")) or 0,
+                        "avatar_url": str(meta.get("avatar_url") or ""),
+                        "alias": str(meta.get("alias") or ""),
+                    }
+                )
+            users_payload_by_ability[ability_id] = users_payload
+
+        self.round_ability_users_cache[rid] = users_payload_by_ability
+        if len(self.round_ability_users_cache) > 512:
+            # Keep cache bounded for long-running process.
+            for old_rid in sorted(self.round_ability_users_cache.keys())[:-256]:
+                self.round_ability_users_cache.pop(old_rid, None)
+
+        self.round_counts_cache[rid] = dict(counts)
+        if len(self.round_counts_cache) > 512:
+            for old_rid in sorted(self.round_counts_cache.keys())[:-256]:
+                self.round_counts_cache.pop(old_rid, None)
+        self.round_excluded_user_boosts_cache[rid] = dict(excluded_user_counts)
+        if len(self.round_excluded_user_boosts_cache) > 512:
+            for old_rid in sorted(self.round_excluded_user_boosts_cache.keys())[:-256]:
+                self.round_excluded_user_boosts_cache.pop(old_rid, None)
+        return counts
+
+    def get_cached_ability_users_for_round(self, round_id: int, ability_id: str) -> List[Dict[str, Any]]:
+        rid = int(round_id)
+        aid = str(ability_id or "").strip()
+        if not aid:
+            return []
+        cached = self.round_ability_users_cache.get(rid)
+        if not isinstance(cached, dict):
+            return []
+        users = cached.get(aid)
+        if not isinstance(users, list):
+            return []
+        return [u for u in users if isinstance(u, dict)]
+
+    def get_cached_power_up_users_for_round(self, round_id: int) -> List[Dict[str, Any]]:
+        return self.get_cached_ability_users_for_round(round_id, POWER_UP_ABILITY_ID)
+
+    def get_cached_excluded_user_boosts_for_round(self, round_id: int) -> Dict[str, int]:
+        rid = int(round_id)
+        cached = self.round_excluded_user_boosts_cache.get(rid)
+        if not isinstance(cached, dict):
+            return {}
+        out: Dict[str, int] = {}
+        for ability_id, cnt in cached.items():
+            aid = str(ability_id or "").strip()
+            c = safe_int(cnt) or 0
+            if not aid or c <= 0:
+                continue
+            out[aid] = c
+        return out
 
 
 def parse_row_range(updated_range: str) -> Optional[Tuple[int, int]]:
@@ -934,731 +2710,28 @@ class SingleInstanceLock:
             pass
 
 
+_DB_DEPRECATION_LOGGED = False
+
+
+def _warn_db_deprecated(context: str = "runtime") -> None:
+    global _DB_DEPRECATION_LOGGED
+    if _DB_DEPRECATION_LOGGED:
+        return
+    _DB_DEPRECATION_LOGGED = True
+    log_warn("sync.db_dependency_removed", context=context, note="PostgreSQL path is disabled; API-only mode is active.")
+
+
 class DBClient:
-    def __init__(self) -> None:
-        self.conn: Any = None
-        self.cols: set[str] = set()
-        self.primary_enabled = True
+    """
+    Deprecated compatibility shim.
+    Kept only so legacy scripts importing main.DBClient do not break.
+    """
 
     def connect(self) -> None:
-        if self.conn is not None:
-            return
-        kwargs = {
-            "host": os.getenv("PGHOST", "127.0.0.1"),
-            "port": int(os.getenv("PGPORT", "5432")),
-            "dbname": os.getenv("PGDATABASE", "GoMining"),
-            "user": os.getenv("PGUSER", "postgres"),
-            "password": os.getenv("PGPASSWORD", ""),
-            "sslmode": os.getenv("PGSSLMODE", "prefer"),
-        }
-        if psycopg is not None:
-            self.conn = psycopg.connect(**kwargs)
-            self.conn.autocommit = True
-        elif psycopg2 is not None:
-            self.conn = psycopg2.connect(**kwargs)
-            self.conn.autocommit = True
-        else:
-            raise RuntimeError("Install psycopg or psycopg2")
-        self.load_multiplier_schema()
+        _warn_db_deprecated("DBClient.connect")
 
     def close(self) -> None:
-        if self.conn is not None:
-            try:
-                self.conn.close()
-            finally:
-                self.conn = None
-
-    def query(self, sql: str, params: Sequence[Any] = ()) -> List[Dict[str, Any]]:
-        if self.conn is None:
-            self.connect()
-        cur = self.conn.cursor()
-        try:
-            cur.execute(sql, tuple(params))
-            if cur.description is None:
-                return []
-            cols = [d[0] for d in cur.description]
-            rows = cur.fetchall()
-            return [{cols[i]: row[i] for i in range(len(cols))} for row in rows]
-        finally:
-            cur.close()
-
-    def load_multiplier_schema(self) -> None:
-        try:
-            rows = self.query(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema='gomining' AND table_name='multiplier_snapshots'"
-            )
-            self.cols = {str(r["column_name"]).strip() for r in rows if r.get("column_name")}
-            self.primary_enabled = len(self.cols) > 0
-        except Exception as e:
-            log_warn("db.schema_introspection_failed", err=repr(e))
-            self.cols = set()
-            self.primary_enabled = False
-
-    def _has(self, name: str) -> bool:
-        return name in self.cols
-
-    @staticmethod
-    def _co(*exprs: Optional[str]) -> str:
-        arr = [x for x in exprs if x]
-        if not arr:
-            return "NULL"
-        if len(arr) == 1:
-            return arr[0]
-        return "COALESCE(" + ", ".join(arr) + ")"
-
-    def _payload_bigint(self, path: str) -> str:
-        if not self._has("source_payload"):
-            return "NULL"
-        return f"CASE WHEN (source_payload #>> '{path}') ~ '^-?[0-9]+$' THEN (source_payload #>> '{path}')::bigint END"
-
-    def _payload_int(self, path: str) -> str:
-        if not self._has("source_payload"):
-            return "NULL"
-        return f"CASE WHEN (source_payload #>> '{path}') ~ '^-?[0-9]+$' THEN (source_payload #>> '{path}')::integer END"
-
-    def _payload_num(self, path: str) -> str:
-        if not self._has("source_payload"):
-            return "NULL"
-        return f"CASE WHEN (source_payload #>> '{path}') ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (source_payload #>> '{path}')::numeric END"
-
-    def _payload_ts(self, path: str) -> str:
-        if not self._has("source_payload"):
-            return "NULL"
-        return f"NULLIF(source_payload #>> '{path}','')::timestamptz"
-
-    def _mult_exprs(self) -> Dict[str, str]:
-        c = self._has
-        return {
-            "league": self._co("league_id" if c("league_id") else None, self._payload_int("{data,leagueId}"), self._payload_int("{leagueId}")),
-            "round": self._co("round_id" if c("round_id") else None, self._payload_bigint("{data,roundId}"), self._payload_bigint("{roundId}")),
-            "block": self._co("block_number" if c("block_number") else None, self._payload_bigint("{data,blockNumber}"), self._payload_bigint("{blockNumber}")),
-            "mult": self._co("multiplier" if c("multiplier") else None, self._payload_num("{data,multiplier}"), self._payload_num("{multiplier}")),
-            "gmt_fund": self._co("gmt_fund" if c("gmt_fund") else None, "gmtFund" if c("gmtFund") else None, self._payload_num("{data,gmtFund}"), self._payload_num("{gmtFund}")),
-            "gmt_pb": self._co("gmt_per_block" if c("gmt_per_block") else None, "gmtPerBlock" if c("gmtPerBlock") else None, self._payload_num("{data,gmtPerBlock}"), self._payload_num("{gmtPerBlock}")),
-            "total_power": self._co(
-                "total_power" if c("total_power") else None,
-                self._payload_num("{data,totalPower}"),
-                self._payload_num("{totalPower}"),
-                self._payload_num("{data,total_power}"),
-                self._payload_num("{total_power}"),
-            ),
-            "blocks_mined": self._co("blocks_mined" if c("blocks_mined") else None, self._payload_int("{data,blocksMined}"), self._payload_int("{blocksMined}")),
-            "eff_league": self._co("efficiency_league" if c("efficiency_league") else None, "effciency_league" if c("effciency_league") else None, self._payload_num("{data,efficiencyLeague}"), self._payload_num("{efficiencyLeague}"), self._payload_num("{data,effciencyLeague}"), self._payload_num("{effciencyLeague}")),
-            "ended": self._co("ended_at" if c("ended_at") else None, "round_ended_at" if c("round_ended_at") else None, self._payload_ts("{data,endedAt}"), self._payload_ts("{endedAt}")),
-            "duration": self._co("round_duration_sec" if c("round_duration_sec") else None, "round_time" if c("round_time") else None, self._payload_int("{data,roundTime}"), self._payload_int("{roundTime}")),
-            "ts": self._co("snapshot_collected_at" if c("snapshot_collected_at") else None, "collected_at" if c("collected_at") else None, "created_at" if c("created_at") else None, "updated_at" if c("updated_at") else None, "now()"),
-            "active": "active" if c("active") else "NULL",
-        }
-
-    def _primary_rounds(self, league_id: int, since_round: int, limit: int, desc: bool = False) -> List[Dict[str, Any]]:
-        if not self.primary_enabled:
-            return []
-        e = self._mult_exprs()
-        pred = f"({e['ended']} IS NOT NULL)"
-        if e["active"] != "NULL":
-            pred = f"({e['ended']} IS NOT NULL OR {e['active']} = FALSE)"
-        direction = "DESC" if desc else "ASC"
-        sql = f"""
-        SELECT
-          {e['ts']} AS snapshot_ts,
-          {e['league']} AS league_id,
-          {e['round']} AS round_id,
-          {e['block']} AS block_number,
-          {e['mult']} AS multiplier,
-          {e['gmt_fund']} AS gmt_fund,
-          {e['gmt_pb']} AS gmt_per_block,
-          {e['total_power']} AS league_th,
-          {e['blocks_mined']} AS blocks_mined,
-          {e['eff_league']} AS efficiency_league,
-          {e['ended']} AS ended_at,
-          {e['duration']} AS round_duration_sec
-        FROM gomining.multiplier_snapshots
-        WHERE {e['league']} = %s
-          AND {e['round']} IS NOT NULL
-          AND {e['round']} > %s
-          AND {pred}
-        ORDER BY {e['round']} {direction}
-        LIMIT %s
-        """
-        return self.query(sql, (league_id, since_round, limit))
-
-    def _fallback_rounds(self, league_id: int, since_round: int, limit: int, desc: bool = False) -> List[Dict[str, Any]]:
-        direction = "DESC" if desc else "ASC"
-        sql = f"""
-        WITH src AS (
-          SELECT
-            COALESCE(collected_at, created_at, now()) AS snapshot_ts,
-            league_id,
-            COALESCE(
-              round_id,
-              CASE WHEN (source_payload #>> '{{data,roundId}}') ~ '^-?[0-9]+$' THEN (source_payload #>> '{{data,roundId}}')::bigint END,
-              CASE WHEN (source_payload #>> '{{roundId}}') ~ '^-?[0-9]+$' THEN (source_payload #>> '{{roundId}}')::bigint END
-            ) AS round_id,
-            COALESCE(
-              block_number,
-              CASE WHEN (source_payload #>> '{{data,blockNumber}}') ~ '^-?[0-9]+$' THEN (source_payload #>> '{{data,blockNumber}}')::bigint END,
-              CASE WHEN (source_payload #>> '{{blockNumber}}') ~ '^-?[0-9]+$' THEN (source_payload #>> '{{blockNumber}}')::bigint END
-            ) AS block_number,
-            COALESCE(
-              CASE WHEN (source_payload #>> '{{data,multiplier}}') ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (source_payload #>> '{{data,multiplier}}')::numeric END,
-              CASE WHEN (source_payload #>> '{{multiplier}}') ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (source_payload #>> '{{multiplier}}')::numeric END
-            ) AS multiplier,
-            NULL::numeric AS gmt_fund,
-            NULL::numeric AS gmt_per_block,
-            NULL::numeric AS league_th,
-            NULL::integer AS blocks_mined,
-            NULL::numeric AS efficiency_league,
-            COALESCE(
-              NULLIF(source_payload #>> '{{data,endedAt}}','')::timestamptz,
-              NULLIF(source_payload #>> '{{endedAt}}','')::timestamptz
-            ) AS ended_at,
-            COALESCE(
-              CASE WHEN (source_payload #>> '{{data,roundTime}}') ~ '^-?[0-9]+$' THEN (source_payload #>> '{{data,roundTime}}')::integer END,
-              CASE WHEN (source_payload #>> '{{roundTime}}') ~ '^-?[0-9]+$' THEN (source_payload #>> '{{roundTime}}')::integer END
-            ) AS round_duration_sec
-          FROM gomining.abilities_snapshots
-          WHERE league_id = %s
-        )
-        SELECT * FROM src
-        WHERE round_id IS NOT NULL AND round_id > %s AND ended_at IS NOT NULL
-        ORDER BY round_id {direction}
-        LIMIT %s
-        """
-        return self.query(sql, (league_id, since_round, limit))
-
-    def fetch_completed_rounds_from_db(self, league_id: int, since_round: int, limit: int = MAX_ROUNDS_PER_POLL) -> List[Dict[str, Any]]:
-        try:
-            rows = self._primary_rounds(league_id, since_round, limit, desc=False)
-            if rows:
-                return rows
-            if self.primary_enabled:
-                return []
-        except Exception as e:
-            log_warn("db.rounds_primary_failed", league_id=league_id, err=repr(e))
-            self.primary_enabled = False
-        try:
-            return self._fallback_rounds(league_id, since_round, limit, desc=False)
-        except Exception as e:
-            log_error("db.rounds_fallback_failed", league_id=league_id, err=repr(e))
-            return []
-
-    def fetch_latest_completed_round_id(self, league_id: int) -> Optional[int]:
-        try:
-            rows = self._primary_rounds(league_id, -1, 1, desc=True)
-            if rows:
-                return safe_int(rows[0].get("round_id"))
-        except Exception:
-            self.primary_enabled = False
-        try:
-            rows = self._fallback_rounds(league_id, -1, 1, desc=True)
-            if rows:
-                return safe_int(rows[0].get("round_id"))
-        except Exception:
-            pass
-        return None
-
-    def load_ability_catalog(self) -> List[Tuple[str, str, int]]:
-        sql = """
-        SELECT ability_id::text AS ability_id, ability_name::text AS ability_name,
-               COALESCE(sort_order, 9999) AS sort_order
-        FROM gomining.ability_dim
-        ORDER BY COALESCE(sort_order, 9999), ability_name
-        """
-        try:
-            rows = self.query(sql)
-            out: List[Tuple[str, str, int]] = []
-            for r in rows:
-                aid = str(r.get("ability_id") or "").strip()
-                aname = str(r.get("ability_name") or "").strip()
-                srt = safe_int(r.get("sort_order")) or 9999
-                if aid and aname:
-                    out.append((aid, aname, srt))
-            if out:
-                return out
-        except Exception as e:
-            log_warn("db.ability_dim_unavailable", err=repr(e))
-
-        rows = self.query(
-            "SELECT ability_id::text AS ability_id, "
-            "COALESCE(NULLIF(MAX(item_payload->>'abilityName'),''), ability_id::text) AS ability_name "
-            "FROM gomining.abilities_snapshot_items GROUP BY ability_id ORDER BY ability_name"
-        )
-        out = []
-        for r in rows:
-            aid = str(r.get("ability_id") or "").strip()
-            aname = str(r.get("ability_name") or "").strip()
-            if aid and aname:
-                out.append((aid, aname, 9999))
-        return out
-
-    def fetch_ability_counts_for_rounds(self, league_id: int, round_ids: Sequence[int]) -> Dict[int, Dict[str, int]]:
-        if not round_ids:
-            return {}
-        ids = sorted({int(x) for x in round_ids})
-        placeholders = ", ".join(["%s"] * len(ids))
-        sql = f"""
-        WITH latest AS (
-          SELECT
-            COALESCE(
-              s.round_id,
-              CASE WHEN (s.source_payload #>> '{{data,roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{data,roundId}}')::bigint END,
-              CASE WHEN (s.source_payload #>> '{{roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{roundId}}')::bigint END
-            ) AS round_id,
-            MAX(s.abilities_snapshot_id) AS abilities_snapshot_id
-          FROM gomining.abilities_snapshots s
-          WHERE s.league_id = %s
-            AND COALESCE(
-              s.round_id,
-              CASE WHEN (s.source_payload #>> '{{data,roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{data,roundId}}')::bigint END,
-              CASE WHEN (s.source_payload #>> '{{roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{roundId}}')::bigint END
-            ) IN ({placeholders})
-          GROUP BY 1
-        ),
-        agg AS (
-          SELECT l.round_id, i.ability_id::text AS ability_id, SUM(i.ability_count)::bigint AS cnt
-          FROM latest l JOIN gomining.abilities_snapshot_items i ON i.abilities_snapshot_id = l.abilities_snapshot_id
-          WHERE i.entity_type = 'aggregate'
-          GROUP BY l.round_id, i.ability_id
-        ),
-        part AS (
-          SELECT l.round_id, i.ability_id::text AS ability_id, SUM(i.ability_count)::bigint AS cnt
-          FROM latest l JOIN gomining.abilities_snapshot_items i ON i.abilities_snapshot_id = l.abilities_snapshot_id
-          WHERE i.entity_type = 'participant'
-          GROUP BY l.round_id, i.ability_id
-        )
-        SELECT COALESCE(a.round_id, p.round_id) AS round_id,
-               COALESCE(a.ability_id, p.ability_id) AS ability_id,
-               COALESCE(a.cnt, p.cnt, 0)::bigint AS cnt
-        FROM agg a FULL OUTER JOIN part p ON p.round_id = a.round_id AND p.ability_id = a.ability_id
-        """
-        rows = self.query(sql, [league_id] + ids)
-        out: Dict[int, Dict[str, int]] = {}
-        for r in rows:
-            rid = safe_int(r.get("round_id"))
-            aid = str(r.get("ability_id") or "").strip()
-            cnt = safe_int(r.get("cnt")) or 0
-            if rid is None or not aid:
-                continue
-            out.setdefault(rid, {})[aid] = int(cnt)
-        return out
-
-    def fetch_latest_abilities_round_id(self, league_id: int) -> Optional[int]:
-        sql = """
-        SELECT MAX(
-          COALESCE(
-            s.round_id,
-            CASE WHEN (s.source_payload #>> '{data,roundId}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{data,roundId}')::bigint END,
-            CASE WHEN (s.source_payload #>> '{roundId}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{roundId}')::bigint END
-          )
-        ) AS round_id
-        FROM gomining.abilities_snapshots s
-        WHERE s.league_id = %s
-        """
-        rows = self.query(sql, (league_id,))
-        if not rows:
-            return None
-        return safe_int(rows[0].get("round_id"))
-
-    def fetch_available_ability_round_ids(self, league_id: int, round_ids: Sequence[int]) -> set[int]:
-        if not round_ids:
-            return set()
-        ids = sorted({int(x) for x in round_ids})
-        placeholders = ", ".join(["%s"] * len(ids))
-        sql = f"""
-        SELECT DISTINCT
-          COALESCE(
-            s.round_id,
-            CASE WHEN (s.source_payload #>> '{{data,roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{data,roundId}}')::bigint END,
-            CASE WHEN (s.source_payload #>> '{{roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{roundId}}')::bigint END
-          ) AS round_id
-        FROM gomining.abilities_snapshots s
-        WHERE s.league_id = %s
-          AND COALESCE(
-            s.round_id,
-            CASE WHEN (s.source_payload #>> '{{data,roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{data,roundId}}')::bigint END,
-            CASE WHEN (s.source_payload #>> '{{roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{roundId}}')::bigint END
-          ) IN ({placeholders})
-        """
-        rows = self.query(sql, [league_id] + ids)
-        out: set[int] = set()
-        for r in rows:
-            rid = safe_int(r.get("round_id"))
-            if rid is not None:
-                out.add(rid)
-        return out
-
-    def fetch_power_up_gmt_sum_for_rounds(self, league_id: int, round_ids: Sequence[int]) -> Dict[int, float]:
-        """
-        Sum Power Up GMT cost per round from participant usage:
-          ability_count * (PPS_FACTOR * nft_power / mean_energy_efficiency) * POWER_UP_GMT_FACTOR
-        Power/eff are resolved by priority:
-          1) exact round-linked player snapshot membership
-          2) latest same-league membership at or before round
-          3) latest membership at or before round (any league)
-        """
-        if not round_ids:
-            return {}
-        ids = sorted({int(x) for x in round_ids})
-        placeholders = ", ".join(["%s"] * len(ids))
-        sql = f"""
-        WITH pu AS (
-          SELECT ability_id
-          FROM gomining.ability_dim
-          WHERE lower(ability_name) IN ('power up boost', 'power-up boost')
-          UNION
-          SELECT DISTINCT i.ability_id::text
-          FROM gomining.abilities_snapshot_items i
-          WHERE lower(COALESCE(i.item_payload->>'abilityName', '')) IN ('power up boost', 'power-up boost')
-        ),
-        latest AS (
-          SELECT
-            COALESCE(
-              s.round_id,
-              CASE WHEN (s.source_payload #>> '{{data,roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{data,roundId}}')::bigint END,
-              CASE WHEN (s.source_payload #>> '{{roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{roundId}}')::bigint END
-            ) AS round_id,
-            MAX(s.abilities_snapshot_id) AS abilities_snapshot_id
-          FROM gomining.abilities_snapshots s
-          WHERE s.league_id = %s
-            AND COALESCE(
-              s.round_id,
-              CASE WHEN (s.source_payload #>> '{{data,roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{data,roundId}}')::bigint END,
-              CASE WHEN (s.source_payload #>> '{{roundId}}') ~ '^-?[0-9]+$' THEN (s.source_payload #>> '{{roundId}}')::bigint END
-            ) IN ({placeholders})
-          GROUP BY 1
-        ),
-        uses AS (
-          SELECT
-            l.round_id,
-            i.entity_id::bigint AS user_id,
-            SUM(COALESCE(i.ability_count, 0))::numeric AS ability_count
-          FROM latest l
-          JOIN gomining.abilities_snapshot_items i ON i.abilities_snapshot_id = l.abilities_snapshot_id
-          WHERE i.entity_type = 'participant'
-            AND i.entity_id IS NOT NULL
-            AND COALESCE(i.ability_count, 0) > 0
-            AND (
-              i.ability_id IN (SELECT ability_id FROM pu)
-              OR lower(COALESCE(i.item_payload->>'abilityName', '')) IN ('power up boost', 'power-up boost')
-            )
-          GROUP BY l.round_id, i.entity_id
-        ),
-        linked AS (
-          SELECT l.round_id, l.player_snapshot_id
-          FROM gomining.round_player_snapshot_links l
-          WHERE l.league_id = %s
-            AND l.round_id IN ({placeholders})
-        ),
-        resolved AS (
-          SELECT
-            u.round_id,
-            u.user_id,
-            u.ability_count,
-            COALESCE(pm_exact.nft_power, pm_league.nft_power, pm_any.nft_power) AS nft_power,
-            COALESCE(pm_exact.mean_energy_efficiency, pm_league.mean_energy_efficiency, pm_any.mean_energy_efficiency) AS mean_eff
-          FROM uses u
-          LEFT JOIN linked lk ON lk.round_id = u.round_id
-          LEFT JOIN gomining.player_snapshot_memberships pm_exact
-            ON pm_exact.player_snapshot_id = lk.player_snapshot_id
-           AND pm_exact.user_id = u.user_id
-           AND pm_exact.nft_power IS NOT NULL
-           AND pm_exact.nft_power > 0
-           AND pm_exact.mean_energy_efficiency IS NOT NULL
-           AND pm_exact.mean_energy_efficiency > 0
-          LEFT JOIN LATERAL (
-            SELECT m.nft_power, m.mean_energy_efficiency
-            FROM gomining.player_snapshot_memberships m
-            WHERE m.user_id = u.user_id
-              AND m.league_id = %s
-              AND m.nft_power IS NOT NULL
-              AND m.nft_power > 0
-              AND m.mean_energy_efficiency IS NOT NULL
-              AND m.mean_energy_efficiency > 0
-              AND (m.round_id IS NULL OR m.round_id <= u.round_id)
-            ORDER BY m.round_id DESC NULLS LAST, m.created_at DESC
-            LIMIT 1
-          ) pm_league ON TRUE
-          LEFT JOIN LATERAL (
-            SELECT m.nft_power, m.mean_energy_efficiency
-            FROM gomining.player_snapshot_memberships m
-            WHERE m.user_id = u.user_id
-              AND m.nft_power IS NOT NULL
-              AND m.nft_power > 0
-              AND m.mean_energy_efficiency IS NOT NULL
-              AND m.mean_energy_efficiency > 0
-              AND (m.round_id IS NULL OR m.round_id <= u.round_id)
-            ORDER BY m.round_id DESC NULLS LAST, m.created_at DESC
-            LIMIT 1
-          ) pm_any ON TRUE
-        )
-        SELECT
-          round_id,
-          SUM(ability_count * ({PPS_FACTOR} * nft_power / mean_eff) * {POWER_UP_GMT_FACTOR})::numeric AS total_power_up_gmt
-        FROM resolved
-        WHERE nft_power IS NOT NULL AND mean_eff IS NOT NULL AND mean_eff > 0
-        GROUP BY round_id
-        """
-        params: List[Any] = [league_id] + ids + [league_id] + ids + [league_id]
-        rows = self.query(sql, params)
-        out: Dict[int, float] = {}
-        for r in rows:
-            rid = safe_int(r.get("round_id"))
-            val = safe_float(r.get("total_power_up_gmt"))
-            if rid is None or val is None:
-                continue
-            out[rid] = val
-        return out
-
-    def fetch_clan_shield_rows_for_rounds(
-        self,
-        league_id: int,
-        round_ids: Sequence[int],
-        min_member_coverage: float = CLAN_EXACT_MEMBER_COVERAGE_THRESHOLD,
-        min_power_coverage: float = CLAN_EXACT_POWER_COVERAGE_THRESHOLD,
-        min_snapshot_coverage: float = CLAN_SNAPSHOT_MIN_COVERAGE,
-        fallback_round_window: int = CLAN_SNAPSHOT_FALLBACK_ROUND_WINDOW,
-    ) -> Dict[int, List[Dict[str, Any]]]:
-        if not round_ids:
-            return {}
-        ids = sorted({int(x) for x in round_ids})
-        placeholders = ", ".join(["%s"] * len(ids))
-        round_window = max(0, int(fallback_round_window))
-        window_lo = min(ids) - round_window
-        window_hi = max(ids) + round_window
-        sql = f"""
-        WITH base_links AS (
-          SELECT
-            l.round_id,
-            l.player_snapshot_id,
-            l.player_snapshot_round_id,
-            l.snapshot_calculated_at
-          FROM gomining.round_player_snapshot_links l
-          WHERE l.league_id = %s
-            AND l.round_id IN ({placeholders})
-            AND l.player_snapshot_id IS NOT NULL
-        ),
-        candidate_links AS (
-          SELECT
-            l.round_id,
-            l.player_snapshot_id,
-            l.player_snapshot_round_id,
-            l.snapshot_calculated_at
-          FROM gomining.round_player_snapshot_links l
-          WHERE l.league_id = %s
-            AND l.round_id BETWEEN %s AND %s
-            AND l.player_snapshot_id IS NOT NULL
-        ),
-        candidate_snapshot_ids AS (
-          SELECT DISTINCT player_snapshot_id FROM candidate_links
-        ),
-        snapshot_quality AS (
-          SELECT
-            s.player_snapshot_id,
-            COALESCE(ct.members_total, 0)::numeric AS members_total,
-            COALESCE(pm.members_seen, 0)::numeric AS members_seen,
-            CASE
-              WHEN COALESCE(ct.members_total, 0) > 0
-                THEN COALESCE(pm.members_seen, 0)::numeric / ct.members_total
-              ELSE 0::numeric
-            END AS member_coverage
-          FROM candidate_snapshot_ids s
-          LEFT JOIN (
-            SELECT
-              t.player_snapshot_id,
-              SUM(COALESCE(t.member_count, 0))::numeric AS members_total
-            FROM gomining.player_snapshot_clan_totals t
-            WHERE t.player_snapshot_id IN (SELECT player_snapshot_id FROM candidate_snapshot_ids)
-            GROUP BY t.player_snapshot_id
-          ) ct ON ct.player_snapshot_id = s.player_snapshot_id
-          LEFT JOIN (
-            SELECT
-              m.player_snapshot_id,
-              COUNT(*)::numeric AS members_seen
-            FROM gomining.player_snapshot_memberships m
-            WHERE m.player_snapshot_id IN (SELECT player_snapshot_id FROM candidate_snapshot_ids)
-            GROUP BY m.player_snapshot_id
-          ) pm ON pm.player_snapshot_id = s.player_snapshot_id
-        ),
-        effective_links AS (
-          SELECT
-            b.round_id,
-            pick.player_snapshot_id,
-            pick.player_snapshot_round_id,
-            pick.snapshot_calculated_at
-          FROM base_links b
-          LEFT JOIN snapshot_quality bq
-            ON bq.player_snapshot_id = b.player_snapshot_id
-          JOIN LATERAL (
-            SELECT
-              c.player_snapshot_id,
-              c.player_snapshot_round_id,
-              c.snapshot_calculated_at
-            FROM candidate_links c
-            LEFT JOIN snapshot_quality q
-              ON q.player_snapshot_id = c.player_snapshot_id
-            ORDER BY
-              CASE
-                WHEN COALESCE(bq.member_coverage, 0) >= %s
-                  THEN CASE WHEN c.player_snapshot_id = b.player_snapshot_id THEN 0 ELSE 1 END
-                ELSE
-                  CASE WHEN COALESCE(q.member_coverage, 0) >= %s THEN 0 ELSE 1 END
-              END,
-              ABS(c.round_id - b.round_id),
-              CASE WHEN c.player_snapshot_id = b.player_snapshot_id THEN 0 ELSE 1 END,
-              c.snapshot_calculated_at DESC
-            LIMIT 1
-          ) pick ON TRUE
-        ),
-        round_meta AS (
-          SELECT
-            round_id,
-            MAX(player_snapshot_round_id) AS snapshot_round_id,
-            MAX(snapshot_calculated_at) AS snapshot_ts
-          FROM effective_links
-          GROUP BY round_id
-        ),
-        eff AS (
-          SELECT
-            m.round_id,
-            MAX(m.efficiency_league) AS efficiency_league
-          FROM gomining.multiplier_snapshots m
-          WHERE m.league_id = %s
-            AND m.round_id IN ({placeholders})
-          GROUP BY m.round_id
-        ),
-        ct AS (
-          SELECT
-            l.round_id,
-            t.clan_id,
-            SUM(COALESCE(t.member_count, 0))::numeric AS members_total,
-            SUM(COALESCE(t.total_nft_power, 0))::numeric AS team_th
-          FROM effective_links l
-          JOIN gomining.player_snapshot_clan_totals t
-            ON t.player_snapshot_id = l.player_snapshot_id
-          GROUP BY l.round_id, t.clan_id
-        ),
-        pm AS (
-          SELECT
-            l.round_id,
-            m.clan_id,
-            COUNT(*)::numeric AS members_seen,
-            SUM(COALESCE(m.nft_power, 0))::numeric AS power_seen,
-            SUM(
-              CASE
-                WHEN m.nft_power IS NOT NULL
-                     AND m.mean_energy_efficiency IS NOT NULL
-                     AND m.mean_energy_efficiency > 0
-                  THEN (m.nft_power / m.mean_energy_efficiency)
-                ELSE 0
-              END
-            )::numeric AS sum_th_over_w
-          FROM effective_links l
-          JOIN gomining.player_snapshot_memberships m
-            ON m.player_snapshot_id = l.player_snapshot_id
-          GROUP BY l.round_id, m.clan_id
-        ),
-        cn AS (
-          SELECT
-            c.round_id AS snapshot_round_id,
-            c.clan_id,
-            MAX(NULLIF(c.clan_name, '')) AS clan_name
-          FROM gomining.clan_snapshot_memberships c
-          WHERE c.league_id = %s
-            AND c.round_id IN (SELECT DISTINCT snapshot_round_id FROM round_meta)
-          GROUP BY c.round_id, c.clan_id
-        )
-        SELECT
-          ct.round_id,
-          rm.snapshot_round_id,
-          rm.snapshot_ts,
-          ct.clan_id,
-          COALESCE(cn.clan_name, 'clan-' || ct.clan_id::text) AS clan_name,
-          ct.members_total,
-          COALESCE(pm.members_seen, 0)::numeric AS members_seen,
-          CASE
-            WHEN ct.members_total > 0 THEN COALESCE(pm.members_seen, 0) / ct.members_total
-            ELSE NULL
-          END AS member_coverage,
-          ct.team_th,
-          COALESCE(pm.power_seen, 0)::numeric AS power_seen,
-          CASE
-            WHEN ct.team_th > 0 THEN COALESCE(pm.power_seen, 0) / ct.team_th
-            ELSE NULL
-          END AS power_coverage,
-          CASE
-            WHEN ct.members_total > 0
-                 AND (COALESCE(pm.members_seen, 0) / ct.members_total) >= %s
-                 AND ct.team_th > 0
-                 AND (COALESCE(pm.power_seen, 0) / ct.team_th) >= %s
-                 AND COALESCE(pm.sum_th_over_w, 0) > 0
-              THEN ({PPS_FACTOR} * pm.sum_th_over_w)
-            WHEN e.efficiency_league IS NOT NULL
-                 AND e.efficiency_league > 0
-                 AND ct.team_th > 0
-              THEN ({PPS_FACTOR} * ct.team_th / e.efficiency_league)
-            ELSE NULL
-          END AS team_pps,
-          CASE
-            WHEN ct.members_total > 0
-                 AND (COALESCE(pm.members_seen, 0) / ct.members_total) >= %s
-                 AND ct.team_th > 0
-                 AND (COALESCE(pm.power_seen, 0) / ct.team_th) >= %s
-                 AND COALESCE(pm.sum_th_over_w, 0) > 0
-              THEN 'player_exact'
-            WHEN e.efficiency_league IS NOT NULL
-                 AND e.efficiency_league > 0
-                 AND ct.team_th > 0
-              THEN 'league_fallback'
-            ELSE 'missing'
-          END AS calc_mode
-        FROM ct
-        JOIN round_meta rm ON rm.round_id = ct.round_id
-        LEFT JOIN pm ON pm.round_id = ct.round_id AND pm.clan_id = ct.clan_id
-        LEFT JOIN eff e ON e.round_id = ct.round_id
-        LEFT JOIN cn ON cn.snapshot_round_id = rm.snapshot_round_id AND cn.clan_id = ct.clan_id
-        ORDER BY ct.round_id ASC, team_pps DESC NULLS LAST, ct.clan_id ASC
-        """
-        params: List[Any] = (
-            [league_id]
-            + ids
-            + [league_id, window_lo, window_hi, min_snapshot_coverage, min_snapshot_coverage]
-            + [league_id]
-            + ids
-            + [league_id]
-        )
-        params.extend(
-            [
-                min_member_coverage,
-                min_power_coverage,
-                min_member_coverage,
-                min_power_coverage,
-            ]
-        )
-        rows = self.query(sql, params)
-        out: Dict[int, List[Dict[str, Any]]] = {}
-        for r in rows:
-            rid = safe_int(r.get("round_id"))
-            if rid is None:
-                continue
-            team_pps = safe_float(r.get("team_pps"))
-            out.setdefault(rid, []).append(
-                {
-                    "round_id": rid,
-                    "snapshot_round_id": safe_int(r.get("snapshot_round_id")),
-                    "snapshot_ts": r.get("snapshot_ts"),
-                    "clan_id": safe_int(r.get("clan_id")),
-                    "clan_name": str(r.get("clan_name") or ""),
-                    "members_total": safe_int(r.get("members_total")) or 0,
-                    "members_seen": safe_int(r.get("members_seen")) or 0,
-                    "member_coverage": safe_float(r.get("member_coverage")),
-                    "team_th": safe_float(r.get("team_th")),
-                    "team_pps": team_pps,
-                    "clan_shield_gmt": calc_clan_shield_gmt(team_pps),
-                    "calc_mode": str(r.get("calc_mode") or "missing"),
-                }
-            )
-        return out
+        return
 
 
 class StateStore:
@@ -1710,6 +2783,26 @@ class StateStore:
             CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_op_round ON pending_ops(sheet_id, op_type, round_id);
             CREATE INDEX IF NOT EXISTS ix_pending_due ON pending_ops(next_attempt_ts, id);
             CREATE INDEX IF NOT EXISTS ix_rowmap ON round_row_map(sheet_id, round_id DESC);
+
+            CREATE TABLE IF NOT EXISTS api_round_cache (
+              league_id INTEGER NOT NULL,
+              round_id INTEGER NOT NULL,
+              snapshot_ts TEXT,
+              block_number INTEGER,
+              multiplier REAL,
+              gmt_fund REAL,
+              gmt_per_block REAL,
+              league_th REAL,
+              blocks_mined INTEGER,
+              efficiency_league REAL,
+              ended_at TEXT,
+              round_duration_sec INTEGER,
+              source TEXT NOT NULL DEFAULT 'api_triplet',
+              updated_at REAL NOT NULL,
+              PRIMARY KEY (league_id, round_id)
+            );
+            CREATE INDEX IF NOT EXISTS ix_api_round_cache_lookup
+              ON api_round_cache(league_id, round_id DESC);
             """
         )
         self._ensure_sheet_state_columns()
@@ -1883,6 +2976,18 @@ class StateStore:
         self.conn.commit()
         return int(cur.rowcount or 0)
 
+    def purge_ops_by_type(self, op_types: Sequence[str]) -> int:
+        types = [str(x).strip() for x in op_types if str(x).strip()]
+        if not types:
+            return 0
+        placeholders = ",".join(["?"] * len(types))
+        cur = self.conn.execute(
+            f"DELETE FROM pending_ops WHERE op_type IN ({placeholders})",
+            tuple(types),
+        )
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
     def delete_op(self, op_id: int) -> None:
         self.conn.execute("DELETE FROM pending_ops WHERE id=?", (op_id,))
         self.conn.commit()
@@ -1905,6 +3010,184 @@ class StateStore:
     def queue_due_count(self) -> int:
         row = self.conn.execute("SELECT COUNT(*) AS c FROM pending_ops WHERE next_attempt_ts<=?", (time.time(),)).fetchone()
         return int(row["c"]) if row else 0
+
+    def upsert_api_round_record(self, rec: Dict[str, Any], source: str = "api_triplet") -> None:
+        league_id = safe_int(rec.get("league_id"))
+        round_id = safe_int(rec.get("round_id"))
+        if league_id is None or round_id is None:
+            return
+        self.conn.execute(
+            """
+            INSERT INTO api_round_cache(
+              league_id, round_id, snapshot_ts, block_number, multiplier, gmt_fund, gmt_per_block,
+              league_th, blocks_mined, efficiency_league, ended_at, round_duration_sec, source, updated_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(league_id, round_id) DO UPDATE SET
+              snapshot_ts=COALESCE(excluded.snapshot_ts, api_round_cache.snapshot_ts),
+              block_number=COALESCE(excluded.block_number, api_round_cache.block_number),
+              multiplier=COALESCE(excluded.multiplier, api_round_cache.multiplier),
+              gmt_fund=COALESCE(excluded.gmt_fund, api_round_cache.gmt_fund),
+              gmt_per_block=COALESCE(excluded.gmt_per_block, api_round_cache.gmt_per_block),
+              league_th=COALESCE(excluded.league_th, api_round_cache.league_th),
+              blocks_mined=COALESCE(excluded.blocks_mined, api_round_cache.blocks_mined),
+              efficiency_league=COALESCE(excluded.efficiency_league, api_round_cache.efficiency_league),
+              ended_at=COALESCE(excluded.ended_at, api_round_cache.ended_at),
+              round_duration_sec=COALESCE(excluded.round_duration_sec, api_round_cache.round_duration_sec),
+              source=excluded.source,
+              updated_at=excluded.updated_at
+            """,
+            (
+                league_id,
+                round_id,
+                to_iso_utc(rec.get("snapshot_ts")),
+                safe_int(rec.get("block_number")),
+                safe_float(rec.get("multiplier")),
+                safe_float(rec.get("gmt_fund")),
+                safe_float(rec.get("gmt_per_block")),
+                safe_float(rec.get("league_th")),
+                safe_int(rec.get("blocks_mined")),
+                safe_float(rec.get("efficiency_league")),
+                to_iso_utc(rec.get("ended_at")),
+                safe_int(rec.get("round_duration_sec")),
+                str(source or "api_triplet"),
+                time.time(),
+            ),
+        )
+        self.conn.commit()
+
+    def upsert_api_round_records(self, records: Sequence[Dict[str, Any]], source: str = "api_triplet") -> int:
+        cnt = 0
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            league_id = safe_int(rec.get("league_id"))
+            round_id = safe_int(rec.get("round_id"))
+            if league_id is None or round_id is None:
+                continue
+            self.conn.execute(
+                """
+                INSERT INTO api_round_cache(
+                  league_id, round_id, snapshot_ts, block_number, multiplier, gmt_fund, gmt_per_block,
+                  league_th, blocks_mined, efficiency_league, ended_at, round_duration_sec, source, updated_at
+                )
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(league_id, round_id) DO UPDATE SET
+                  snapshot_ts=COALESCE(excluded.snapshot_ts, api_round_cache.snapshot_ts),
+                  block_number=COALESCE(excluded.block_number, api_round_cache.block_number),
+                  multiplier=COALESCE(excluded.multiplier, api_round_cache.multiplier),
+                  gmt_fund=COALESCE(excluded.gmt_fund, api_round_cache.gmt_fund),
+                  gmt_per_block=COALESCE(excluded.gmt_per_block, api_round_cache.gmt_per_block),
+                  league_th=COALESCE(excluded.league_th, api_round_cache.league_th),
+                  blocks_mined=COALESCE(excluded.blocks_mined, api_round_cache.blocks_mined),
+                  efficiency_league=COALESCE(excluded.efficiency_league, api_round_cache.efficiency_league),
+                  ended_at=COALESCE(excluded.ended_at, api_round_cache.ended_at),
+                  round_duration_sec=COALESCE(excluded.round_duration_sec, api_round_cache.round_duration_sec),
+                  source=excluded.source,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    league_id,
+                    round_id,
+                    to_iso_utc(rec.get("snapshot_ts")),
+                    safe_int(rec.get("block_number")),
+                    safe_float(rec.get("multiplier")),
+                    safe_float(rec.get("gmt_fund")),
+                    safe_float(rec.get("gmt_per_block")),
+                    safe_float(rec.get("league_th")),
+                    safe_int(rec.get("blocks_mined")),
+                    safe_float(rec.get("efficiency_league")),
+                    to_iso_utc(rec.get("ended_at")),
+                    safe_int(rec.get("round_duration_sec")),
+                    str(source or "api_triplet"),
+                    time.time(),
+                ),
+            )
+            cnt += 1
+        self.conn.commit()
+        return cnt
+
+    def fetch_api_completed_rounds(self, league_id: int, since_round: int, limit: int = MAX_ROUNDS_PER_POLL) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT
+              snapshot_ts,
+              league_id,
+              round_id,
+              block_number,
+              multiplier,
+              gmt_fund,
+              gmt_per_block,
+              league_th,
+              blocks_mined,
+              efficiency_league,
+              ended_at,
+              round_duration_sec
+            FROM api_round_cache
+            WHERE league_id=?
+              AND round_id>?
+              AND ended_at IS NOT NULL
+            ORDER BY round_id ASC
+            LIMIT ?
+            """,
+            (league_id, since_round, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def fetch_latest_api_completed_round_id(self, league_id: int) -> Optional[int]:
+        row = self.conn.execute(
+            """
+            SELECT round_id
+            FROM api_round_cache
+            WHERE league_id=?
+              AND ended_at IS NOT NULL
+            ORDER BY round_id DESC
+            LIMIT 1
+            """,
+            (league_id,),
+        ).fetchone()
+        return safe_int(row["round_id"]) if row else None
+
+    def fetch_latest_api_round_record(self, league_id: int) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            """
+            SELECT
+              snapshot_ts,
+              league_id,
+              round_id,
+              block_number,
+              multiplier,
+              gmt_fund,
+              gmt_per_block,
+              league_th,
+              blocks_mined,
+              efficiency_league,
+              ended_at,
+              round_duration_sec,
+              source
+            FROM api_round_cache
+            WHERE league_id=?
+            ORDER BY round_id DESC
+            LIMIT 1
+            """,
+            (league_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def mark_api_round_ended(self, league_id: int, round_id: int, ended_at_iso: str) -> int:
+        ended_at = to_iso_utc(ended_at_iso) or utc_now_iso()
+        cur = self.conn.execute(
+            """
+            UPDATE api_round_cache
+            SET ended_at=?, updated_at=?
+            WHERE league_id=?
+              AND round_id=?
+              AND (ended_at IS NULL OR TRIM(ended_at)='')
+            """,
+            (ended_at, time.time(), league_id, round_id),
+        )
+        self.conn.commit()
+        return int(cur.rowcount or 0)
 
 
 @dataclass
@@ -1932,7 +3215,7 @@ def _normalize_sheet_marker(raw: Any) -> str:
     s = str(raw or "").strip().lower()
     if s == MAIN_SHEET_MARKER.lower():
         return MAIN_SHEET_MARKER
-    if s == CLAN_SHEET_MARKER.lower():
+    if s == CLAN_SHEET_MARKER.lower() or s == f"{CLAN_SHEET_MARKER.lower()}_shield":
         return CLAN_SHEET_MARKER
     return ""
 
@@ -2045,6 +3328,13 @@ def _expected_without_league_th(expected_header: Sequence[str]) -> List[str]:
     return out
 
 
+def _expected_with_legacy_clan_gmt(expected_header: Sequence[str]) -> List[str]:
+    out = list(expected_header)
+    if "calc_mode" in out and "clan_shield_gmt" not in out:
+        out.insert(out.index("calc_mode"), "clan_shield_gmt")
+    return out
+
+
 def _looks_like_iso_ts(value: Any) -> bool:
     s = str(value or "").strip()
     if not s:
@@ -2086,6 +3376,28 @@ def _detect_next_row(ws: Any, read_limiter: TokenBucket, round_col_index: int = 
     return max(LOG_START_ROW, last_data_row + 1)
 
 
+def _read_round_row_index(ws: Any, read_limiter: TokenBucket, round_col_index: int = 7) -> Dict[int, int]:
+    """
+    Build round_id -> row_idx index directly from the sheet roundId column.
+    Used to heal missing local row_map entries and detect actual holes.
+    """
+    out: Dict[int, int] = {}
+    try:
+        read_limiter.wait_for_token(1)
+        values = ws.col_values(round_col_index)
+    except Exception as e:
+        log_warn("sheet.read_round_index_failed", sheet=getattr(ws, "title", "?"), err=repr(e))
+        return out
+    for idx, val in enumerate(values, start=1):
+        if idx < LOG_START_ROW:
+            continue
+        rid = safe_int(val)
+        if rid is None:
+            continue
+        out[rid] = idx
+    return out
+
+
 def _normalize_payload_row(row: Any, expected_cols: int, round_id: int, round_col_idx: Optional[int] = 6) -> Optional[List[Any]]:
     if not isinstance(row, list):
         return None
@@ -2124,6 +3436,32 @@ def _insert_league_th_column(ctx: SheetContext, write_limiter: TokenBucket) -> b
         return False
 
 
+def _remove_clan_gmt_column(ctx: SheetContext, write_limiter: TokenBucket) -> bool:
+    try:
+        write_limiter.wait_for_token(1)
+        ctx.ws.spreadsheet.batch_update(
+            {
+                "requests": [
+                    {
+                        "deleteDimension": {
+                            "range": {
+                                "sheetId": ctx.ws.id,
+                                "dimension": "COLUMNS",
+                                "startIndex": CLAN_LEGACY_GMT_COL_INDEX,
+                                "endIndex": CLAN_LEGACY_GMT_COL_INDEX + 1,
+                            }
+                        }
+                    }
+                ]
+            }
+        )
+        log_info("sheet.legacy_clan_gmt_removed", sheet=ctx.title, col_index=CLAN_LEGACY_GMT_COL_INDEX)
+        return True
+    except Exception as e:
+        log_warn("sheet.legacy_clan_gmt_remove_failed", sheet=ctx.title, err=repr(e))
+        return False
+
+
 def sync_layout_if_needed(
     ctx: SheetContext,
     expected_header: List[str],
@@ -2141,6 +3479,7 @@ def sync_layout_if_needed(
 
     needs_history_shift = False
     shift_reason = None
+    needs_clan_gmt_column_drop = False
     checked_history = enable_history_shift and (ctx.ws_id in MIGRATION_CHECKED_SHEETS)
     if enable_history_shift and LEAGUE_TH_HEADER in expected_header:
         old_expected = _expected_without_league_th(expected_header)
@@ -2150,8 +3489,12 @@ def sync_layout_if_needed(
         elif header_ok and (not checked_history) and _history_shift_detected(ctx.ws, read_limiter):
             needs_history_shift = True
             shift_reason = "shifted_history_detected"
+    if marker == CLAN_SHEET_MARKER and not header_ok and existing_header:
+        legacy_expected = _expected_with_legacy_clan_gmt(expected_header)
+        if _header_matches_existing(existing_header, legacy_expected):
+            needs_clan_gmt_column_drop = True
 
-    if cached_ok and header_ok and not needs_history_shift:
+    if cached_ok and header_ok and not needs_history_shift and not needs_clan_gmt_column_drop:
         return
     if DRY_RUN:
         reason_parts: List[str] = []
@@ -2161,6 +3504,8 @@ def sync_layout_if_needed(
             reason_parts.append("header_mismatch")
         if needs_history_shift:
             reason_parts.append("history_shift")
+        if needs_clan_gmt_column_drop:
+            reason_parts.append("legacy_clan_gmt_column")
         reason = "+".join(reason_parts) if reason_parts else "no_change"
         log_info("sheet.layout_dry_skip", sheet=ctx.title, reason=reason)
         state.upsert_sheet_meta(ctx.ws_id, ctx.title, ctx.league_id, layout_sig=layout_sig)
@@ -2173,6 +3518,9 @@ def sync_layout_if_needed(
             return
     elif enable_history_shift and not checked_history:
         MIGRATION_CHECKED_SHEETS.add(ctx.ws_id)
+    if needs_clan_gmt_column_drop:
+        if not _remove_clan_gmt_column(ctx, write_limiter):
+            return
     write_limiter.wait_for_token(1)
     updates = [
         {"range": "A1", "values": [[marker]]},
@@ -2205,6 +3553,7 @@ def refresh_sheet_contexts(
     clan_expected_header: List[str],
     write_limiter: TokenBucket,
     read_limiter: TokenBucket,
+    enable_clan_sync: bool = ENABLE_CLAN_SYNC,
 ) -> Tuple[Dict[int, SheetContext], Dict[int, SheetContext]]:
     read_limiter.wait_for_token(1)
     worksheets = sh.worksheets()
@@ -2219,6 +3568,7 @@ def refresh_sheet_contexts(
             worksheets=len(worksheets),
             main_header_cols=len(main_expected_header),
             clan_header_cols=len(clan_expected_header),
+            clan_sync_enabled=enable_clan_sync,
         )
 
     for ws in worksheets:
@@ -2239,7 +3589,7 @@ def refresh_sheet_contexts(
                 expected_cols=len(main_expected_header),
                 round_col_idx=6,
             )
-        elif marker == CLAN_SHEET_MARKER:
+        elif marker == CLAN_SHEET_MARKER and enable_clan_sync:
             clan_contexts[ws.id] = SheetContext(
                 ws_id=ws.id,
                 title=ws.title,
@@ -2249,54 +3599,57 @@ def refresh_sheet_contexts(
                 expected_cols=len(clan_expected_header),
                 round_col_idx=2,
             )
+        elif marker == CLAN_SHEET_MARKER and DEBUG_VERBOSE:
+            log_debug("sheet.refresh_skip_clan_disabled", sheet=ws.title, ws_id=ws.id)
         elif DEBUG_VERBOSE:
             log_debug("sheet.refresh_skip_unknown_marker", sheet=ws.title, ws_id=ws.id, marker=marker)
 
-    clan_by_league = {ctx.league_id: ctx for ctx in clan_contexts.values()}
-    for main_ctx in list(main_contexts.values()):
-        if main_ctx.league_id in clan_by_league:
-            continue
-        clan_title = _clan_tab_title(main_ctx.title)
-        if DRY_RUN:
-            log_info(
-                "sheet.clan_tab_create_dry_skip",
-                league_id=main_ctx.league_id,
-                source_sheet=main_ctx.title,
-                target_title=clan_title,
-            )
-            continue
-        try:
-            write_limiter.wait_for_token(1)
-            ws_new = sh.add_worksheet(
-                title=clan_title,
-                rows=max(1000, LOG_START_ROW + 50),
-                cols=max(26, len(clan_expected_header) + 2),
-            )
-            ctx = SheetContext(
-                ws_id=ws_new.id,
-                title=ws_new.title,
-                ws=ws_new,
-                league_id=main_ctx.league_id,
-                kind="clan",
-                expected_cols=len(clan_expected_header),
-                round_col_idx=2,
-            )
-            clan_contexts[ws_new.id] = ctx
-            clan_by_league[ctx.league_id] = ctx
-            log_info(
-                "sheet.clan_tab_created",
-                league_id=ctx.league_id,
-                sheet=ctx.title,
-                source_sheet=main_ctx.title,
-            )
-        except Exception as e:
-            log_warn(
-                "sheet.clan_tab_create_failed",
-                league_id=main_ctx.league_id,
-                source_sheet=main_ctx.title,
-                target_title=clan_title,
-                err=repr(e),
-            )
+    if enable_clan_sync:
+        clan_by_league = {ctx.league_id: ctx for ctx in clan_contexts.values()}
+        for main_ctx in list(main_contexts.values()):
+            if main_ctx.league_id in clan_by_league:
+                continue
+            clan_title = _clan_tab_title(main_ctx.title)
+            if DRY_RUN:
+                log_info(
+                    "sheet.clan_tab_create_dry_skip",
+                    league_id=main_ctx.league_id,
+                    source_sheet=main_ctx.title,
+                    target_title=clan_title,
+                )
+                continue
+            try:
+                write_limiter.wait_for_token(1)
+                ws_new = sh.add_worksheet(
+                    title=clan_title,
+                    rows=max(1000, LOG_START_ROW + 50),
+                    cols=max(26, len(clan_expected_header) + 2),
+                )
+                ctx = SheetContext(
+                    ws_id=ws_new.id,
+                    title=ws_new.title,
+                    ws=ws_new,
+                    league_id=main_ctx.league_id,
+                    kind="clan",
+                    expected_cols=len(clan_expected_header),
+                    round_col_idx=2,
+                )
+                clan_contexts[ws_new.id] = ctx
+                clan_by_league[ctx.league_id] = ctx
+                log_info(
+                    "sheet.clan_tab_created",
+                    league_id=ctx.league_id,
+                    sheet=ctx.title,
+                    source_sheet=main_ctx.title,
+                )
+            except Exception as e:
+                log_warn(
+                    "sheet.clan_tab_create_failed",
+                    league_id=main_ctx.league_id,
+                    source_sheet=main_ctx.title,
+                    target_title=clan_title,
+                    err=repr(e),
+                )
 
     for ctx in main_contexts.values():
         state.upsert_sheet_meta(ctx.ws_id, ctx.title, ctx.league_id, layout_sig=None)
@@ -2343,6 +3696,41 @@ def _reschedule(state: StateStore, op_id: int, retry_count: int, retry_after: Op
     if DEBUG_VERBOSE:
         log_debug("queue.reschedule_calc", op_id=op_id, retry_count=retry_count, retry_after=retry_after, delay_s=round(delay, 3))
     state.reschedule_op(op_id, retry_count, time.time() + delay)
+
+
+def _maybe_flush_during_enqueue(
+    flush_tick: Optional[Callable[[], int]],
+    last_flush_monotonic: float,
+    flush_every_seconds: float,
+    *,
+    scope: str,
+    sheet: str,
+    round_id: Optional[int],
+) -> float:
+    if flush_tick is None:
+        return last_flush_monotonic
+    now_mono = time.monotonic()
+    if flush_every_seconds > 0 and (now_mono - last_flush_monotonic) < flush_every_seconds:
+        return last_flush_monotonic
+    try:
+        processed = int(flush_tick() or 0)
+        if processed > 0:
+            log_info(
+                "queue.flushed_during_enqueue",
+                scope=scope,
+                sheet=sheet,
+                round_id=round_id,
+                processed=processed,
+            )
+    except Exception as e:
+        log_warn(
+            "queue.flush_during_enqueue_failed",
+            scope=scope,
+            sheet=sheet,
+            round_id=round_id,
+            err=repr(e),
+        )
+    return now_mono
 
 
 def _handle_missing_sheet_op(state: StateStore, op: Dict[str, Any], retry_after: float = 30.0) -> None:
@@ -2724,12 +4112,94 @@ def flush_sheet_queue_with_rate_limit(state: StateStore, contexts: Dict[int, She
     return processed
 
 
+def sync_api_round_cache(
+    state: StateStore,
+    round_metrics_api: GoMiningRoundMetricsApiClient,
+    league_ids: Sequence[int],
+) -> Tuple[int, int]:
+    wanted = sorted({int(x) for x in league_ids if safe_int(x) is not None})
+    if not wanted:
+        return 0, 0
+
+    records: List[Dict[str, Any]] = []
+    failed = 0
+    for league_id in wanted:
+        rec = round_metrics_api.fetch_round_metrics_triplet(
+            league_id,
+            strict_league_validation=ROUND_GET_LAST_STRICT_LEAGUE_VALIDATION,
+        )
+        if not isinstance(rec, dict):
+            failed += 1
+            log_warn("sync.api_round_cache_league_skip", league_id=league_id, reason="round_metrics_unavailable")
+            continue
+
+        round_id = safe_int(rec.get("round_id"))
+        if round_id is None:
+            failed += 1
+            log_warn("sync.api_round_cache_league_skip", league_id=league_id, reason="missing_round_id")
+            continue
+
+        if ROUND_CLOSE_ON_ROLLOVER:
+            prev = state.fetch_latest_api_round_record(league_id)
+            if isinstance(prev, dict):
+                prev_round_id = safe_int(prev.get("round_id"))
+                prev_ended_at = to_iso_utc(prev.get("ended_at"))
+                if prev_round_id is not None and round_id > prev_round_id and not prev_ended_at:
+                    ended_at_synth = to_iso_utc(rec.get("snapshot_ts")) or utc_now_iso()
+                    marked = state.mark_api_round_ended(league_id, prev_round_id, ended_at_synth)
+                    if marked > 0:
+                        log_info(
+                            "sync.api_round_rollover_closed",
+                            league_id=league_id,
+                            prev_round_id=prev_round_id,
+                            next_round_id=round_id,
+                            ended_at=ended_at_synth,
+                        )
+
+        records.append(rec)
+
+    if not records:
+        log_warn("sync.api_round_cache_fetch_failed", leagues=len(wanted), failed=failed)
+        return 0, 0
+
+    written = state.upsert_api_round_records(records, source="api_triplet")
+    return written, len(records)
+
+
+def fetch_completed_rounds_prefer_api(
+    db: Optional[DBClient],
+    state: StateStore,
+    league_id: int,
+    since_round: int,
+    limit: int = MAX_ROUNDS_PER_POLL,
+) -> List[Dict[str, Any]]:
+    if db is not None:
+        _warn_db_deprecated("fetch_completed_rounds_prefer_api")
+    return state.fetch_api_completed_rounds(league_id, since_round, limit)
+
+
+def fetch_latest_completed_round_id_prefer_api(
+    db: Optional[DBClient],
+    state: StateStore,
+    league_id: int,
+) -> Optional[int]:
+    if db is not None:
+        _warn_db_deprecated("fetch_latest_completed_round_id_prefer_api")
+    api_latest = state.fetch_latest_api_completed_round_id(league_id)
+    return api_latest
+
+
 def build_canonical_row(
     rec: Dict[str, Any],
     ability_headers: List[str],
     counts_by_name: Dict[str, int],
     price_cutover_round: Optional[int],
     power_up_gmt_value: Optional[float] = None,
+    power_up_gmt_sentinel_value: Optional[float] = None,
+    clan_power_up_gmt_value: Optional[float] = None,
+    clan_power_up_gmt_sentinel_value: Optional[float] = None,
+    power_up_missing_aliases: Optional[Sequence[str]] = None,
+    excluded_user_boosts_audit: str = "",
 ) -> List[Any]:
     ts_iso = to_iso_utc(rec.get("snapshot_ts")) or ""
     ended_iso = to_iso_utc(rec.get("ended_at")) or ""
@@ -2763,11 +4233,38 @@ def build_canonical_row(
     for name in ability_headers:
         row.append(int(counts_by_name.get(name, 0)))
 
+    power_up_count = int(counts_by_name.get("Power Up Boost", 0) or 0)
+    clan_power_up_count = int(counts_by_name.get("Clan Power Up Boost", 0) or 0)
     power_up_gmt: Any = ""
+    power_up_gmt_sentinel: Any = ""
+    clan_power_up_gmt: Any = ""
+    clan_power_up_gmt_sentinel: Any = ""
     if round_id_num is not None and (price_cutover_round is None or round_id_num > price_cutover_round):
-        # After cutover we persist explicit zero when no Power Up usage was observed.
-        power_up_gmt = 0.0 if power_up_gmt_value is None else power_up_gmt_value
+        # After cutover we persist explicit zero only when no Power Up usage was observed.
+        # If usage exists but exact user-based price could not be resolved, keep cell empty (not misleading zero).
+        if power_up_count <= 0:
+            power_up_gmt = 0.0 if power_up_gmt_value is None else power_up_gmt_value
+            power_up_gmt_sentinel = 0.0 if power_up_gmt_sentinel_value is None else power_up_gmt_sentinel_value
+        else:
+            power_up_gmt = "" if power_up_gmt_value is None else power_up_gmt_value
+            power_up_gmt_sentinel = "" if power_up_gmt_sentinel_value is None else power_up_gmt_sentinel_value
+        if clan_power_up_count <= 0:
+            clan_power_up_gmt = 0.0 if clan_power_up_gmt_value is None else clan_power_up_gmt_value
+            clan_power_up_gmt_sentinel = (
+                0.0 if clan_power_up_gmt_sentinel_value is None else clan_power_up_gmt_sentinel_value
+            )
+        else:
+            clan_power_up_gmt = "" if clan_power_up_gmt_value is None else clan_power_up_gmt_value
+            clan_power_up_gmt_sentinel = (
+                "" if clan_power_up_gmt_sentinel_value is None else clan_power_up_gmt_sentinel_value
+            )
     row.append(power_up_gmt)
+    row.append(power_up_gmt_sentinel)
+    row.append(clan_power_up_gmt)
+    row.append(clan_power_up_gmt_sentinel)
+    aliases = [str(x).strip() for x in (power_up_missing_aliases or []) if str(x).strip()]
+    row.append(", ".join(aliases))
+    row.append(str(excluded_user_boosts_audit or "").strip())
     return row
 
 
@@ -2785,7 +4282,6 @@ def build_clan_round_rows(rec: Dict[str, Any], clan_rows: Sequence[Dict[str, Any
         member_cov = safe_float(clan.get("member_coverage"))
         team_th = safe_float(clan.get("team_th"))
         team_pps = safe_float(clan.get("team_pps"))
-        clan_shield_gmt = safe_float(clan.get("clan_shield_gmt"))
         out.append(
             [
                 snap_ts,
@@ -2799,7 +4295,6 @@ def build_clan_round_rows(rec: Dict[str, Any], clan_rows: Sequence[Dict[str, Any
                 "" if member_cov is None else member_cov,
                 "" if team_th is None else team_th,
                 "" if team_pps is None else team_pps,
-                "" if clan_shield_gmt is None else clan_shield_gmt,
                 str(clan.get("calc_mode") or "missing"),
             ]
         )
@@ -2807,19 +4302,42 @@ def build_clan_round_rows(rec: Dict[str, Any], clan_rows: Sequence[Dict[str, Any
 
 
 def enqueue_main_sheet_ops(
-    db: DBClient,
+    db: Optional[DBClient],
     state: StateStore,
     contexts: Dict[int, SheetContext],
     ability_id_to_name: Dict[str, str],
     ability_headers: List[str],
+    round_ability_api: GoMiningRoundAbilityApiClient,
+    read_limiter: Optional[TokenBucket] = None,
+    power_up_clan_api: Optional[GoMiningClanApiClient] = None,
+    flush_tick: Optional[Callable[[], int]] = None,
+    flush_every_seconds: float = ENQUEUE_FLUSH_EVERY_SECONDS,
 ) -> int:
     enqueued = 0
+    ability_header_order = {name: idx for idx, name in enumerate(ability_headers)}
     for ws_id, ctx in contexts.items():
+        last_flush_monotonic = time.monotonic() - max(0.0, flush_every_seconds)
+
+        def _progress_tick(round_id: Optional[int]) -> None:
+            nonlocal last_flush_monotonic
+            last_flush_monotonic = _maybe_flush_during_enqueue(
+                flush_tick,
+                last_flush_monotonic,
+                flush_every_seconds,
+                scope="main",
+                sheet=ctx.title,
+                round_id=round_id,
+            )
+
         state.upsert_sheet_meta(ws_id, ctx.title, ctx.league_id, layout_sig=None)
         last_synced = state.get_last_synced_round(ws_id)
 
         if last_synced is None:
-            cutover = db.fetch_latest_completed_round_id(ctx.league_id)
+            cutover = fetch_latest_completed_round_id_prefer_api(
+                db,
+                state,
+                ctx.league_id,
+            )
             if cutover is None:
                 cutover = 0
             state.set_last_synced_round(ws_id, cutover)
@@ -2833,13 +4351,14 @@ def enqueue_main_sheet_ops(
             price_cutover = last_synced
             log_info("sync.price_cutover_initialized", sheet=ctx.title, league_id=ctx.league_id, cutover_round=price_cutover)
 
-        ability_latest_round = db.fetch_latest_abilities_round_id(ctx.league_id)
         since_round = max(0, last_synced - STABILIZATION_ROUNDS)
-        if ability_latest_round is not None:
-            # Ability snapshots can lag behind multiplier snapshots significantly.
-            # Pull from the lower watermark so previously written zero-rows can be corrected later.
-            since_round = min(since_round, max(0, ability_latest_round - STABILIZATION_ROUNDS))
-        rounds = db.fetch_completed_rounds_from_db(ctx.league_id, since_round, MAX_ROUNDS_PER_POLL)
+        rounds = fetch_completed_rounds_prefer_api(
+            db,
+            state,
+            ctx.league_id,
+            since_round,
+            MAX_ROUNDS_PER_POLL,
+        )
         if DEBUG_VERBOSE:
             log_debug(
                 "sync.sheet_poll",
@@ -2848,7 +4367,6 @@ def enqueue_main_sheet_ops(
                 league_id=ctx.league_id,
                 last_synced=last_synced,
                 since_round=since_round,
-                ability_latest_round=ability_latest_round,
                 fetched_rounds=len(rounds),
             )
         if not rounds:
@@ -2862,66 +4380,373 @@ def enqueue_main_sheet_ops(
 
         max_round = max(round_ids)
         row_maps = state.get_round_row_map_bulk(ws_id, round_ids)
-        available_ability_rounds = db.fetch_available_ability_round_ids(ctx.league_id, round_ids)
-        counts_by_round = db.fetch_ability_counts_for_rounds(ctx.league_id, round_ids)
-        power_up_gmt_by_round = db.fetch_power_up_gmt_sum_for_rounds(ctx.league_id, round_ids)
+        sheet_round_index: Dict[int, int] = {}
+        if ctx.ws is not None and read_limiter is not None:
+            sheet_round_index = _read_round_row_index(
+                ctx.ws,
+                read_limiter,
+                round_col_index=(ctx.round_col_idx or 6) + 1,
+            )
+        counts_by_round: Dict[int, Optional[Dict[str, int]]] = {}
 
         for rec in rounds_sorted:
             rid = safe_int(rec.get("round_id"))
             if rid is None:
                 continue
-            is_new_round = rid > last_synced
-
-            # For new rows, require ability snapshot availability; otherwise wait and keep strict order.
-            if is_new_round:
-                if ability_latest_round is None or rid > ability_latest_round or rid not in available_ability_rounds:
+            _progress_tick(rid)
+            latest_last_synced = state.get_last_synced_round(ws_id)
+            if latest_last_synced is not None and latest_last_synced > last_synced:
+                last_synced = latest_last_synced
+            mapped = row_maps.get(rid)
+            if mapped is None:
+                fresh_map = state.get_round_row_map_bulk(ws_id, [rid]).get(rid)
+                if fresh_map is not None:
+                    mapped = fresh_map
+                    row_maps[rid] = fresh_map
+            if mapped is None:
+                existing_row_idx = sheet_round_index.get(rid)
+                if existing_row_idx is not None:
+                    # Reconstruct missing local mapping for rows already present in sheet.
+                    state.upsert_row_map(ws_id, rid, existing_row_idx, "", 0)
+                    mapped = {"row_idx": existing_row_idx, "checksum": "", "finalized": 0}
+                    row_maps[rid] = mapped
+                    if DEBUG_VERBOSE:
+                        log_debug(
+                            "sync.round_row_map_recovered_from_sheet",
+                            sheet=ctx.title,
+                            round_id=rid,
+                            row_idx=existing_row_idx,
+                        )
+                elif rid <= last_synced:
+                    # Real hole: round is <= last_synced but missing in both row_map and sheet.
+                    # Keep processing so it can be appended/backfilled.
                     log_warn(
-                        "sync.round_wait_abilities",
+                        "sync.round_hole_detected",
                         sheet=ctx.title,
-                        league_id=ctx.league_id,
                         round_id=rid,
                         last_synced=last_synced,
-                        ability_latest_round=ability_latest_round,
                     )
-                    break
-            elif rid not in available_ability_rounds:
-                # Existing rows can only be recalculated once matching ability snapshot exists.
-                continue
 
-            counts_by_id = counts_by_round.get(rid, {})
+            counts_source = "cache"
+            if rid not in counts_by_round:
+                # API is the only source for ability counts to guarantee user-specific exclusions.
+                api_counts = round_ability_api.fetch_round_ability_counts(
+                    rid,
+                    expected_league_id=ctx.league_id,
+                    progress_hook=lambda rid=rid: _progress_tick(rid),
+                )
+                counts_by_round[rid] = api_counts
+                counts_source = "api"
+            counts_by_id = counts_by_round.get(rid)
+            if DEBUG_VERBOSE and counts_by_id is not None:
+                log_debug(
+                    "sync.round_ability_source",
+                    sheet=ctx.title,
+                    league_id=ctx.league_id,
+                    round_id=rid,
+                    source=counts_source,
+                    abilities=len(counts_by_id),
+                )
+            if counts_by_id is None:
+                lag_to_latest = max_round - rid
+                # Strict gating: never write synthetic zero ability counts.
+                # If the API is unavailable for this round, stop this sheet and retry next poll.
+                log_warn(
+                    "sync.round_wait_abilities_api",
+                    sheet=ctx.title,
+                    league_id=ctx.league_id,
+                    round_id=rid,
+                    last_synced=last_synced,
+                    max_round=max_round,
+                    lag_to_latest=lag_to_latest,
+                )
+                break
+
             counts_by_name: Dict[str, int] = {}
+            unknown_ability_ids: List[str] = []
             for aid, cnt in counts_by_id.items():
                 aname = ability_id_to_name.get(aid)
                 if not aname:
+                    unknown_ability_ids.append(aid)
                     continue
                 counts_by_name[aname] = counts_by_name.get(aname, 0) + int(cnt)
+
+            if unknown_ability_ids:
+                unknown_unique = sorted(set(unknown_ability_ids))
+                log_warn(
+                    "sync.round_unknown_ability_ids",
+                    sheet=ctx.title,
+                    league_id=ctx.league_id,
+                    round_id=rid,
+                    unknown_count=len(unknown_unique),
+                    unknown_ids=unknown_unique[:10],
+                )
+
+            excluded_user_boosts_audit = ""
+            get_cached_excluded_boosts = getattr(
+                round_ability_api,
+                "get_cached_excluded_user_boosts_for_round",
+                None,
+            )
+            if callable(get_cached_excluded_boosts):
+                try:
+                    excluded_counts_by_id = get_cached_excluded_boosts(rid)
+                except Exception as e:
+                    excluded_counts_by_id = {}
+                    log_warn(
+                        "sync.round_excluded_user_audit_cache_read_failed",
+                        sheet=ctx.title,
+                        league_id=ctx.league_id,
+                        round_id=rid,
+                        user_id=EXCLUDED_BOOST_USER_ID,
+                        err=repr(e),
+                    )
+                if isinstance(excluded_counts_by_id, dict) and excluded_counts_by_id:
+                    known_counts: Dict[str, int] = {}
+                    unknown_counts: Dict[str, int] = {}
+                    for ability_id_raw, cnt_raw in excluded_counts_by_id.items():
+                        aid = str(ability_id_raw or "").strip()
+                        cnt = safe_int(cnt_raw) or 0
+                        if not aid or cnt <= 0:
+                            continue
+                        mapped = ability_id_to_name.get(aid)
+                        if mapped:
+                            known_counts[mapped] = known_counts.get(mapped, 0) + cnt
+                        else:
+                            unknown_counts[aid] = unknown_counts.get(aid, 0) + cnt
+                    parts: List[str] = []
+                    for name, cnt in sorted(
+                        known_counts.items(),
+                        key=lambda x: (ability_header_order.get(x[0], 9999), x[0]),
+                    ):
+                        parts.append(f"{name}={cnt}")
+                    for aid, cnt in sorted(unknown_counts.items(), key=lambda x: x[0]):
+                        parts.append(f"ability_id={aid}:{cnt}")
+                    excluded_user_boosts_audit = "; ".join(parts)
+
+            power_up_gmt_value: Optional[float] = None
+            power_up_gmt_sentinel_value: Optional[float] = None
+            clan_power_up_gmt_value: Optional[float] = None
+            clan_power_up_gmt_sentinel_value: Optional[float] = None
+            power_up_missing_aliases: List[str] = []
+
+            get_cached_users = getattr(round_ability_api, "get_cached_ability_users_for_round", None)
+            refetched_users_for_round = False
+
+            if callable(get_cached_users):
+                power_up_count = int(counts_by_name.get("Power Up Boost", 0) or 0)
+                power_up_users: List[Dict[str, Any]] = []
+                if power_up_count <= 0:
+                    power_up_gmt_value = 0.0
+                    power_up_gmt_sentinel_value = 0.0
+                    power_up_missing_aliases = []
+                else:
+                    try:
+                        cached_users = get_cached_users(rid, POWER_UP_ABILITY_ID)
+                        if isinstance(cached_users, list):
+                            power_up_users = [u for u in cached_users if isinstance(u, dict)]
+                    except Exception as e:
+                        log_warn(
+                            "sync.round_power_up_cache_read_failed",
+                            sheet=ctx.title,
+                            league_id=ctx.league_id,
+                            round_id=rid,
+                            err=repr(e),
+                        )
+                    if not power_up_users and not refetched_users_for_round:
+                        # Pull API user-leaderboard once to populate exact per-user boost users for pricing.
+                        _ = round_ability_api.fetch_round_ability_counts(
+                            rid,
+                            expected_league_id=ctx.league_id,
+                            progress_hook=lambda rid=rid: _progress_tick(rid),
+                        )
+                        refetched_users_for_round = True
+                    if not power_up_users:
+                        try:
+                            cached_users = get_cached_users(rid, POWER_UP_ABILITY_ID)
+                            if isinstance(cached_users, list):
+                                power_up_users = [u for u in cached_users if isinstance(u, dict)]
+                        except Exception as e:
+                            log_warn(
+                                "sync.round_power_up_cache_read_failed_after_refetch",
+                                sheet=ctx.title,
+                                league_id=ctx.league_id,
+                                round_id=rid,
+                                err=repr(e),
+                            )
+                    if power_up_users:
+                        power_up_resolution_stats: Dict[str, int] = {}
+                        exact_power_up_gmt, exact_power_up_gmt_sentinel, exact_missing = calc_power_up_gmt_triplet_from_power_up_users_api(
+                            power_up_users,
+                            power_up_clan_api,
+                            resolution_stats=power_up_resolution_stats,
+                        )
+                        resolved_api = int(power_up_resolution_stats.get("resolved_api", 0))
+                        missing_count = int(power_up_resolution_stats.get("missing", 0))
+                        if resolved_api <= 0:
+                            power_up_resolution_source = "unresolved"
+                        else:
+                            power_up_resolution_source = "api_only"
+                        log_debug(
+                            "sync.round_power_up_resolution",
+                            sheet=ctx.title,
+                            league_id=ctx.league_id,
+                            round_id=rid,
+                            power_up_resolution_source=power_up_resolution_source,
+                            resolved_api=resolved_api,
+                            missing=missing_count,
+                            users=len(power_up_users),
+                            boost_count=power_up_count,
+                        )
+                        power_up_missing_aliases = [str(x).strip() for x in (exact_missing or []) if str(x).strip()]
+                        if exact_power_up_gmt is not None and exact_power_up_gmt_sentinel is not None:
+                            power_up_gmt_value = exact_power_up_gmt
+                            power_up_gmt_sentinel_value = exact_power_up_gmt_sentinel
+                        else:
+                            power_up_gmt_value = None
+                            power_up_gmt_sentinel_value = None
+                            log_warn(
+                                "sync.round_power_up_exact_unavailable",
+                                sheet=ctx.title,
+                                league_id=ctx.league_id,
+                                round_id=rid,
+                                users=len(power_up_users),
+                                missing=len(power_up_missing_aliases),
+                                missing_aliases=power_up_missing_aliases[:20],
+                                boost_count=power_up_count,
+                            )
+                    else:
+                        power_up_gmt_value = None
+                        power_up_gmt_sentinel_value = None
+                        power_up_missing_aliases = []
+                        log_warn(
+                            "sync.round_power_up_users_missing",
+                            sheet=ctx.title,
+                            league_id=ctx.league_id,
+                            round_id=rid,
+                            boost_count=power_up_count,
+                            counts_source=counts_source,
+                        )
+
+                clan_power_up_count = int(counts_by_name.get("Clan Power Up Boost", 0) or 0)
+                clan_power_up_users: List[Dict[str, Any]] = []
+                if clan_power_up_count <= 0:
+                    clan_power_up_gmt_value = 0.0
+                    clan_power_up_gmt_sentinel_value = 0.0
+                else:
+                    try:
+                        cached_users = get_cached_users(rid, CLAN_POWER_UP_ABILITY_ID)
+                        if isinstance(cached_users, list):
+                            clan_power_up_users = [u for u in cached_users if isinstance(u, dict)]
+                    except Exception as e:
+                        log_warn(
+                            "sync.round_clan_power_up_cache_read_failed",
+                            sheet=ctx.title,
+                            league_id=ctx.league_id,
+                            round_id=rid,
+                            err=repr(e),
+                        )
+                    if not clan_power_up_users and not refetched_users_for_round:
+                        _ = round_ability_api.fetch_round_ability_counts(
+                            rid,
+                            expected_league_id=ctx.league_id,
+                            progress_hook=lambda rid=rid: _progress_tick(rid),
+                        )
+                        refetched_users_for_round = True
+                    if not clan_power_up_users:
+                        try:
+                            cached_users = get_cached_users(rid, CLAN_POWER_UP_ABILITY_ID)
+                            if isinstance(cached_users, list):
+                                clan_power_up_users = [u for u in cached_users if isinstance(u, dict)]
+                        except Exception as e:
+                            log_warn(
+                                "sync.round_clan_power_up_cache_read_failed_after_refetch",
+                                sheet=ctx.title,
+                                league_id=ctx.league_id,
+                                round_id=rid,
+                                err=repr(e),
+                            )
+                    if clan_power_up_users:
+                        exact_clan_power_up_gmt, exact_clan_power_up_gmt_sentinel = calc_clan_power_up_gmt_pair_from_boost_users_api(
+                            clan_power_up_users,
+                            power_up_clan_api,
+                        )
+                        if exact_clan_power_up_gmt is not None and exact_clan_power_up_gmt_sentinel is not None:
+                            clan_power_up_gmt_value = exact_clan_power_up_gmt
+                            clan_power_up_gmt_sentinel_value = exact_clan_power_up_gmt_sentinel
+                        else:
+                            clan_power_up_gmt_value = None
+                            clan_power_up_gmt_sentinel_value = None
+                            log_warn(
+                            "sync.round_clan_power_up_exact_unavailable",
+                            sheet=ctx.title,
+                            league_id=ctx.league_id,
+                            round_id=rid,
+                            users=len(clan_power_up_users),
+                            boost_count=clan_power_up_count,
+                            fallback="api_only_no_external_db",
+                        )
+                    else:
+                        clan_power_up_gmt_value = None
+                        clan_power_up_gmt_sentinel_value = None
+                        log_warn(
+                            "sync.round_clan_power_up_users_missing",
+                            sheet=ctx.title,
+                            league_id=ctx.league_id,
+                            round_id=rid,
+                            boost_count=clan_power_up_count,
+                            counts_source=counts_source,
+                            fallback="api_only_no_external_db",
+                        )
+            else:
+                # Backward compatibility for stubs/tests that do not expose per-user cache.
+                power_up_count = int(counts_by_name.get("Power Up Boost", 0) or 0)
+                if power_up_count <= 0:
+                    power_up_gmt_value = 0.0
+                    power_up_gmt_sentinel_value = 0.0
+                    power_up_missing_aliases = []
+                else:
+                    approx = calc_boost_gmt_from_api_round(rec, counts_by_name, "Power Up Boost")
+                    power_up_gmt_value = approx
+                    power_up_gmt_sentinel_value = approx
+                    power_up_missing_aliases = []
+                clan_power_up_count = int(counts_by_name.get("Clan Power Up Boost", 0) or 0)
+                if clan_power_up_count <= 0:
+                    clan_power_up_gmt_value = 0.0
+                    clan_power_up_gmt_sentinel_value = 0.0
+                else:
+                    # Clan Power Up must be clan-based via clan/get-by-id users.
+                    # Without round API user cache we cannot resolve exact clan membership/counts here.
+                    clan_power_up_gmt_value = None
+                    clan_power_up_gmt_sentinel_value = None
 
             row = build_canonical_row(
                 rec,
                 ability_headers,
                 counts_by_name,
                 price_cutover_round=price_cutover,
-                power_up_gmt_value=safe_float(power_up_gmt_by_round.get(rid)),
+                power_up_gmt_value=power_up_gmt_value,
+                power_up_gmt_sentinel_value=power_up_gmt_sentinel_value,
+                clan_power_up_gmt_value=clan_power_up_gmt_value,
+                clan_power_up_gmt_sentinel_value=clan_power_up_gmt_sentinel_value,
+                power_up_missing_aliases=power_up_missing_aliases,
+                excluded_user_boosts_audit=excluded_user_boosts_audit,
             )
             checksum = row_checksum(row)
             finalized = 1 if rid <= (max_round - STABILIZATION_ROUNDS) else 0
-            mapped = row_maps.get(rid)
 
             if mapped is None:
-                if rid > last_synced:
-                    state.enqueue_op(ws_id, "append_round", rid, checksum, {"row": row, "finalized": finalized})
-                    enqueued += 1
-                    if DEBUG_VERBOSE:
-                        log_debug(
-                            "sync.round_enqueued_append",
-                            sheet=ctx.title,
-                            round_id=rid,
-                            finalized=finalized,
-                            checksum=checksum[:12],
-                            row_preview=row[:12],
-                        )
-                elif DEBUG_VERBOSE:
-                    log_debug("sync.round_skip_no_map_old_round", sheet=ctx.title, round_id=rid, last_synced=last_synced)
+                state.enqueue_op(ws_id, "append_round", rid, checksum, {"row": row, "finalized": finalized})
+                enqueued += 1
+                if DEBUG_VERBOSE:
+                    log_debug(
+                        "sync.round_enqueued_append",
+                        sheet=ctx.title,
+                        round_id=rid,
+                        finalized=finalized,
+                        checksum=checksum[:12],
+                        row_preview=row[:12],
+                    )
                 continue
 
             needs_update = (str(mapped.get("checksum")) != checksum) or (int(mapped.get("finalized") or 0) != finalized)
@@ -2957,25 +4782,50 @@ def enqueue_main_sheet_ops(
 
 
 def enqueue_clan_sheet_ops(
-    db: DBClient,
+    db: Optional[DBClient],
     state: StateStore,
     clan_contexts: Dict[int, SheetContext],
     clan_api: GoMiningClanApiClient,
+    flush_tick: Optional[Callable[[], int]] = None,
+    flush_every_seconds: float = ENQUEUE_FLUSH_EVERY_SECONDS,
 ) -> int:
     enqueued = 0
     for ws_id, ctx in clan_contexts.items():
+        last_flush_monotonic = time.monotonic() - max(0.0, flush_every_seconds)
+
+        def _progress_tick(round_id: Optional[int]) -> None:
+            nonlocal last_flush_monotonic
+            last_flush_monotonic = _maybe_flush_during_enqueue(
+                flush_tick,
+                last_flush_monotonic,
+                flush_every_seconds,
+                scope="clan",
+                sheet=ctx.title,
+                round_id=round_id,
+            )
+
         state.upsert_sheet_meta(ws_id, ctx.title, ctx.league_id, layout_sig=None)
         last_synced = state.get_last_synced_round(ws_id)
 
         if last_synced is None:
-            cutover = db.fetch_latest_completed_round_id(ctx.league_id)
+            cutover = fetch_latest_completed_round_id_prefer_api(
+                db,
+                state,
+                ctx.league_id,
+            )
             if cutover is None:
                 cutover = 0
             state.set_last_synced_round(ws_id, cutover)
             log_info("sync.clan_init_cutover", sheet=ctx.title, league_id=ctx.league_id, cutover_round=cutover)
             continue
 
-        rounds = db.fetch_completed_rounds_from_db(ctx.league_id, max(0, last_synced), MAX_ROUNDS_PER_POLL)
+        rounds = fetch_completed_rounds_prefer_api(
+            db,
+            state,
+            ctx.league_id,
+            max(0, last_synced),
+            MAX_ROUNDS_PER_POLL,
+        )
         if DEBUG_VERBOSE:
             log_debug(
                 "sync.clan_sheet_poll",
@@ -3000,7 +4850,18 @@ def enqueue_clan_sheet_ops(
             rid = safe_int(rec.get("round_id"))
             if rid is None or rid <= last_synced:
                 continue
+            _progress_tick(rid)
+            latest_last_synced = state.get_last_synced_round(ws_id)
+            if latest_last_synced is not None and latest_last_synced > last_synced:
+                last_synced = latest_last_synced
+            if rid <= last_synced:
+                continue
             mapped = row_maps.get(rid)
+            if mapped is None:
+                fresh_map = state.get_round_row_map_bulk(ws_id, [rid]).get(rid)
+                if fresh_map is not None:
+                    mapped = fresh_map
+                    row_maps[rid] = fresh_map
             if mapped is not None:
                 if DEBUG_VERBOSE:
                     log_debug("sync.clan_round_skip_existing", sheet=ctx.title, round_id=rid, row_idx=mapped.get("row_idx"))
@@ -3065,28 +4926,29 @@ def main() -> None:
     lock = SingleInstanceLock(LOCK_FILE_PATH)
     lock.acquire()
     state: Optional[StateStore] = None
-    db: Optional[DBClient] = None
     try:
-        db = DBClient()
-        db.connect()
-
-        catalog = db.load_ability_catalog()
-        if not catalog:
-            raise RuntimeError("No abilities found in ability_dim or abilities_snapshot_items")
-
-        ability_id_to_name = build_ability_id_to_header(catalog)
+        ability_id_to_name = build_ability_id_to_header(ABILITY_DIM_STATIC)
         ability_headers = list(ABILITY_HEADER_ORDER)
         if not ability_id_to_name:
-            raise RuntimeError("No matching boost abilities found in catalog for configured fixed header set.")
+            raise RuntimeError("No matching boost abilities found in static ability mapping for configured fixed header set.")
         log_info("sync.ability_mapping_loaded", mapped_ids=len(ability_id_to_name), columns=len(ability_headers))
 
-        main_expected_header = BASE_HEADERS + ability_headers + [POWER_UP_PRICE_HEADER]
+        main_expected_header = BASE_HEADERS + ability_headers + [
+            POWER_UP_PRICE_HEADER,
+            POWER_UP_PRICE_SENTINEL_HEADER,
+            CLAN_POWER_UP_PRICE_HEADER,
+            CLAN_POWER_UP_PRICE_SENTINEL_HEADER,
+            MISSING_HEADER,
+            EXCLUDED_USER_BOOST_AUDIT_HEADER,
+        ]
         clan_expected_header = list(CLAN_HEADERS)
 
         state = StateStore(STATE_DB_PATH)
         write_limiter = TokenBucket(GS_WRITE_REQ_PER_MIN, name="sheets_write")
         read_limiter = TokenBucket(GS_READ_REQ_PER_MIN, name="sheets_read")
         gomining_limiter = TokenBucket(GOMINING_API_REQ_PER_MIN, name="gomining_api")
+        if ENABLE_DB_FALLBACK_RAW:
+            _warn_db_deprecated("ENABLE_DB_FALLBACK env")
         token_fetcher: Optional[Callable[[], Optional[str]]] = None
         effective_bearer = GOMINING_BEARER_TOKEN.strip()
         if TOKEN_URL and TOKEN_X_AUTH:
@@ -3100,7 +4962,7 @@ def main() -> None:
                 log_warn("token_api.startup_failed_using_fallback", token_url=TOKEN_URL)
         if not effective_bearer:
             raise RuntimeError("GOMINING_BEARER_TOKEN is required when TOKEN_URL/TOKEN_X_AUTH is not configured.")
-        clan_api = GoMiningClanApiClient(
+        power_up_clan_api: Optional[GoMiningClanApiClient] = GoMiningClanApiClient(
             effective_bearer,
             limiter=gomining_limiter,
             leaderboard_url=CLAN_LEADERBOARD_API_URL,
@@ -3108,6 +4970,31 @@ def main() -> None:
             page_limit=CLAN_API_PAGE_LIMIT,
             timeout_seconds=CLAN_API_TIMEOUT_SECONDS,
             max_retries=CLAN_API_MAX_RETRIES,
+            token_fetcher=token_fetcher,
+        )
+        clan_api: Optional[GoMiningClanApiClient] = power_up_clan_api if ENABLE_CLAN_SYNC else None
+        round_metrics_api = GoMiningRoundMetricsApiClient(
+            effective_bearer,
+            limiter=gomining_limiter,
+            base_url=GOMINING_API_BASE_URL,
+            multiplier_path=MULTIPLIER_PATH,
+            round_clan_leaderboard_path=ROUND_CLAN_LEADERBOARD_PATH,
+            player_leaderboard_path=PLAYER_LEADERBOARD_PATH,
+            clan_leaderboard_path=ROUND_METRICS_CLAN_PATH,
+            user_page_limit=ROUND_METRICS_USER_PAGE_LIMIT,
+            clan_page_limit=ROUND_METRICS_CLAN_PAGE_LIMIT,
+            round_scan_lookback=ROUND_GET_LAST_SCAN_LOOKBACK,
+            timeout_seconds=ROUND_METRICS_TIMEOUT_SECONDS,
+            max_retries=ROUND_METRICS_MAX_RETRIES,
+            token_fetcher=token_fetcher,
+        )
+        round_ability_api = GoMiningRoundAbilityApiClient(
+            effective_bearer,
+            limiter=gomining_limiter,
+            user_leaderboard_url=ROUND_USER_LEADERBOARD_API_URL,
+            page_limit=ROUND_API_PAGE_LIMIT,
+            timeout_seconds=ROUND_API_TIMEOUT_SECONDS,
+            max_retries=ROUND_API_MAX_RETRIES,
             token_fetcher=token_fetcher,
         )
 
@@ -3119,10 +5006,19 @@ def main() -> None:
             clan_expected_header,
             write_limiter,
             read_limiter,
+            enable_clan_sync=ENABLE_CLAN_SYNC,
         )
         contexts_all = {**main_contexts, **clan_contexts}
         purge_stale_queue_ops(state, contexts_all)
-        api_leagues = fetch_league_catalog_from_api(clan_api.bearer_token)
+        if not ENABLE_CLAN_SYNC:
+            purged_clan_ops = state.purge_ops_by_type(["append_clan_round"])
+            if purged_clan_ops > 0:
+                log_info("queue.purged_clan_ops", deleted_ops=purged_clan_ops)
+        configured_league_ids = sorted({ctx.league_id for ctx in main_contexts.values()} | {ctx.league_id for ctx in clan_contexts.values()})
+        cached_written, cached_total = sync_api_round_cache(state, round_metrics_api, configured_league_ids)
+        if cached_total > 0:
+            log_info("sync.api_round_cache_seeded", leagues=len(configured_league_ids), seen=cached_total, written=cached_written)
+        api_leagues = fetch_league_catalog_from_api(round_metrics_api.bearer_token)
 
         log_info(
             "sync.spreadsheet_opened",
@@ -3141,12 +5037,34 @@ def main() -> None:
             drop_non_retryable=DROP_NON_RETRYABLE_SHEET_ERRORS,
             purge_missing_sheet_ops=PURGE_QUEUE_FOR_MISSING_SHEETS,
             gomining_api_req_per_min=GOMINING_API_REQ_PER_MIN,
+            clan_sync_enabled=ENABLE_CLAN_SYNC,
             clan_api_page_limit=CLAN_API_PAGE_LIMIT,
             clan_api_timeout_s=CLAN_API_TIMEOUT_SECONDS,
             clan_api_max_retries=CLAN_API_MAX_RETRIES,
+            gomining_api_base_url=GOMINING_API_BASE_URL,
+            round_multiplier_path=MULTIPLIER_PATH,
+            round_clan_leaderboard_path=ROUND_CLAN_LEADERBOARD_PATH,
+            round_player_leaderboard_path=PLAYER_LEADERBOARD_PATH,
+            round_metrics_clan_path=ROUND_METRICS_CLAN_PATH,
+            round_metrics_timeout_s=ROUND_METRICS_TIMEOUT_SECONDS,
+            round_metrics_max_retries=ROUND_METRICS_MAX_RETRIES,
+            round_metrics_user_page_limit=ROUND_METRICS_USER_PAGE_LIMIT,
+            round_metrics_clan_page_limit=ROUND_METRICS_CLAN_PAGE_LIMIT,
+            round_get_last_scan_lookback=ROUND_GET_LAST_SCAN_LOOKBACK,
+            round_close_on_rollover=ROUND_CLOSE_ON_ROLLOVER,
+            round_get_last_strict_league_validation=ROUND_GET_LAST_STRICT_LEAGUE_VALIDATION,
+            round_user_leaderboard_url=ROUND_USER_LEADERBOARD_API_URL,
+            round_api_page_limit=ROUND_API_PAGE_LIMIT,
+            round_api_timeout_s=ROUND_API_TIMEOUT_SECONDS,
+            round_api_max_retries=ROUND_API_MAX_RETRIES,
+            leagues_api_poll_s=LEAGUES_API_POLL_SECONDS,
+            league_index_lookback_days=LEAGUE_INDEX_LOOKBACK_DAYS,
+            league_index_try_without_calculated_at=LEAGUE_INDEX_TRY_WITHOUT_CALCULATED_AT,
             token_url_set=bool(TOKEN_URL),
             token_method=(TOKEN_METHOD if TOKEN_METHOD in {"GET", "POST"} else "GET"),
             token_verify_ssl=TOKEN_VERIFY_SSL,
+            api_only_mode=True,
+            enqueue_flush_every_s=ENQUEUE_FLUSH_EVERY_SECONDS,
             dry_run=DRY_RUN,
             log_level=LOG_LEVEL,
             debug_verbose=DEBUG_VERBOSE,
@@ -3185,14 +5103,30 @@ def main() -> None:
                     clan_expected_header,
                     write_limiter,
                     read_limiter,
+                    enable_clan_sync=ENABLE_CLAN_SYNC,
                 )
                 contexts_all = {**main_contexts, **clan_contexts}
                 purge_stale_queue_ops(state, contexts_all)
+                if not ENABLE_CLAN_SYNC:
+                    purged_clan_ops = state.purge_ops_by_type(["append_clan_round"])
+                    if purged_clan_ops > 0:
+                        log_info("queue.purged_clan_ops", deleted_ops=purged_clan_ops)
+                configured_league_ids = sorted(
+                    {ctx.league_id for ctx in main_contexts.values()} | {ctx.league_id for ctx in clan_contexts.values()}
+                )
                 last_refresh = now
                 log_info("sync.sheet_refresh_done", active_main=len(main_contexts), active_clan=len(clan_contexts))
 
             if now - last_league_api_poll >= LEAGUES_API_POLL_SECONDS:
-                api_leagues = fetch_league_catalog_from_api(clan_api.bearer_token)
+                cached_written, cached_total = sync_api_round_cache(state, round_metrics_api, configured_league_ids)
+                if cached_total > 0 and DEBUG_VERBOSE:
+                    log_debug(
+                        "sync.api_round_cache_poll",
+                        leagues=len(configured_league_ids),
+                        seen=cached_total,
+                        written=cached_written,
+                    )
+                api_leagues = fetch_league_catalog_from_api(round_metrics_api.bearer_token)
                 last_league_api_poll = now
                 if api_leagues:
                     configured = {ctx.league_id for ctx in main_contexts.values()}
@@ -3208,8 +5142,40 @@ def main() -> None:
                     )
 
             if now - last_poll >= SYNC_POLL_SECONDS:
-                enq_main = enqueue_main_sheet_ops(db, state, main_contexts, ability_id_to_name, ability_headers)
-                enq_clan = enqueue_clan_sheet_ops(db, state, clan_contexts, clan_api)
+                cached_written, cached_total = sync_api_round_cache(state, round_metrics_api, configured_league_ids)
+                if cached_total > 0 and DEBUG_VERBOSE:
+                    log_debug(
+                        "sync.api_round_cache_poll",
+                        leagues=len(configured_league_ids),
+                        seen=cached_total,
+                        written=cached_written,
+                    )
+
+                def _flush_due_queue_tick() -> int:
+                    return flush_sheet_queue_with_rate_limit(state, contexts_all, write_limiter)
+
+                enq_main = enqueue_main_sheet_ops(
+                    None,
+                    state,
+                    main_contexts,
+                    ability_id_to_name,
+                    ability_headers,
+                    round_ability_api,
+                    read_limiter,
+                    power_up_clan_api=power_up_clan_api,
+                    flush_tick=_flush_due_queue_tick,
+                    flush_every_seconds=ENQUEUE_FLUSH_EVERY_SECONDS,
+                )
+                enq_clan = 0
+                if ENABLE_CLAN_SYNC and clan_api is not None:
+                    enq_clan = enqueue_clan_sheet_ops(
+                        None,
+                        state,
+                        clan_contexts,
+                        clan_api,
+                        flush_tick=_flush_due_queue_tick,
+                        flush_every_seconds=ENQUEUE_FLUSH_EVERY_SECONDS,
+                    )
                 enq = enq_main + enq_clan
                 last_poll = now
                 if enq > 0:
@@ -3247,11 +5213,6 @@ def main() -> None:
         try:
             if state is not None:
                 state.close()
-        except Exception:
-            pass
-        try:
-            if db is not None:
-                db.close()
         except Exception:
             pass
         lock.release()
