@@ -18,3 +18,6 @@ sync_state.sqlite-shm
 sync_state.sqlite-wal
 sync_state.sqlite.bak.*
 api_debug/
+
+# Local Codex/Claude metadata
+.claude/

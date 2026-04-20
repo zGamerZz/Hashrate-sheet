@@ -175,7 +175,9 @@ MISSING_HEADER = "missing"
 EXCLUDED_USER_BOOST_AUDIT_HEADER = "Excluded User 2144425 Boosts (Audit)"
 EXCLUDED_BOOST_USER_ID = 2144425
 
-PPS_FACTOR = 28.0
+PPS_BASE_EE_W_PER_TH = 20.0
+# Legacy alias kept to minimize churn in downstream imports/tests.
+PPS_FACTOR = PPS_BASE_EE_W_PER_TH
 POWER_UP_GMT_FACTOR = 0.0389
 POWER_UP_ABILITY_ID = "5d6f8166-0f20-486f-b920-e898ca94dcc1"
 CLAN_POWER_UP_ABILITY_ID = "8a9b57a9-8a17-4647-8b2f-a164dc52b1f4"
@@ -375,7 +377,7 @@ def row_checksum(row: List[Any]) -> str:
 def calc_league_pps(league_th: Optional[float], efficiency_league: Optional[float]) -> Optional[float]:
     if league_th is None or efficiency_league is None or efficiency_league <= 0:
         return None
-    return PPS_FACTOR * league_th / efficiency_league
+    return PPS_BASE_EE_W_PER_TH * league_th / efficiency_league
 
 
 def calc_power_up_gmt(league_th: Optional[float], efficiency_league: Optional[float]) -> Optional[float]:
@@ -582,7 +584,7 @@ def calc_clan_power_up_gmt_pair_from_boost_users_api(
 ) -> Tuple[Optional[float], Optional[float]]:
     """
     Exact clan-based calculation for Clan Power Up:
-      per_use_gmt(clan) = (SUM_over_clan_members(PPS_FACTOR * power / ee)) * CLAN_POWER_UP_GMT_FACTOR
+      per_use_gmt(clan) = (SUM_over_clan_members(PPS_BASE_EE_W_PER_TH * power / ee)) * CLAN_POWER_UP_GMT_FACTOR
       total = SUM(per_user_once * per_use_gmt(user_clan))
     Sentinel-adjusted value applies 20% discount for users with avatar id in [200..299]
     (or sentinel marker in alias).
@@ -657,7 +659,7 @@ def calc_clan_power_up_gmt_pair_from_boost_users_api(
 def calc_team_pps_exact(sum_th_over_w: Optional[float]) -> Optional[float]:
     if sum_th_over_w is None or sum_th_over_w <= 0:
         return None
-    return PPS_FACTOR * sum_th_over_w
+    return PPS_BASE_EE_W_PER_TH * sum_th_over_w
 
 
 def calc_team_pps_fallback(team_th: Optional[float], efficiency_league: Optional[float]) -> Optional[float]:
@@ -1368,7 +1370,7 @@ def calc_team_th_and_pps_from_users(users: Sequence[Dict[str, Any]]) -> Tuple[fl
         team_th += pwr
         if ee is None or ee <= 0:
             continue
-        team_pps += PPS_FACTOR * pwr / ee
+        team_pps += PPS_BASE_EE_W_PER_TH * pwr / ee
     return team_th, team_pps
 
 
@@ -1831,7 +1833,7 @@ class GoMiningClanApiClient:
     def fetch_clan_team_pps_for_clans(self, clan_ids: Sequence[int]) -> Dict[int, float]:
         """
         Compute team PPS per clan from full clan/get-by-id user lists:
-          team_pps = SUM(PPS_FACTOR * user_power / user_ee) for users with valid power/ee.
+          team_pps = SUM(PPS_BASE_EE_W_PER_TH * user_power / user_ee) for users with valid power/ee.
         """
         out: Dict[int, float] = {}
         clan_id_set = sorted({int(x) for x in clan_ids if safe_int(x) is not None})

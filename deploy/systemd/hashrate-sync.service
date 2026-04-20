@@ -1,0 +1,21 @@
+[Unit]
+Description=Hashrate Hunter Sync Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hashrate_hunter_sheet
+EnvironmentFile=-/etc/default/hashrate-sync
+ExecStart=/opt/hashrate_hunter_sheet/.venv/bin/python /opt/hashrate_hunter_sheet/main.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+User=hashrate
+Group=hashrate
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+

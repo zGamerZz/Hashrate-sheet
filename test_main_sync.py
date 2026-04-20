@@ -611,10 +611,11 @@ class SyncCoreTests(unittest.TestCase):
         self.assertEqual(row[-1], "")
 
     def test_formula_helpers(self) -> None:
-        self.assertAlmostEqual(main.calc_league_pps(1000.0, 20.0), 1400.0)
-        self.assertAlmostEqual(main.calc_power_up_gmt(1000.0, 20.0), 1400.0 * 0.0389)
-        self.assertAlmostEqual(main.calc_team_pps_exact(10.0), 280.0)
-        self.assertAlmostEqual(main.calc_team_pps_fallback(100.0, 20.0), 140.0)
+        expected_pps = main.PPS_BASE_EE_W_PER_TH * 1000.0 / 20.0
+        self.assertAlmostEqual(main.calc_league_pps(1000.0, 20.0), expected_pps)
+        self.assertAlmostEqual(main.calc_power_up_gmt(1000.0, 20.0), expected_pps * 0.0389)
+        self.assertAlmostEqual(main.calc_team_pps_exact(10.0), main.PPS_BASE_EE_W_PER_TH * 10.0)
+        self.assertAlmostEqual(main.calc_team_pps_fallback(100.0, 20.0), main.PPS_BASE_EE_W_PER_TH * 100.0 / 20.0)
         self.assertAlmostEqual(main.calc_clan_power_up_gmt(200.0), 0.111)
         self.assertIsNone(main.calc_power_up_gmt(1000.0, 0.0))
         self.assertIsNone(main.calc_team_pps_fallback(None, 20.0))
@@ -812,8 +813,9 @@ class SyncCoreTests(unittest.TestCase):
         second = client.fetch_clan_team_pps_for_clans([10, 10])
         self.assertIn(10, first)
         self.assertIn(10, second)
-        self.assertAlmostEqual(first[10], 280.0)
-        self.assertAlmostEqual(second[10], 280.0)
+        expected = main.PPS_BASE_EE_W_PER_TH * ((100.0 / 20.0) + (50.0 / 10.0))
+        self.assertAlmostEqual(first[10], expected)
+        self.assertAlmostEqual(second[10], expected)
         self.assertEqual(client.calls, [10])
 
     def test_fetch_completed_rounds_prefer_api_uses_cache_only(self) -> None:
@@ -949,7 +951,7 @@ class SyncCoreTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["clan_id"], 11)
         self.assertAlmostEqual(rows[0]["team_th"], 150.0)
-        self.assertAlmostEqual(rows[0]["team_pps"], 280.0)
+        self.assertAlmostEqual(rows[0]["team_pps"], main.PPS_BASE_EE_W_PER_TH * ((100.0 / 20.0) + (50.0 / 10.0)))
         self.assertEqual(rows[0]["members_total"], 2)
         self.assertEqual(rows[0]["members_seen"], 2)
         self.assertEqual(rows[0]["calc_mode"], "api_exact")
