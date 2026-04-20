@@ -5,6 +5,7 @@ import time
 import unittest
 from typing import Any, Dict, List
 
+import backfill_multiplier_threshold
 import backfill_round_gap
 import main
 
@@ -2894,6 +2895,185 @@ class BackfillRoundGapTests(unittest.TestCase):
                 os.remove(path)
             except OSError:
                 pass
+
+    def test_multiplier_threshold_filter_strictly_greater(self) -> None:
+        records = [
+            {"round_id": 101, "multiplier": 2.0},
+            {"round_id": 102, "multiplier": 2.1},
+            {"round_id": 103, "multiplier": 1.9},
+            {"round_id": 104, "multiplier": None},
+            {"round_id": None, "multiplier": 3.0},
+        ]
+        out = backfill_multiplier_threshold.filter_round_records_by_multiplier(records, min_multiplier=2.0)
+        self.assertEqual([main.safe_int(x.get("round_id")) for x in out], [102])
+
+    def test_multiplier_threshold_build_output_rows_normalizes_values(self) -> None:
+        records = [
+            {
+                "snapshot_ts": "2026-04-20T10:00:00+00:00",
+                "league_id": "1",
+                "round_id": "200",
+                "multiplier": "2.5",
+                "block_number": "123",
+                "gmt_fund": "1000.5",
+                "gmt_per_block": "1.25",
+                "league_th": "7777.7",
+                "blocks_mined": "800",
+                "efficiency_league": "19.5",
+                "ended_at": "2026-04-20T10:05:00+00:00",
+                "round_duration_sec": "300",
+            }
+        ]
+        rows = backfill_multiplier_threshold.build_output_rows(records)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(rows[0]), len(backfill_multiplier_threshold.OUTPUT_HEADERS))
+        self.assertEqual(rows[0][1], 1)
+        self.assertEqual(rows[0][2], 200)
+        self.assertAlmostEqual(rows[0][3], 2.5)
+        self.assertEqual(rows[0][4], 123)
+        self.assertAlmostEqual(rows[0][5], 1000.5)
+        self.assertAlmostEqual(rows[0][6], 1.25)
+        self.assertAlmostEqual(rows[0][7], 7777.7)
+        self.assertEqual(rows[0][8], 800)
+        self.assertAlmostEqual(rows[0][9], 19.5)
+        self.assertEqual(rows[0][10], "2026-04-20T10:05:00+00:00")
+        self.assertEqual(rows[0][11], 300)
+
+    def test_multiplier_threshold_resolve_target_round(self) -> None:
+        self.assertEqual(backfill_multiplier_threshold.resolve_target_round("latest", 958000), 958000)
+        self.assertEqual(backfill_multiplier_threshold.resolve_target_round("958999", 958000), 958000)
+        self.assertEqual(backfill_multiplier_threshold.resolve_target_round("958999", None), 958999)
+        self.assertIsNone(backfill_multiplier_threshold.resolve_target_round("latest", None))
+
+    def test_multiplier_threshold_merge_round_records_for_league_mixed(self) -> None:
+        cached = {
+            10: {"league_id": 1, "round_id": 10, "multiplier": 1.1},
+        }
+        fetched = {
+            11: backfill_round_gap.RoundRecordFetchResult(
+                league_id=1,
+                round_id=11,
+                ok=True,
+                record={"league_id": 1, "round_id": 11, "multiplier": 2.2},
+            ),
+            12: backfill_round_gap.RoundRecordFetchResult(
+                league_id=2,
+                round_id=12,
+                ok=True,
+                record={"league_id": 2, "round_id": 12, "multiplier": 3.3},
+            ),
+            13: backfill_round_gap.RoundRecordFetchResult(
+                league_id=1,
+                round_id=13,
+                ok=False,
+                error="round_record_unavailable_or_not_finalized",
+            ),
+        }
+        merged, failed = backfill_multiplier_threshold.merge_round_records_for_league(
+            candidate_round_ids=[10, 11, 12, 13],
+            cached_record_map=cached,
+            round_record_by_round_id=fetched,
+            league_id=1,
+        )
+        self.assertEqual([main.safe_int(x.get("round_id")) for x in merged], [10, 11])
+        self.assertEqual(failed, [12])
+
+    def test_multiplier_threshold_rebuild_target_sheet_dry_run_does_not_mutate(self) -> None:
+        class FakeWS:
+            row_count = 10
+            col_count = 10
+
+            def add_rows(self, _n: int) -> None:
+                raise AssertionError("add_rows must not be called in dry-run")
+
+            def add_cols(self, _n: int) -> None:
+                raise AssertionError("add_cols must not be called in dry-run")
+
+            def batch_clear(self, _ranges: List[str]) -> None:
+                raise AssertionError("batch_clear must not be called in dry-run")
+
+            def batch_update(self, _updates: List[Dict[str, Any]], value_input_option: str = "RAW") -> None:
+                _ = value_input_option
+                raise AssertionError("batch_update must not be called in dry-run")
+
+            def update(self, range_name: str, values: List[List[Any]], value_input_option: str = "RAW") -> None:
+                _ = (range_name, values, value_input_option)
+                raise AssertionError("update must not be called in dry-run")
+
+        ws = FakeWS()
+        stats = backfill_multiplier_threshold.rebuild_target_sheet(
+            ws=ws,
+            league_id=1,
+            from_round=100,
+            to_round=200,
+            min_multiplier=2.0,
+            rows=[[1, 2, 3]],
+            write_limiter=main.TokenBucket(9999, name="test"),
+            execute=False,
+        )
+        self.assertFalse(stats["executed"])
+        self.assertEqual(stats["written_rows"], 1)
+
+    def test_multiplier_threshold_rebuild_target_sheet_execute_writes(self) -> None:
+        class FakeWS:
+            def __init__(self) -> None:
+                self.row_count = 5
+                self.col_count = 5
+                self.cleared: List[List[str]] = []
+                self.batch_updates: List[List[Dict[str, Any]]] = []
+                self.updates: List[Dict[str, Any]] = []
+
+            def add_rows(self, n: int) -> None:
+                self.row_count += int(n)
+
+            def add_cols(self, n: int) -> None:
+                self.col_count += int(n)
+
+            def batch_clear(self, ranges: List[str]) -> None:
+                self.cleared.append(list(ranges))
+
+            def batch_update(self, updates: List[Dict[str, Any]], value_input_option: str = "RAW") -> None:
+                _ = value_input_option
+                self.batch_updates.append(list(updates))
+
+            def update(self, range_name: str, values: List[List[Any]], value_input_option: str = "RAW") -> None:
+                self.updates.append(
+                    {
+                        "range_name": range_name,
+                        "values": values,
+                        "value_input_option": value_input_option,
+                    }
+                )
+
+        ws = FakeWS()
+        rows = [
+            ["2026-04-20T10:00:00+00:00", 1, 100, 2.5, 123, 100.0, 1.0, 50.0, 10, 20.0, "2026-04-20T10:01:00+00:00", 60],
+            ["2026-04-20T10:10:00+00:00", 1, 101, 2.7, 124, 101.0, 1.1, 51.0, 11, 19.9, "2026-04-20T10:11:00+00:00", 60],
+        ]
+        stats = backfill_multiplier_threshold.rebuild_target_sheet(
+            ws=ws,
+            league_id=1,
+            from_round=100,
+            to_round=101,
+            min_multiplier=2.0,
+            rows=rows,
+            write_limiter=main.TokenBucket(9999, name="test"),
+            execute=True,
+        )
+        self.assertTrue(stats["executed"])
+        self.assertEqual(stats["written_rows"], 2)
+        self.assertTrue(ws.cleared)
+        self.assertTrue(ws.batch_updates)
+        first_update = ws.batch_updates[0]
+        self.assertEqual(first_update[0]["range"], "A1")
+        self.assertEqual(first_update[0]["values"][0][0], backfill_multiplier_threshold.TARGET_MARKER)
+        self.assertEqual(first_update[1]["range"], "A3")
+        self.assertEqual(first_update[1]["values"][0], backfill_multiplier_threshold.OUTPUT_HEADERS)
+        self.assertEqual(len(ws.updates), 1)
+        self.assertEqual(ws.updates[0]["range_name"], "A4")
+        self.assertEqual(ws.updates[0]["values"], rows)
+        self.assertGreaterEqual(ws.row_count, 1000)
+        self.assertGreaterEqual(ws.col_count, 26)
 
 
 if __name__ == "__main__":
