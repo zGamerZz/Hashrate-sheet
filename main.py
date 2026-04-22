@@ -161,6 +161,7 @@ try:
 except Exception:
     ROUND_RETRY_BACKOFF_MAX_SECONDS = max(ROUND_RETRY_BACKOFF_MIN_SECONDS, 600.0)
 GAP_SCAN_LOOKBACK_ROUNDS = max(10, int(os.getenv("GAP_SCAN_LOOKBACK_ROUNDS", "500")))
+RECONCILE_DEEP_MISSING_PER_PASS = max(0, int(os.getenv("RECONCILE_DEEP_MISSING_PER_PASS", "50")))
 ADAPTIVE_RPM_ENABLE = os.getenv("ADAPTIVE_RPM_ENABLE", "1").strip() in {"1", "true", "TRUE", "yes", "YES"}
 ADAPTIVE_RPM_MIN = max(1, int(os.getenv("ADAPTIVE_RPM_MIN", "120")))
 ADAPTIVE_RPM_MAX = max(ADAPTIVE_RPM_MIN, int(os.getenv("ADAPTIVE_RPM_MAX", str(GOMINING_API_REQ_PER_MIN))))
@@ -3287,6 +3288,65 @@ class StateStore:
         ).fetchone()
         return int(row["c"]) if row else 0
 
+    def list_missing_row_map_round_ids(
+        self,
+        sheet_id: int,
+        league_id: int,
+        from_round: int,
+        limit: int = 200,
+    ) -> List[int]:
+        rows = self.conn.execute(
+            """
+            SELECT a.round_id
+            FROM api_round_cache a
+            LEFT JOIN round_row_map m
+              ON m.sheet_id=? AND m.round_id=a.round_id
+            WHERE a.league_id=?
+              AND a.round_id>=?
+              AND a.ended_at IS NOT NULL
+              AND m.round_id IS NULL
+            ORDER BY a.round_id ASC
+            LIMIT ?
+            """,
+            (sheet_id, league_id, max(0, int(from_round)), max(1, int(limit))),
+        ).fetchall()
+        out: List[int] = []
+        for r in rows:
+            rid = safe_int(r["round_id"])
+            if rid is not None and rid > 0:
+                out.append(int(rid))
+        return out
+
+    def fetch_api_round_records_by_ids(self, league_id: int, round_ids: Sequence[int]) -> List[Dict[str, Any]]:
+        ids = sorted({int(x) for x in round_ids if safe_int(x) is not None and int(x) > 0})
+        if not ids:
+            return []
+        placeholders = ",".join(["?"] * len(ids))
+        rows = self.conn.execute(
+            f"""
+            SELECT
+              snapshot_ts,
+              league_id,
+              round_id,
+              block_number,
+              multiplier,
+              gmt_fund,
+              gmt_per_block,
+              league_th,
+              blocks_mined,
+              efficiency_league,
+              ended_at,
+              round_duration_sec
+            FROM api_round_cache
+            WHERE league_id=?
+              AND ended_at IS NOT NULL
+              AND round_id IN ({placeholders})
+            ORDER BY round_id ASC
+            """,
+            tuple([int(league_id)] + ids),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_round_row_map_bulk(self, sheet_id: int, round_ids: Sequence[int]) -> Dict[int, Dict[str, Any]]:
         if not round_ids:
             return {}
@@ -5583,13 +5643,13 @@ def _enqueue_specific_main_rounds(
         since_round: int,
         limit: int = MAX_ROUNDS_PER_POLL,
     ) -> List[Dict[str, Any]]:
-        _ = (db, _state)
+        _ = (db, _state, since_round)
         if int(league_id) != int(ctx.league_id):
             return []
         out: List[Dict[str, Any]] = []
         for rec in recs_sorted:
             rid = safe_int(rec.get("round_id"))
-            if rid is None or rid <= since_round:
+            if rid is None:
                 continue
             out.append(rec)
             if len(out) >= max(1, int(limit)):
@@ -5631,6 +5691,8 @@ def run_reconcile_pass(
         if latest_round is None:
             continue
         from_round = max(0, int(latest_round) - int(GAP_SCAN_LOOKBACK_ROUNDS))
+        price_cutover = state.get_price_cutover_round(ws_id)
+        deep_from_round = max(0, int(price_cutover)) if price_cutover is not None else 0
         records = state.fetch_api_completed_rounds(
             ctx.league_id,
             since_round=max(0, from_round - 1),
@@ -5648,11 +5710,31 @@ def run_reconcile_pass(
         retry_states = state.list_retryable_round_states(ctx.league_id, limit=MAX_ROUNDS_PER_POLL)
         retry_ids = {int(safe_int(x.get("round_id")) or -1) for x in retry_states if safe_int(x.get("round_id")) is not None}
         missing_ids = [rid for rid in round_ids if rid >= from_round and rid not in row_map]
-        target_ids = sorted({rid for rid in missing_ids if rid > 0} | {rid for rid in retry_ids if rid > 0})
+        deep_missing_ids: List[int] = []
+        if RECONCILE_DEEP_MISSING_PER_PASS > 0:
+            deep_missing_ids = state.list_missing_row_map_round_ids(
+                ws_id,
+                ctx.league_id,
+                from_round=deep_from_round,
+                limit=RECONCILE_DEEP_MISSING_PER_PASS,
+            )
+        target_ids = sorted(
+            {rid for rid in missing_ids if rid > 0}
+            | {rid for rid in retry_ids if rid > 0}
+            | {rid for rid in deep_missing_ids if rid > 0}
+        )
         if not target_ids:
             continue
         sheets_with_gaps += 1
         rec_by_rid = {int(safe_int(r.get("round_id")) or -1): r for r in records if safe_int(r.get("round_id")) is not None}
+        missing_record_ids = [rid for rid in target_ids if rid not in rec_by_rid]
+        if missing_record_ids:
+            extra_records = state.fetch_api_round_records_by_ids(ctx.league_id, missing_record_ids)
+            for rec in extra_records:
+                rid = safe_int(rec.get("round_id"))
+                if rid is None:
+                    continue
+                rec_by_rid[int(rid)] = rec
         target_records = [rec_by_rid[rid] for rid in target_ids if rid in rec_by_rid]
         for rid in target_ids:
             state.upsert_round_processing_state(
@@ -5682,6 +5764,8 @@ def run_reconcile_pass(
             league_id=ctx.league_id,
             latest_seen=latest_round,
             lookback_from=from_round,
+            deep_from=deep_from_round,
+            deep_targets=len(deep_missing_ids),
             targets=len(target_records),
             queued=enq,
         )
@@ -5875,6 +5959,7 @@ def main(once_reconcile: bool = False) -> None:
             round_retry_backoff_min_s=ROUND_RETRY_BACKOFF_MIN_SECONDS,
             round_retry_backoff_max_s=ROUND_RETRY_BACKOFF_MAX_SECONDS,
             gap_scan_lookback_rounds=GAP_SCAN_LOOKBACK_ROUNDS,
+            reconcile_deep_missing_per_pass=RECONCILE_DEEP_MISSING_PER_PASS,
             adaptive_rpm_enabled=ADAPTIVE_RPM_ENABLE,
             adaptive_rpm_min=ADAPTIVE_RPM_MIN,
             adaptive_rpm_max=ADAPTIVE_RPM_MAX,

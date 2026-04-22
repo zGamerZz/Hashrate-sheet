@@ -1480,6 +1480,141 @@ class SyncCoreTests(unittest.TestCase):
             except OSError:
                 pass
 
+    def test_run_reconcile_pass_queues_retry_round_outside_lookback(self) -> None:
+        class FakeRoundAPI:
+            def fetch_round_ability_counts(
+                self,
+                round_id: int,
+                expected_league_id: int | None = None,
+                progress_hook: Any | None = None,
+            ) -> Dict[str, int] | None:
+                _ = (round_id, expected_league_id, progress_hook)
+                return {"a1": 1}
+
+        fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
+        os.close(fd)
+        orig_lookback = main.GAP_SCAN_LOOKBACK_ROUNDS
+        orig_deep = main.RECONCILE_DEEP_MISSING_PER_PASS
+        try:
+            st = main.StateStore(path)
+            st.upsert_sheet_meta(11, "Eclipse", 3)
+            st.set_last_synced_round(11, 1200)
+            st.set_price_cutover_round(11, 900)
+            self._seed_api_rounds(
+                st,
+                [
+                    {"round_id": 1000, "league_id": 3, "snapshot_ts": "2026-04-01T22:00:00+00:00"},
+                    {"round_id": 1199, "league_id": 3, "snapshot_ts": "2026-04-01T22:02:00+00:00"},
+                    {"round_id": 1200, "league_id": 3, "snapshot_ts": "2026-04-01T22:03:00+00:00"},
+                ],
+            )
+            st.upsert_row_map(11, 1199, 10, "ok", 1)
+            st.upsert_row_map(11, 1200, 11, "ok", 1)
+            st.upsert_round_processing_state(
+                3,
+                1000,
+                metrics_status="ok",
+                abilities_status="failed",
+                sheet_status="pending",
+                retry_after_ts=time.time() - 1,
+                attempt_count=2,
+            )
+            ctx = main.SheetContext(
+                ws_id=11,
+                title="Eclipse",
+                ws=None,
+                league_id=3,
+                kind="main",
+                expected_cols=len(main.BASE_HEADERS) + 1 + 6,
+                round_col_idx=6,
+            )
+            main.GAP_SCAN_LOOKBACK_ROUNDS = 10
+            main.RECONCILE_DEEP_MISSING_PER_PASS = 0
+            stats = main.run_reconcile_pass(
+                state=st,
+                main_contexts={11: ctx},
+                ability_id_to_name={"a1": "Rocket (x1)"},
+                ability_headers=["Rocket (x1)"],
+                round_ability_api=FakeRoundAPI(),  # type: ignore[arg-type]
+                read_limiter=None,
+                power_up_clan_api=None,
+            )
+            self.assertGreaterEqual(int(stats.get("queued_ops") or 0), 1)
+            due = st.fetch_due_ops(limit=50)
+            due_rounds = {int(main.safe_int(x.get("round_id")) or -1) for x in due}
+            self.assertIn(1000, due_rounds)
+            st.close()
+        finally:
+            main.GAP_SCAN_LOOKBACK_ROUNDS = orig_lookback
+            main.RECONCILE_DEEP_MISSING_PER_PASS = orig_deep
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def test_run_reconcile_pass_deep_scan_queues_old_missing_without_retry_state(self) -> None:
+        class FakeRoundAPI:
+            def fetch_round_ability_counts(
+                self,
+                round_id: int,
+                expected_league_id: int | None = None,
+                progress_hook: Any | None = None,
+            ) -> Dict[str, int] | None:
+                _ = (round_id, expected_league_id, progress_hook)
+                return {"a1": 1}
+
+        fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
+        os.close(fd)
+        orig_lookback = main.GAP_SCAN_LOOKBACK_ROUNDS
+        orig_deep = main.RECONCILE_DEEP_MISSING_PER_PASS
+        try:
+            st = main.StateStore(path)
+            st.upsert_sheet_meta(22, "Eclipse", 3)
+            st.set_last_synced_round(22, 1200)
+            st.set_price_cutover_round(22, 900)
+            self._seed_api_rounds(
+                st,
+                [
+                    {"round_id": 1000, "league_id": 3, "snapshot_ts": "2026-04-01T22:00:00+00:00"},
+                    {"round_id": 1199, "league_id": 3, "snapshot_ts": "2026-04-01T22:02:00+00:00"},
+                    {"round_id": 1200, "league_id": 3, "snapshot_ts": "2026-04-01T22:03:00+00:00"},
+                ],
+            )
+            st.upsert_row_map(22, 1199, 10, "ok", 1)
+            st.upsert_row_map(22, 1200, 11, "ok", 1)
+            ctx = main.SheetContext(
+                ws_id=22,
+                title="Eclipse",
+                ws=None,
+                league_id=3,
+                kind="main",
+                expected_cols=len(main.BASE_HEADERS) + 1 + 6,
+                round_col_idx=6,
+            )
+            main.GAP_SCAN_LOOKBACK_ROUNDS = 10
+            main.RECONCILE_DEEP_MISSING_PER_PASS = 5
+            stats = main.run_reconcile_pass(
+                state=st,
+                main_contexts={22: ctx},
+                ability_id_to_name={"a1": "Rocket (x1)"},
+                ability_headers=["Rocket (x1)"],
+                round_ability_api=FakeRoundAPI(),  # type: ignore[arg-type]
+                read_limiter=None,
+                power_up_clan_api=None,
+            )
+            self.assertGreaterEqual(int(stats.get("queued_ops") or 0), 1)
+            due = st.fetch_due_ops(limit=50)
+            due_rounds = {int(main.safe_int(x.get("round_id")) or -1) for x in due}
+            self.assertIn(1000, due_rounds)
+            st.close()
+        finally:
+            main.GAP_SCAN_LOOKBACK_ROUNDS = orig_lookback
+            main.RECONCILE_DEEP_MISSING_PER_PASS = orig_deep
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
     def test_enqueue_main_sheet_ops_updates_when_abilities_arrive(self) -> None:
         rec = {
             "snapshot_ts": "2026-04-01T22:00:00+00:00",
