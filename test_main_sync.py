@@ -2348,7 +2348,7 @@ class SyncCoreTests(unittest.TestCase):
             main.log_info = lambda msg, **fields: info_events.append({"msg": msg, "fields": dict(fields)})  # type: ignore[assignment]
             written, seen = main.sync_api_round_cache(st, stub, [1])
             self.assertEqual((written, seen), (4, 4))
-            self.assertEqual(stub.by_round_calls, [101, 102, 103])
+            self.assertEqual(stub.by_round_calls, [103, 102, 101])
             latest = st.fetch_latest_api_round_record(1)
             self.assertIsNotNone(latest)
             self.assertEqual(latest["round_id"], 104)
@@ -2419,7 +2419,7 @@ class SyncCoreTests(unittest.TestCase):
             main.log_info = lambda msg, **fields: info_events.append({"msg": msg, "fields": dict(fields)})  # type: ignore[assignment]
             written, seen = main.sync_api_round_cache(st, stub, [1])
             self.assertEqual((written, seen), (3, 3))
-            self.assertEqual(stub.by_round_calls, [101, 102])
+            self.assertEqual(stub.by_round_calls, [103, 102])
             latest = st.fetch_latest_api_round_record(1)
             self.assertIsNotNone(latest)
             self.assertEqual(latest["round_id"], 104)
@@ -2430,6 +2430,77 @@ class SyncCoreTests(unittest.TestCase):
         finally:
             main.SYNC_API_GAP_FILL_MAX = orig_gap_max
             main.log_info = orig_log_info  # type: ignore[assignment]
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def test_sync_api_round_cache_gap_fill_sparse_ids_scans_backwards(self) -> None:
+        class StubRoundMetricsAPI:
+            def __init__(self) -> None:
+                self.by_round_calls: List[int] = []
+                self.available = {249, 233, 217}
+
+            @staticmethod
+            def _build_record(round_id: int) -> Dict[str, Any]:
+                return {
+                    "snapshot_ts": "2026-04-18T10:30:00+00:00",
+                    "league_id": 1,
+                    "round_id": round_id,
+                    "block_number": 100 + round_id,
+                    "multiplier": 1.0,
+                    "gmt_fund": 10.0,
+                    "blocks_mined": 2,
+                    "gmt_per_block": 5.0,
+                    "league_th": 1500.0,
+                    "efficiency_league": 20.0,
+                    "ended_at": "2026-04-18T10:30:00+00:00",
+                    "round_duration_sec": 60,
+                }
+
+            def fetch_round_metrics_triplet(
+                self,
+                league_id: int,
+                strict_league_validation: bool = False,
+            ) -> Dict[str, Any] | None:
+                _ = (league_id, strict_league_validation)
+                return self._build_record(250)
+
+            def fetch_round_metrics_by_round_id(self, league_id: int, round_id: int) -> Dict[str, Any] | None:
+                _ = league_id
+                self.by_round_calls.append(round_id)
+                if round_id in self.available:
+                    return self._build_record(round_id)
+                return None
+
+        fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
+        os.close(fd)
+        orig_gap_max = main.SYNC_API_GAP_FILL_MAX
+        orig_probe_max = main.SYNC_API_GAP_FILL_PROBE_MAX
+        try:
+            st = main.StateStore(path)
+            st.upsert_api_round_record(
+                {
+                    "snapshot_ts": "2026-04-18T10:20:00+00:00",
+                    "league_id": 1,
+                    "round_id": 200,
+                    "ended_at": "2026-04-18T10:21:00+00:00",
+                }
+            )
+            stub = StubRoundMetricsAPI()
+            main.SYNC_API_GAP_FILL_MAX = 3
+            main.SYNC_API_GAP_FILL_PROBE_MAX = 40
+            written, seen = main.sync_api_round_cache(st, stub, [1])
+            self.assertEqual((written, seen), (4, 4))
+            self.assertGreaterEqual(len(stub.by_round_calls), 3)
+            self.assertEqual(stub.by_round_calls[0], 249)
+            recent = st.fetch_api_completed_rounds(1, since_round=200, limit=20)
+            recent_ids = sorted(main.safe_int(r.get("round_id")) for r in recent)
+            self.assertEqual([x for x in recent_ids if x is not None], [217, 233, 249, 250])
+            st.close()
+        finally:
+            main.SYNC_API_GAP_FILL_MAX = orig_gap_max
+            main.SYNC_API_GAP_FILL_PROBE_MAX = orig_probe_max
             try:
                 os.remove(path)
             except OSError:

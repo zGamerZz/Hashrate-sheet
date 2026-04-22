@@ -50,6 +50,15 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1bq5Sy2pV35x33Q12G5_EJ2S0Kb1iXo1Y2
 
 SYNC_POLL_SECONDS = int(os.getenv("SYNC_POLL_SECONDS", "5"))
 SYNC_API_GAP_FILL_MAX = max(1, int(os.getenv("SYNC_API_GAP_FILL_MAX", "20")))
+SYNC_API_GAP_FILL_PROBE_MAX = max(
+    1,
+    int(
+        os.getenv(
+            "SYNC_API_GAP_FILL_PROBE_MAX",
+            str(max(SYNC_API_GAP_FILL_MAX * 10, 120)),
+        )
+    ),
+)
 SHEET_REFRESH_SECONDS = int(os.getenv("SHEET_REFRESH_SECONDS", "1800"))
 GS_WRITE_REQ_PER_MIN = int(os.getenv("GS_WRITE_REQ_PER_MIN", "45"))
 GS_READ_REQ_PER_MIN = int(os.getenv("GS_READ_REQ_PER_MIN", "20"))
@@ -4603,10 +4612,25 @@ def sync_api_round_cache(
             missing_total = round_id - prev_round_id - 1
             attempted = min(missing_total, SYNC_API_GAP_FILL_MAX)
             fetched = 0
+            probes = 0
+            # Round IDs are global and sparse per league. Probe backwards from the latest
+            # round to capture recent same-league rounds instead of assuming contiguity.
+            probe_budget = min(
+                missing_total,
+                max(attempted, SYNC_API_GAP_FILL_PROBE_MAX),
+            )
             fetch_by_round_id = getattr(round_metrics_api, "fetch_round_metrics_by_round_id", None)
 
             if callable(fetch_by_round_id):
-                for gap_round_id in range(prev_round_id + 1, prev_round_id + attempted + 1):
+                candidate_round_id = round_id - 1
+                while (
+                    candidate_round_id > prev_round_id
+                    and fetched < attempted
+                    and probes < probe_budget
+                ):
+                    gap_round_id = candidate_round_id
+                    candidate_round_id -= 1
+                    probes += 1
                     gap_rec = fetch_by_round_id(league_id, gap_round_id)
                     if not isinstance(gap_rec, dict):
                         log_warn(
@@ -4628,6 +4652,7 @@ def sync_api_round_cache(
                         continue
                     league_records.append(gap_rec)
                     fetched += 1
+                league_records.sort(key=lambda x: safe_int(x.get("round_id")) or -1)
             else:
                 log_warn(
                     "sync.api_round_gap_fill_round_skip",
@@ -4636,8 +4661,9 @@ def sync_api_round_cache(
                     reason="client_missing_method",
                 )
 
-            capped = missing_total > SYNC_API_GAP_FILL_MAX
-            remaining_missing = missing_total - fetched
+            capped = missing_total > fetched
+            probe_capped = bool(attempted > fetched and probes >= probe_budget and probe_budget > 0)
+            remaining_missing = max(0, missing_total - fetched)
             log_info(
                 "sync.api_round_gap_fill",
                 league_id=league_id,
@@ -4645,8 +4671,11 @@ def sync_api_round_cache(
                 new_round_id=round_id,
                 missing_total=missing_total,
                 attempted=attempted,
+                probe_budget=probe_budget,
+                probes=probes,
                 fetched=fetched,
                 capped=capped,
+                probe_capped=probe_capped,
                 remaining=remaining_missing,
             )
             league_records.append(rec)
@@ -5810,6 +5839,8 @@ def main(once_reconcile: bool = False) -> None:
             auto_expand_rows=AUTO_EXPAND_SHEET_ROWS,
             drop_non_retryable=DROP_NON_RETRYABLE_SHEET_ERRORS,
             purge_missing_sheet_ops=PURGE_QUEUE_FOR_MISSING_SHEETS,
+            sync_api_gap_fill_max=SYNC_API_GAP_FILL_MAX,
+            sync_api_gap_fill_probe_max=SYNC_API_GAP_FILL_PROBE_MAX,
             gomining_api_req_per_min=GOMINING_API_REQ_PER_MIN,
             clan_sync_enabled=ENABLE_CLAN_SYNC,
             clan_api_page_limit=CLAN_API_PAGE_LIMIT,
