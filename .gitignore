@@ -1,5 +1,6 @@
 .venv/
 __pycache__/
+.pytest_cache/
 *.pyc
 
 # Local secrets and service credentials
@@ -10,14 +11,11 @@ abc.json
 # Runtime artifacts
 sync_debug.log
 sync_state.sqlite
-sync.lock
-.VSCodeCounter/
-
-sync_debug.log
-sync_state.sqlite
 sync_state.sqlite-shm
 sync_state.sqlite-wal
 sync_state.sqlite.bak.*
+sync.lock
+.VSCodeCounter/
 api_debug/
 
 # Local Codex/Claude metadata

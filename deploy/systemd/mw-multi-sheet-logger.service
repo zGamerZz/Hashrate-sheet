@@ -1,0 +1,20 @@
+[Unit]
+Description=GoMining Multiplier Logger
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/gomining/multiplier_logger
+EnvironmentFile=-/etc/default/mw-multi-sheet-logger
+ExecStart=/opt/gomining/multiplier_logger/.venv/bin/python /opt/gomining/multiplier_logger/main.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+User=main
+Group=main
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
