@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import requests
 
 from ..config import *
-from ..logging_utils import log_info, log_warn
+from ..logging_utils import log_debug, log_info, log_warn
 from ..runtime.rate_limit import TokenBucket
 from ..storage.state import StateStore
 from ..utils import row_checksum, safe_float, safe_int
