@@ -11,6 +11,7 @@ abc.json
 sync_debug.log
 sync_state.sqlite
 sync.lock
+.VSCodeCounter/
 
 sync_debug.log
 sync_state.sqlite

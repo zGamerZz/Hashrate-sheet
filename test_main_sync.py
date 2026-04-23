@@ -882,7 +882,7 @@ class SyncCoreTests(unittest.TestCase):
         ]
         team_th, team_pps = main.calc_team_th_and_pps_from_users(users)
         self.assertAlmostEqual(team_th, 1700.0)
-        self.assertAlmostEqual(team_pps, 1960.0)
+        self.assertAlmostEqual(team_pps, main.PPS_BASE_EE_W_PER_TH * ((1000.0 / 20.0) + (200.0 / 10.0)))
 
     def test_to_api_calculated_at(self) -> None:
         out = main._to_api_calculated_at("2026-03-31T12:34:56+00:00")
