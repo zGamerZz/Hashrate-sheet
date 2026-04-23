@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/gomining/multiplier_logger
-EnvironmentFile=-/etc/default/mw-multi-sheet-logger
+EnvironmentFile=-/opt/gomining/multiplier_logger/.env
 ExecStart=/opt/gomining/multiplier_logger/.venv/bin/python /opt/gomining/multiplier_logger/main.py
 Restart=always
 RestartSec=5

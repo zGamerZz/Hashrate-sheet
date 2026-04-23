@@ -32,13 +32,13 @@ python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
 
+cp -n deploy/systemd/mw-multi-sheet-logger.env.example .env
 sudo install -m 0644 deploy/systemd/mw-multi-sheet-logger.service /etc/systemd/system/mw-multi-sheet-logger.service
-sudo cp -n deploy/systemd/mw-multi-sheet-logger.env.example /etc/default/mw-multi-sheet-logger
 sudo systemctl daemon-reload
 sudo systemctl enable --now mw-multi-sheet-logger.service
 ```
 
-Edit `/etc/default/mw-multi-sheet-logger` after the first copy to set secrets and sheet IDs.
+Edit `/opt/gomining/multiplier_logger/.env` after the first copy to set secrets and sheet IDs.
 
 ## Clean Server Working Tree
 
