@@ -213,7 +213,7 @@ def main_cli() -> None:
 
         ability_id_to_name = main.build_ability_id_to_header(main.ABILITY_DIM_STATIC)
         ability_headers = list(main.ABILITY_HEADER_ORDER)
-        expected_cols = len(main.BASE_HEADERS) + len(ability_headers) + 5
+        expected_cols = len(main.BASE_HEADERS) + len(ability_headers) + 7
 
         sh = main.open_spreadsheet()
         contexts = _load_main_contexts(sh, read_limiter, expected_cols)

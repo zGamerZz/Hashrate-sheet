@@ -337,7 +337,7 @@ def main_cli() -> int:
         gomining_guard = backfill_round_gap.ThreadSafeRateGuard(int(args.gomining_rpm), name="gomining_api")
         effective_bearer, token_fetcher = backfill_round_gap._resolve_effective_bearer()
 
-        expected_main_cols = len(main.BASE_HEADERS) + len(main.ABILITY_HEADER_ORDER) + 6
+        expected_main_cols = len(main.BASE_HEADERS) + len(main.ABILITY_HEADER_ORDER) + 7
         sh = main.open_spreadsheet()
         contexts = backfill_round_gap._load_main_contexts(sh, read_limiter, expected_main_cols)
 

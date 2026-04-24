@@ -84,6 +84,7 @@ class StateStore:
               league_th REAL,
               blocks_mined INTEGER,
               efficiency_league REAL,
+              btc_fund REAL,
               ended_at TEXT,
               round_duration_sec INTEGER,
               source TEXT NOT NULL DEFAULT 'api_triplet',
@@ -110,6 +111,7 @@ class StateStore:
             """
         )
         self._ensure_sheet_state_columns()
+        self._ensure_api_round_cache_columns()
         self.conn.commit()
 
     def _ensure_sheet_state_columns(self) -> None:
@@ -117,6 +119,12 @@ class StateStore:
         cols = {str(r["name"]) for r in rows}
         if "price_cutover_round" not in cols:
             self.conn.execute("ALTER TABLE sheet_state ADD COLUMN price_cutover_round INTEGER")
+
+    def _ensure_api_round_cache_columns(self) -> None:
+        rows = self.conn.execute("PRAGMA table_info(api_round_cache)").fetchall()
+        cols = {str(r["name"]) for r in rows}
+        if "btc_fund" not in cols:
+            self.conn.execute("ALTER TABLE api_round_cache ADD COLUMN btc_fund REAL")
 
     def get_sheet_state(self, sheet_id: int) -> Optional[Dict[str, Any]]:
         row = self.conn.execute(
@@ -307,6 +315,7 @@ class StateStore:
               league_th,
               blocks_mined,
               efficiency_league,
+              btc_fund,
               ended_at,
               round_duration_sec
             FROM api_round_cache
@@ -473,9 +482,9 @@ class StateStore:
             """
             INSERT INTO api_round_cache(
               league_id, round_id, snapshot_ts, block_number, multiplier, gmt_fund, gmt_per_block,
-              league_th, blocks_mined, efficiency_league, ended_at, round_duration_sec, source, updated_at
+              league_th, blocks_mined, efficiency_league, btc_fund, ended_at, round_duration_sec, source, updated_at
             )
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(league_id, round_id) DO UPDATE SET
               snapshot_ts=COALESCE(excluded.snapshot_ts, api_round_cache.snapshot_ts),
               block_number=COALESCE(excluded.block_number, api_round_cache.block_number),
@@ -485,6 +494,7 @@ class StateStore:
               league_th=COALESCE(excluded.league_th, api_round_cache.league_th),
               blocks_mined=COALESCE(excluded.blocks_mined, api_round_cache.blocks_mined),
               efficiency_league=COALESCE(excluded.efficiency_league, api_round_cache.efficiency_league),
+              btc_fund=COALESCE(excluded.btc_fund, api_round_cache.btc_fund),
               ended_at=COALESCE(excluded.ended_at, api_round_cache.ended_at),
               round_duration_sec=COALESCE(excluded.round_duration_sec, api_round_cache.round_duration_sec),
               source=excluded.source,
@@ -501,6 +511,7 @@ class StateStore:
                 safe_float(rec.get("league_th")),
                 safe_int(rec.get("blocks_mined")),
                 safe_float(rec.get("efficiency_league")),
+                safe_float(rec.get("btc_fund")),
                 to_iso_utc(rec.get("ended_at")),
                 safe_int(rec.get("round_duration_sec")),
                 str(source or "api_triplet"),
@@ -522,9 +533,9 @@ class StateStore:
                 """
                 INSERT INTO api_round_cache(
                   league_id, round_id, snapshot_ts, block_number, multiplier, gmt_fund, gmt_per_block,
-                  league_th, blocks_mined, efficiency_league, ended_at, round_duration_sec, source, updated_at
+                  league_th, blocks_mined, efficiency_league, btc_fund, ended_at, round_duration_sec, source, updated_at
                 )
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(league_id, round_id) DO UPDATE SET
                   snapshot_ts=COALESCE(excluded.snapshot_ts, api_round_cache.snapshot_ts),
                   block_number=COALESCE(excluded.block_number, api_round_cache.block_number),
@@ -534,6 +545,7 @@ class StateStore:
                   league_th=COALESCE(excluded.league_th, api_round_cache.league_th),
                   blocks_mined=COALESCE(excluded.blocks_mined, api_round_cache.blocks_mined),
                   efficiency_league=COALESCE(excluded.efficiency_league, api_round_cache.efficiency_league),
+                  btc_fund=COALESCE(excluded.btc_fund, api_round_cache.btc_fund),
                   ended_at=COALESCE(excluded.ended_at, api_round_cache.ended_at),
                   round_duration_sec=COALESCE(excluded.round_duration_sec, api_round_cache.round_duration_sec),
                   source=excluded.source,
@@ -550,6 +562,7 @@ class StateStore:
                     safe_float(rec.get("league_th")),
                     safe_int(rec.get("blocks_mined")),
                     safe_float(rec.get("efficiency_league")),
+                    safe_float(rec.get("btc_fund")),
                     to_iso_utc(rec.get("ended_at")),
                     safe_int(rec.get("round_duration_sec")),
                     str(source or "api_triplet"),
@@ -574,6 +587,7 @@ class StateStore:
               league_th,
               blocks_mined,
               efficiency_league,
+              btc_fund,
               ended_at,
               round_duration_sec
             FROM api_round_cache
@@ -615,6 +629,7 @@ class StateStore:
               league_th,
               blocks_mined,
               efficiency_league,
+              btc_fund,
               ended_at,
               round_duration_sec,
               source

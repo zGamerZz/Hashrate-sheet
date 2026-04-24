@@ -511,6 +511,7 @@ class GoMiningRoundMetricsApiClient:
             "league_th": safe_float(clan_data.get("totalPower")),
             "blocks_mined": blocks_mined,
             "efficiency_league": safe_float(clan_data.get("weightedEnergyEfficiencyPerTh")),
+            "btc_fund": safe_float(clan_data.get("btcFund")),
             "ended_at": ended_at,
             "round_duration_sec": round_duration_sec,
         }

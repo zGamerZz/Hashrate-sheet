@@ -56,6 +56,7 @@ def main(once_reconcile: bool = False) -> None:
             CLAN_POWER_UP_PRICE_SENTINEL_HEADER,
             MISSING_HEADER,
             EXCLUDED_USER_BOOST_AUDIT_HEADER,
+            BTC_FUND_HEADER,
         ]
         clan_expected_header = list(CLAN_HEADERS)
 

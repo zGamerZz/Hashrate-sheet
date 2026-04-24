@@ -58,6 +58,7 @@ def build_canonical_row(
     duration = safe_int(rec.get("round_duration_sec"))
     blocks_mined = safe_int(rec.get("blocks_mined"))
     efficiency_league = safe_float(rec.get("efficiency_league"))
+    btc_fund = safe_float(rec.get("btc_fund"))
 
     row: List[Any] = [
         ts_iso,
@@ -108,6 +109,7 @@ def build_canonical_row(
     aliases = [str(x).strip() for x in (power_up_missing_aliases or []) if str(x).strip()]
     row.append(", ".join(aliases))
     row.append(str(excluded_user_boosts_audit or "").strip())
+    row.append("" if btc_fund is None else btc_fund)
     return row
 
 def build_clan_round_rows(rec: Dict[str, Any], clan_rows: Sequence[Dict[str, Any]]) -> List[List[Any]]:

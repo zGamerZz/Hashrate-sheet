@@ -5,6 +5,7 @@ import time
 import unittest
 from typing import Any, Dict, List
 
+import backfill_eclipse_backfill
 import backfill_multiplier_threshold
 import backfill_round_gap
 import main
@@ -154,6 +155,7 @@ class SyncCoreTests(unittest.TestCase):
                 return {
                     "data": {
                         "totalMinedBlocks": 1172,
+                        "btcFund": "2.5675718901263472",
                         "totalPower": 1833891.2399650307,
                         "weightedEnergyEfficiencyPerTh": 20.05189094789897,
                     }
@@ -176,6 +178,7 @@ class SyncCoreTests(unittest.TestCase):
         self.assertAlmostEqual(rec["gmt_per_block"], 189651.96424237 / 1172.0)
         self.assertAlmostEqual(rec["league_th"], 1833891.2399650307)
         self.assertAlmostEqual(rec["efficiency_league"], 20.05189094789897)
+        self.assertAlmostEqual(rec["btc_fund"], 2.5675718901263472)
         self.assertEqual(rec["ended_at"], "2026-04-18T10:35:49+00:00")
         self.assertEqual(rec["round_duration_sec"], 60)
         calc_at_user = calls[2]["json_payload"]["calculatedAt"]
@@ -508,6 +511,7 @@ class SyncCoreTests(unittest.TestCase):
             "round_duration_sec": 60,
             "blocks_mined": 662,
             "efficiency_league": 20.49,
+            "btc_fund": 1.2345,
         }
         ability_headers = ["Echo Boost (x1)", "Rocket (x1)"]
         counts = {"Echo Boost (x1)": 3}
@@ -525,12 +529,13 @@ class SyncCoreTests(unittest.TestCase):
         self.assertAlmostEqual(row[11], 20.49)
         self.assertEqual(row[12], 3)
         self.assertEqual(row[13], 0)
-        self.assertAlmostEqual(row[-6], 555.0)
+        self.assertAlmostEqual(row[-7], 555.0)
+        self.assertAlmostEqual(row[-6], 0.0)
         self.assertAlmostEqual(row[-5], 0.0)
         self.assertAlmostEqual(row[-4], 0.0)
-        self.assertAlmostEqual(row[-3], 0.0)
+        self.assertEqual(row[-3], "")
         self.assertEqual(row[-2], "")
-        self.assertEqual(row[-1], "")
+        self.assertAlmostEqual(row[-1], 1.2345)
 
     def test_build_canonical_row_with_missing_aliases(self) -> None:
         rec = {
@@ -549,11 +554,12 @@ class SyncCoreTests(unittest.TestCase):
             power_up_gmt_sentinel_value=43.56,
             power_up_missing_aliases=["alice", "bob"],
         )
-        self.assertAlmostEqual(row[-6], 54.45)
-        self.assertAlmostEqual(row[-5], 43.56)
+        self.assertAlmostEqual(row[-7], 54.45)
+        self.assertAlmostEqual(row[-6], 43.56)
+        self.assertAlmostEqual(row[-5], 0.0)
         self.assertAlmostEqual(row[-4], 0.0)
-        self.assertAlmostEqual(row[-3], 0.0)
-        self.assertEqual(row[-2], "alice, bob")
+        self.assertEqual(row[-3], "alice, bob")
+        self.assertEqual(row[-2], "")
         self.assertEqual(row[-1], "")
 
     def test_build_canonical_row_cutover_blocks_old_round(self) -> None:
@@ -565,6 +571,7 @@ class SyncCoreTests(unittest.TestCase):
             "efficiency_league": 20.0,
         }
         row = main.build_canonical_row(rec, [], {}, price_cutover_round=123, power_up_gmt_value=999.0)
+        self.assertEqual(row[-7], "")
         self.assertEqual(row[-6], "")
         self.assertEqual(row[-5], "")
         self.assertEqual(row[-4], "")
@@ -581,10 +588,11 @@ class SyncCoreTests(unittest.TestCase):
             "efficiency_league": 20.0,
         }
         row = main.build_canonical_row(rec, [], {}, price_cutover_round=123, power_up_gmt_value=None)
+        self.assertEqual(row[-7], 0.0)
         self.assertEqual(row[-6], 0.0)
         self.assertEqual(row[-5], 0.0)
         self.assertEqual(row[-4], 0.0)
-        self.assertEqual(row[-3], 0.0)
+        self.assertEqual(row[-3], "")
         self.assertEqual(row[-2], "")
         self.assertEqual(row[-1], "")
 
@@ -604,10 +612,11 @@ class SyncCoreTests(unittest.TestCase):
             power_up_gmt_value=None,
             power_up_gmt_sentinel_value=None,
         )
+        self.assertEqual(row[-7], "")
         self.assertEqual(row[-6], "")
-        self.assertEqual(row[-5], "")
+        self.assertEqual(row[-5], 0.0)
         self.assertEqual(row[-4], 0.0)
-        self.assertEqual(row[-3], 0.0)
+        self.assertEqual(row[-3], "")
         self.assertEqual(row[-2], "")
         self.assertEqual(row[-1], "")
 
@@ -1421,7 +1430,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 6,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
                 round_col_idx=6,
             )
             fake_round_api = FakeRoundAPI()
@@ -1525,7 +1534,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=3,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 6,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
                 round_col_idx=6,
             )
             main.GAP_SCAN_LOOKBACK_ROUNDS = 10
@@ -1588,7 +1597,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=3,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 6,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
                 round_col_idx=6,
             )
             main.GAP_SCAN_LOOKBACK_ROUNDS = 10
@@ -1658,7 +1667,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 6,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
                 round_col_idx=6,
             )
             enq = main.enqueue_main_sheet_ops(
@@ -1677,10 +1686,11 @@ class SyncCoreTests(unittest.TestCase):
             payload = json.loads(due[0]["payload_json"])
             row = payload["row"]
             self.assertEqual(row[12], 5)
+            self.assertAlmostEqual(row[-7], 5.0 * main.calc_power_up_gmt(1000.0, 20.0))
             self.assertAlmostEqual(row[-6], 5.0 * main.calc_power_up_gmt(1000.0, 20.0))
-            self.assertAlmostEqual(row[-5], 5.0 * main.calc_power_up_gmt(1000.0, 20.0))
+            self.assertAlmostEqual(row[-5], 0.0)
             self.assertAlmostEqual(row[-4], 0.0)
-            self.assertAlmostEqual(row[-3], 0.0)
+            self.assertEqual(row[-3], "")
             self.assertEqual(row[-2], "")
             self.assertEqual(row[-1], "")
             st.close()
@@ -1738,7 +1748,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 6,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
                 round_col_idx=6,
             )
             enq = main.enqueue_main_sheet_ops(
@@ -1755,7 +1765,8 @@ class SyncCoreTests(unittest.TestCase):
             payload = json.loads(due[0]["payload_json"])
             row = payload["row"]
             self.assertEqual(row[12], 4)
-            self.assertEqual(row[-1], "Power Up Boost=3; ability_id=unknown-aid:2")
+            self.assertEqual(row[-2], "Power Up Boost=3; ability_id=unknown-aid:2")
+            self.assertEqual(row[-1], "")
             st.close()
         finally:
             try:
@@ -1816,7 +1827,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 6,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
                 round_col_idx=6,
             )
             enq = main.enqueue_main_sheet_ops(
@@ -1835,10 +1846,11 @@ class SyncCoreTests(unittest.TestCase):
             row = payload["row"]
             clan_cpu = main.calc_clan_power_up_gmt(2000.0) or 0.0
             self.assertEqual(row[12], 2)
+            self.assertAlmostEqual(row[-7], 0.0)
             self.assertAlmostEqual(row[-6], 0.0)
-            self.assertAlmostEqual(row[-5], 0.0)
-            self.assertAlmostEqual(row[-4], clan_cpu)
-            self.assertAlmostEqual(row[-3], float(main.round_gmt_2(clan_cpu * 0.8)))
+            self.assertAlmostEqual(row[-5], clan_cpu)
+            self.assertAlmostEqual(row[-4], float(main.round_gmt_2(clan_cpu * 0.8)))
+            self.assertEqual(row[-3], "")
             self.assertEqual(row[-2], "")
             self.assertEqual(row[-1], "")
             st.close()
@@ -1889,7 +1901,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 6,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
                 round_col_idx=6,
             )
             enq = main.enqueue_main_sheet_ops(
@@ -1976,7 +1988,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 6,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
                 round_col_idx=6,
             )
             enq = main.enqueue_main_sheet_ops(
@@ -2085,7 +2097,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 6,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
                 round_col_idx=6,
             )
             fake_round_api = FakeRoundAPI()
@@ -2238,6 +2250,7 @@ class SyncCoreTests(unittest.TestCase):
                     "league_id": 1,
                     "round_id": 10,
                     "gmt_fund": 100.0,
+                    "btc_fund": 1.25,
                     "blocks_mined": 25,
                     "gmt_per_block": 4.0,
                     "ended_at": "2026-04-18T10:01:00+00:00",
@@ -2257,11 +2270,13 @@ class SyncCoreTests(unittest.TestCase):
 
             completed = st.fetch_api_completed_rounds(1, since_round=0, limit=20)
             self.assertEqual([r["round_id"] for r in completed], [10])
+            self.assertAlmostEqual(completed[0]["btc_fund"], 1.25)
             latest_completed = st.fetch_latest_api_completed_round_id(1)
             self.assertEqual(latest_completed, 10)
             latest_any = st.fetch_latest_api_round_record(1)
             self.assertIsNotNone(latest_any)
             self.assertEqual(latest_any["round_id"], 11)
+            self.assertIsNone(latest_any["btc_fund"])
 
             marked = st.mark_api_round_ended(1, 11, "2026-04-18T10:06:00+00:00")
             self.assertEqual(marked, 1)
@@ -2749,7 +2764,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 6,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
                 round_col_idx=6,
             )
             enq = main.enqueue_main_sheet_ops(
@@ -3005,7 +3020,7 @@ class BackfillRoundGapTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + len(main.ABILITY_HEADER_ORDER) + 6,
+                expected_cols=len(main.BASE_HEADERS) + len(main.ABILITY_HEADER_ORDER) + 7,
                 round_col_idx=6,
             )
 
@@ -3059,7 +3074,7 @@ class BackfillRoundGapTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + len(main.ABILITY_HEADER_ORDER) + 6,
+                expected_cols=len(main.BASE_HEADERS) + len(main.ABILITY_HEADER_ORDER) + 7,
                 round_col_idx=6,
             )
             bumped = {"done": False}
@@ -3280,6 +3295,271 @@ class BackfillRoundGapTests(unittest.TestCase):
         self.assertEqual(ws.updates[0]["values"], rows)
         self.assertGreaterEqual(ws.row_count, 1000)
         self.assertGreaterEqual(ws.col_count, 26)
+
+    def test_eclipse_backfill_target_header_has_exact_main_shape(self) -> None:
+        header = backfill_eclipse_backfill.build_target_header()
+        self.assertEqual(len(header), 33)
+        self.assertEqual(header[: len(main.BASE_HEADERS)], main.BASE_HEADERS)
+        self.assertEqual(header[12:26], main.ABILITY_HEADER_ORDER)
+        self.assertEqual(header[-7:], [
+            main.POWER_UP_PRICE_HEADER,
+            main.POWER_UP_PRICE_SENTINEL_HEADER,
+            main.CLAN_POWER_UP_PRICE_HEADER,
+            main.CLAN_POWER_UP_PRICE_SENTINEL_HEADER,
+            main.MISSING_HEADER,
+            main.EXCLUDED_USER_BOOST_AUDIT_HEADER,
+            main.BTC_FUND_HEADER,
+        ])
+
+    def test_eclipse_backfill_filter_records_for_target(self) -> None:
+        records = [
+            {"league_id": 3, "round_id": 924320, "ended_at": "2026-04-08T23:59:59Z"},
+            {"league_id": 3, "round_id": 924321, "ended_at": "2026-04-09T00:00:00Z"},
+            {"league_id": 1, "round_id": 924322, "ended_at": "2026-04-09T00:01:00Z"},
+            {"league_id": 3, "round_id": 924323, "ended_at": ""},
+        ]
+        accepted, stats = backfill_eclipse_backfill.filter_records_for_target(
+            records,
+            league_id=3,
+            start_ended_at="2026-04-09T00:00:00Z",
+        )
+        self.assertEqual([r["round_id"] for r in accepted], [924321])
+        self.assertEqual(stats["accepted"], 1)
+        self.assertEqual(stats["before_start"], 1)
+        self.assertEqual(stats["wrong_league"], 1)
+        self.assertEqual(stats["missing_ended_at"], 1)
+
+    def test_eclipse_backfill_ensure_target_sheet_dry_run_does_not_write(self) -> None:
+        class FakeWS:
+            id = 1178175974
+            title = "Eclipse-backfill"
+            row_count = 10
+            col_count = 10
+
+            def add_rows(self, _n: int) -> None:
+                raise AssertionError("add_rows must not be called in dry-run")
+
+            def add_cols(self, _n: int) -> None:
+                raise AssertionError("add_cols must not be called in dry-run")
+
+            def batch_update(self, _updates: List[Dict[str, Any]], value_input_option: str = "RAW") -> None:
+                _ = value_input_option
+                raise AssertionError("batch_update must not be called in dry-run")
+
+            def batch_clear(self, _ranges: List[str]) -> None:
+                raise AssertionError("batch_clear must not be called in dry-run")
+
+            def col_values(self, _index: int) -> List[str]:
+                return [""] * 3 + ["924321"]
+
+        class FakeSpreadsheet:
+            def worksheets(self) -> List[FakeWS]:
+                return [FakeWS()]
+
+        setup = backfill_eclipse_backfill.ensure_target_sheet_context(
+            sh=FakeSpreadsheet(),
+            target_title="Eclipse-backfill",
+            league_id=3,
+            header=backfill_eclipse_backfill.build_target_header(),
+            write_limiter=main.TokenBucket(9999, name="test_write"),
+            read_limiter=main.TokenBucket(9999, name="test_read"),
+            execute=False,
+            reset_target=True,
+        )
+        self.assertFalse(setup.wrote_layout)
+        self.assertFalse(setup.reset_rows)
+        self.assertEqual(setup.ctx.ws_id, 1178175974)
+        self.assertEqual(setup.existing_rounds, 1)
+
+    def test_eclipse_backfill_ensure_target_sheet_execute_writes_marker_to_d1(self) -> None:
+        class FakeWS:
+            def __init__(self) -> None:
+                self.id = 1178175974
+                self.title = "Eclipse-backfill"
+                self.row_count = 10
+                self.col_count = 10
+                self.batch_updates: List[List[Dict[str, Any]]] = []
+
+            def add_rows(self, n: int) -> None:
+                self.row_count += int(n)
+
+            def add_cols(self, n: int) -> None:
+                self.col_count += int(n)
+
+            def batch_update(self, updates: List[Dict[str, Any]], value_input_option: str = "RAW") -> None:
+                _ = value_input_option
+                self.batch_updates.append(list(updates))
+
+            def col_values(self, _index: int) -> List[str]:
+                return [""] * 3
+
+        class FakeSpreadsheet:
+            def __init__(self, ws: FakeWS) -> None:
+                self._ws = ws
+
+            def worksheets(self) -> List[FakeWS]:
+                return [self._ws]
+
+        ws = FakeWS()
+        setup = backfill_eclipse_backfill.ensure_target_sheet_context(
+            sh=FakeSpreadsheet(ws),
+            target_title="Eclipse-backfill",
+            league_id=3,
+            header=backfill_eclipse_backfill.build_target_header(),
+            write_limiter=main.TokenBucket(9999, name="test_write"),
+            read_limiter=main.TokenBucket(9999, name="test_read"),
+            execute=True,
+            reset_target=False,
+        )
+        self.assertTrue(setup.wrote_layout)
+        self.assertTrue(ws.batch_updates)
+        first_update = ws.batch_updates[0]
+        by_range = {item["range"]: item["values"][0][0] for item in first_update}
+        self.assertEqual(by_range["A1"], "")
+        self.assertEqual(by_range["B1"], "")
+        self.assertEqual(by_range["D1"], main.MAIN_SHEET_MARKER)
+        self.assertEqual(by_range["E1"], 3)
+
+    def test_eclipse_backfill_prepare_target_state_sets_cutover(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "state.sqlite")
+            st = main.StateStore(path)
+            try:
+                ctx = main.SheetContext(
+                    ws_id=1178175974,
+                    title="Eclipse-backfill",
+                    ws=None,
+                    league_id=3,
+                    expected_cols=32,
+                    round_col_idx=6,
+                )
+                stats = backfill_eclipse_backfill.prepare_target_state(
+                    state=st,
+                    ctx=ctx,
+                    from_round=924321,
+                    to_round=975502,
+                    execute=True,
+                    reset_target=True,
+                    read_limiter=None,
+                )
+                sheet_state = st.get_sheet_state(ctx.ws_id) or {}
+                self.assertTrue(stats["executed"])
+                self.assertEqual(stats["cutover_round"], 924320)
+                self.assertEqual(main.safe_int(sheet_state.get("last_synced_round")), 924320)
+                self.assertEqual(main.safe_int(sheet_state.get("price_cutover_round")), 924320)
+            finally:
+                st.close()
+
+    def test_eclipse_backfill_prepare_target_state_recovers_existing_rows(self) -> None:
+        class FakeWS:
+            def col_values(self, _index: int) -> List[str]:
+                return ["", "", "", "924321", "", "924330"]
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "state.sqlite")
+            st = main.StateStore(path)
+            try:
+                ctx = main.SheetContext(
+                    ws_id=1178175974,
+                    title="Eclipse-backfill",
+                    ws=FakeWS(),
+                    league_id=3,
+                    expected_cols=32,
+                    round_col_idx=6,
+                )
+                st.upsert_row_map(ctx.ws_id, 924321, 99, "stale", 1)
+                stats = backfill_eclipse_backfill.prepare_target_state(
+                    state=st,
+                    ctx=ctx,
+                    from_round=924321,
+                    to_round=975502,
+                    execute=True,
+                    reset_target=False,
+                    read_limiter=main.TokenBucket(9999, name="test_read"),
+                )
+                row_map = st.get_round_row_map_bulk(ctx.ws_id, [924321, 924330])
+                self.assertEqual(stats["row_map_deleted"], 1)
+                self.assertEqual(stats["row_map_synced"], 2)
+                self.assertEqual(row_map[924321]["row_idx"], 4)
+                self.assertEqual(row_map[924321]["checksum"], "")
+                self.assertEqual(row_map[924330]["row_idx"], 6)
+            finally:
+                st.close()
+
+    def test_eclipse_backfill_existing_round_enqueues_update_not_append(self) -> None:
+        class FakeWS:
+            def col_values(self, _index: int) -> List[str]:
+                return ["", "", "", "924321"]
+
+        rec = {
+            "snapshot_ts": "2026-04-09T00:11:50+00:00",
+            "league_id": 3,
+            "round_id": 924321,
+            "block_number": 944265,
+            "multiplier": 1.0,
+            "gmt_fund": 3725.007,
+            "gmt_per_block": 6.569677249,
+            "league_th": 151390.2497,
+            "ended_at": "2026-04-09T00:09:45+00:00",
+            "round_duration_sec": 29,
+            "blocks_mined": 567,
+            "efficiency_league": 20.1952556,
+        }
+
+        class FakeRoundAPI:
+            def fetch_round_ability_counts(
+                self,
+                round_id: int,
+                expected_league_id: int | None = None,
+                progress_hook: Any | None = None,
+            ) -> Dict[str, int] | None:
+                _ = (round_id, expected_league_id, progress_hook)
+                return {main.POWER_UP_ABILITY_ID: 1}
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "state.sqlite")
+            st = main.StateStore(path)
+            try:
+                ctx = main.SheetContext(
+                    ws_id=1178175974,
+                    title="Eclipse-backfill",
+                    ws=FakeWS(),
+                    league_id=3,
+                    expected_cols=len(backfill_eclipse_backfill.build_target_header()),
+                    round_col_idx=6,
+                )
+                st.upsert_sheet_meta(ctx.ws_id, ctx.title, ctx.league_id)
+                st.set_last_synced_round(ctx.ws_id, 924321)
+                st.set_price_cutover_round(ctx.ws_id, 924320)
+                SyncCoreTests._seed_api_rounds(st, [rec])
+
+                backfill_eclipse_backfill.prepare_target_state(
+                    state=st,
+                    ctx=ctx,
+                    from_round=924321,
+                    to_round=924321,
+                    execute=True,
+                    reset_target=False,
+                    read_limiter=main.TokenBucket(9999, name="test_read"),
+                )
+
+                enq = main.enqueue_main_sheet_ops(
+                    None,
+                    st,
+                    {ctx.ws_id: ctx},
+                    main.build_ability_id_to_header(main.ABILITY_DIM_STATIC),
+                    list(main.ABILITY_HEADER_ORDER),
+                    FakeRoundAPI(),  # type: ignore[arg-type]
+                    read_limiter=main.TokenBucket(9999, name="test_read_2"),
+                    power_up_clan_api=None,
+                )
+                self.assertEqual(enq, 1)
+                due = st.fetch_due_ops(limit=10)
+                self.assertEqual(len(due), 1)
+                self.assertEqual(due[0]["op_type"], "update_round")
+                self.assertEqual(due[0]["round_id"], 924321)
+            finally:
+                st.close()
 
 
 if __name__ == "__main__":
