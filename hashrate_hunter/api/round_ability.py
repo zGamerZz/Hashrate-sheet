@@ -245,8 +245,7 @@ class GoMiningRoundAbilityApiClient:
         winner_user_id: Optional[int] = None
         round_multiplier: Optional[float] = None
         tracked_users_by_ability: Dict[str, Dict[Tuple[int, Optional[int]], Dict[str, Any]]] = {
-            POWER_UP_ABILITY_ID: {},
-            CLAN_POWER_UP_ABILITY_ID: {},
+            str(ability_id): {} for ability_id, _ability_name, _sort_order in ABILITY_DIM_STATIC
         }
 
         while True:
@@ -297,7 +296,9 @@ class GoMiningRoundAbilityApiClient:
                     log_warn("gomining_api.round_user_count_invalid", round_id=rid, count=data.get("count"), skip=skip)
                     return None
                 if total_count == 0:
-                    self.round_ability_users_cache[rid] = {POWER_UP_ABILITY_ID: [], CLAN_POWER_UP_ABILITY_ID: []}
+                    self.round_ability_users_cache[rid] = {
+                        str(ability_id): [] for ability_id, _ability_name, _sort_order in ABILITY_DIM_STATIC
+                    }
                     self.round_counts_cache[rid] = {}
                     self.round_excluded_user_boosts_cache[rid] = {}
                     self.round_tracked_user_blocks_mined_cache[rid] = None

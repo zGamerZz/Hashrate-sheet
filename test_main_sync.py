@@ -660,6 +660,44 @@ class SyncCoreTests(unittest.TestCase):
         self.assertFalse(main.has_sentinel_alias_discount("regular alias"))
         self.assertFalse(main.has_sentinel_alias_discount(None))
 
+    def test_build_odyssey_sentinel_boost_rows_counts_actual_boost_uses(self) -> None:
+        rec = {
+            "snapshot_ts": "2026-04-20T10:00:00+00:00",
+            "league_id": 1,
+            "round_id": 901204,
+            "ended_at": "2026-04-20T10:01:00+00:00",
+        }
+        rows = main.build_odyssey_sentinel_boost_rows(
+            rec,
+            ["Rocket (x1)", "Echo Boost (x1)", "Focus Boost (x1)"],
+            {
+                "Rocket (x1)": "rocket-aid",
+                "Echo Boost (x1)": "echo-aid",
+                "Focus Boost (x1)": "focus-aid",
+            },
+            {"Rocket (x1)": 5, "Echo Boost (x1)": 1, "Focus Boost (x1)": 1},
+            {
+                "Rocket (x1)": [
+                    {"user_id": 1, "count": 3, "avatar_url": "https://x/gominers_256.jpeg", "alias": "alpha"},
+                    {"user_id": 2, "count": 2, "avatar_url": "https://x/gominers_123.jpeg", "alias": "beta"},
+                ],
+                "Echo Boost (x1)": [
+                    {"user_id": 3, "count": 1, "avatar_url": "", "alias": "\U0001F5B2 gamma"},
+                ],
+                "Focus Boost (x1)": [
+                    {"user_id": 4, "count": 1, "avatar_url": "https://x/gominers_123.jpeg", "alias": "delta"},
+                ],
+            },
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0][4], "Rocket (x1)")
+        self.assertEqual(rows[0][6], 5)
+        self.assertEqual(rows[0][7], 3)
+        self.assertEqual(rows[0][8], "alpha=3")
+        self.assertEqual(rows[1][4], "Echo Boost (x1)")
+        self.assertEqual(rows[1][7], 1)
+        self.assertEqual(rows[1][8], "\U0001F5B2 gamma=1")
+
     def test_calc_power_up_gmt_pair_from_power_up_users_api_applies_sentinel_discount(self) -> None:
         class StubClanApi:
             def fetch_user_power_ee_for_clans(self, clan_ids: List[int]) -> tuple[dict[tuple[int, int], tuple[float, float]], dict[int, tuple[float, float]]]:
@@ -1218,6 +1256,57 @@ class SyncCoreTests(unittest.TestCase):
         self.assertEqual(len(power_up_users), 1)
         self.assertEqual(power_up_users[0]["count"], 1)
         self.assertEqual(power_up_users[0]["alias"], "\U0001F5B2 user")
+
+    def test_round_ability_api_caches_users_for_all_known_boosts(self) -> None:
+        rocket_id = "3f735c47-cead-4d15-8dad-7db4a7b3f4e7"
+        echo_id = "646d3c76-fe06-414f-8d39-eb0aa7da429a"
+        focus_id = "592724c5-1f59-43b2-af13-2de8d2c97a9d"
+
+        class FakeResponse:
+            def __init__(self, status_code: int, body: Dict[str, Any]) -> None:
+                self.status_code = status_code
+                self._body = body
+                self.text = json.dumps(body)
+                self.headers: Dict[str, str] = {}
+
+            def json(self) -> Dict[str, Any]:
+                return self._body
+
+        class FakeSession:
+            def post(self, url: str, headers: Dict[str, str], json: Dict[str, Any], timeout: int) -> FakeResponse:
+                _ = (url, headers, timeout)
+                participants = [
+                    {
+                        "user": {"id": 123, "avatar": "https://x/gominers_250.jpeg", "alias": "alpha"},
+                        "clan": {"id": 987},
+                        "usedAbilities": [
+                            {"nftGameAbilityId": rocket_id, "count": 2},
+                            {"nftGameAbilityId": echo_id, "count": 3},
+                            {"nftGameAbilityId": focus_id, "count": 4},
+                        ],
+                    }
+                ]
+                body = {"data": {"count": 1, "roundId": 901208, "leagueId": 1, "participants": participants}}
+                return FakeResponse(200, body)
+
+        client = main.GoMiningRoundAbilityApiClient(
+            bearer_token="x",
+            limiter=main.TokenBucket(9999, name="test"),
+            page_limit=50,
+            timeout_seconds=5,
+            max_retries=1,
+        )
+        client.session = FakeSession()  # type: ignore[assignment]
+
+        counts = client.fetch_round_ability_counts(901208, expected_league_id=1)
+        self.assertIsNotNone(counts)
+        assert counts is not None
+        self.assertEqual(counts.get(rocket_id), 2)
+        self.assertEqual(counts.get(echo_id), 3)
+        self.assertEqual(counts.get(focus_id), 4)
+        self.assertEqual(client.get_cached_ability_users_for_round(901208, rocket_id)[0]["count"], 2)
+        self.assertEqual(client.get_cached_ability_users_for_round(901208, echo_id)[0]["count"], 3)
+        self.assertEqual(client.get_cached_ability_users_for_round(901208, focus_id)[0]["count"], 4)
 
     def test_round_ability_api_excludes_configured_user_and_tracks_audit(self) -> None:
         class FakeResponse:
@@ -3468,6 +3557,143 @@ class BackfillRoundGapTests(unittest.TestCase):
         self.assertEqual(ws.updates[0]["values"], rows)
         self.assertGreaterEqual(ws.row_count, 1000)
         self.assertGreaterEqual(ws.col_count, 26)
+
+    def test_refresh_sheet_contexts_detects_odyssey_sentinel_and_infers_league(self) -> None:
+        class FakeCell:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+        class FakeWS:
+            def __init__(self, ws_id: int, title: str, a1: str, b1: str) -> None:
+                self.id = ws_id
+                self.title = title
+                self._a1 = a1
+                self._b1 = b1
+                self.batch_updates: List[List[Dict[str, Any]]] = []
+
+            def acell(self, cell: str) -> FakeCell:
+                return FakeCell(self._a1 if cell == "A1" else self._b1)
+
+            def row_values(self, row: int) -> List[str]:
+                _ = row
+                return []
+
+            def col_values(self, index: int) -> List[str]:
+                _ = index
+                return [""] * 3
+
+            def batch_update(self, updates: List[Dict[str, Any]], value_input_option: str = "RAW") -> None:
+                _ = value_input_option
+                self.batch_updates.append(list(updates))
+
+        class FakeSpreadsheet:
+            def __init__(self, worksheets: List[FakeWS]) -> None:
+                self._worksheets = worksheets
+
+            def worksheets(self) -> List[FakeWS]:
+                return self._worksheets
+
+        odyssey = FakeWS(1, "Odyssey", main.MAIN_SHEET_MARKER, "1")
+        sentinel = FakeWS(2, main.ODYSSEY_SENTINEL_SHEET_TITLE, "", "")
+        with tempfile.TemporaryDirectory() as td:
+            st = main.StateStore(os.path.join(td, "state.sqlite"))
+            try:
+                main_contexts, _clan_contexts, sentinel_contexts = main.refresh_sheet_contexts(
+                    FakeSpreadsheet([odyssey, sentinel]),
+                    st,
+                    main.BASE_HEADERS + list(main.ABILITY_HEADER_ORDER),
+                    list(main.CLAN_HEADERS),
+                    main.TokenBucket(9999, name="write"),
+                    main.TokenBucket(9999, name="read"),
+                    enable_clan_sync=False,
+                    odyssey_sentinel_header=list(main.ODYSSEY_SENTINEL_HEADERS),
+                    return_odyssey_sentinel=True,
+                )
+                self.assertEqual(len(main_contexts), 1)
+                self.assertEqual(len(sentinel_contexts), 1)
+                ctx = sentinel_contexts[2]
+                self.assertEqual(ctx.league_id, 1)
+                self.assertEqual(ctx.kind, "odyssey_sentinel")
+                self.assertTrue(sentinel.batch_updates)
+                by_range = {item["range"]: item["values"][0][0] for item in sentinel.batch_updates[0]}
+                self.assertEqual(by_range["A1"], main.ODYSSEY_SENTINEL_SHEET_MARKER)
+                self.assertEqual(by_range["B1"], 1)
+                self.assertEqual(sentinel.batch_updates[0][2]["values"][0], main.ODYSSEY_SENTINEL_HEADERS)
+            finally:
+                st.close()
+
+    def test_enqueue_odyssey_sentinel_sheet_ops_enqueues_only_hit_rounds(self) -> None:
+        rocket_id = "3f735c47-cead-4d15-8dad-7db4a7b3f4e7"
+        echo_id = "646d3c76-fe06-414f-8d39-eb0aa7da429a"
+
+        class FakeRoundAPI:
+            def fetch_round_ability_counts(
+                self,
+                round_id: int,
+                expected_league_id: int | None = None,
+                progress_hook: Any | None = None,
+            ) -> Dict[str, int] | None:
+                _ = (expected_league_id, progress_hook)
+                if round_id == 101:
+                    return {rocket_id: 5, echo_id: 1}
+                if round_id == 102:
+                    return {rocket_id: 2}
+                return {}
+
+            def get_cached_ability_users_for_round(self, round_id: int, ability_id: str) -> List[Dict[str, Any]]:
+                if round_id == 101 and ability_id == rocket_id:
+                    return [
+                        {"user_id": 1, "count": 3, "avatar_url": "https://x/gominers_250.jpeg", "alias": "alpha"},
+                        {"user_id": 2, "count": 2, "avatar_url": "https://x/gominers_123.jpeg", "alias": "beta"},
+                    ]
+                if round_id == 101 and ability_id == echo_id:
+                    return [{"user_id": 3, "count": 1, "avatar_url": "", "alias": "\U0001F5B2 gamma"}]
+                if round_id == 102 and ability_id == rocket_id:
+                    return [{"user_id": 4, "count": 2, "avatar_url": "https://x/gominers_123.jpeg", "alias": "delta"}]
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            st = main.StateStore(os.path.join(td, "state.sqlite"))
+            try:
+                ctx = main.SheetContext(
+                    ws_id=222,
+                    title=main.ODYSSEY_SENTINEL_SHEET_TITLE,
+                    ws=None,
+                    league_id=1,
+                    kind="odyssey_sentinel",
+                    expected_cols=len(main.ODYSSEY_SENTINEL_HEADERS),
+                    round_col_idx=2,
+                )
+                st.upsert_sheet_meta(ctx.ws_id, ctx.title, ctx.league_id)
+                st.set_last_synced_round(ctx.ws_id, 100)
+                SyncCoreTests._seed_api_rounds(
+                    st,
+                    [
+                        {"league_id": 1, "round_id": 101, "snapshot_ts": "2026-04-20T10:00:00+00:00", "ended_at": "2026-04-20T10:01:00+00:00"},
+                        {"league_id": 1, "round_id": 102, "snapshot_ts": "2026-04-20T10:02:00+00:00", "ended_at": "2026-04-20T10:03:00+00:00"},
+                    ],
+                )
+                enq = main.enqueue_odyssey_sentinel_sheet_ops(
+                    None,
+                    st,
+                    {ctx.ws_id: ctx},
+                    main.build_ability_id_to_header(main.ABILITY_DIM_STATIC),
+                    list(main.ABILITY_HEADER_ORDER),
+                    FakeRoundAPI(),  # type: ignore[arg-type]
+                )
+                self.assertEqual(enq, 1)
+                self.assertEqual(st.get_last_synced_round(ctx.ws_id), 102)
+                due = st.fetch_due_ops(limit=10)
+                self.assertEqual(len(due), 1)
+                self.assertEqual(due[0]["op_type"], "append_odyssey_sentinel_round")
+                payload = json.loads(due[0]["payload_json"])
+                self.assertEqual(len(payload["rows"]), 2)
+                self.assertEqual(payload["rows"][0][4], "Rocket (x1)")
+                self.assertEqual(payload["rows"][0][7], 3)
+                self.assertEqual(payload["rows"][1][4], "Echo Boost (x1)")
+                self.assertEqual(payload["rows"][1][7], 1)
+            finally:
+                st.close()
 
     def test_eclipse_backfill_target_header_has_exact_main_shape(self) -> None:
         header = backfill_eclipse_backfill.build_target_header()

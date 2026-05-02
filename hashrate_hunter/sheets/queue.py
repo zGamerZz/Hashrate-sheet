@@ -443,6 +443,98 @@ def flush_sheet_queue_with_rate_limit(state: StateStore, contexts: Dict[int, She
                     err=repr(e),
                 )
 
+        elif op_type == "append_odyssey_sentinel_round":
+            i += 1
+            ws_id = int(op["sheet_id"])
+            ctx = contexts.get(ws_id)
+            if not ctx:
+                _handle_missing_sheet_op(state, op, retry_after=30.0)
+                continue
+            try:
+                payload = json.loads(str(op["payload_json"]))
+                rid = int(op["round_id"])
+                rows_payload = payload.get("rows")
+                if not isinstance(rows_payload, list) or not rows_payload:
+                    log_warn("queue.odyssey_sentinel_append_drop_invalid_payload", sheet=ctx.title, op_id=op["id"], round_id=rid)
+                    state.delete_op(int(op["id"]))
+                    continue
+                rows: List[List[Any]] = []
+                for row in rows_payload:
+                    norm = _normalize_payload_row(
+                        row,
+                        ctx.expected_cols,
+                        rid,
+                        round_col_idx=ctx.round_col_idx,
+                    )
+                    if norm is None:
+                        rows = []
+                        break
+                    rows.append(norm)
+                if not rows:
+                    log_warn("queue.odyssey_sentinel_append_drop_invalid_rows", sheet=ctx.title, op_id=op["id"], round_id=rid)
+                    state.delete_op(int(op["id"]))
+                    continue
+                if DRY_RUN:
+                    log_info("queue.odyssey_sentinel_append_dry_skip", sheet=ctx.title, round_id=rid, rows=len(rows))
+                    continue
+
+                start_row = max(LOG_START_ROW, ctx.next_row)
+                end_row = start_row + len(rows) - 1
+                if not _ensure_sheet_row_capacity(ctx, end_row, write_limiter):
+                    _reschedule(state, int(op["id"]), int(op["retry_count"]) + 1, retry_after=30.0)
+                    log_warn(
+                        "queue.odyssey_sentinel_append_capacity_pending",
+                        sheet=ctx.title,
+                        ws_id=ws_id,
+                        round_id=rid,
+                        required_last_row=end_row,
+                        rows=len(rows),
+                    )
+                    continue
+
+                write_limiter.wait_for_token(1)
+                ctx.ws.update(range_name=f"A{start_row}", values=rows, value_input_option="RAW")
+                state.upsert_row_map(ws_id, rid, start_row, str(op["checksum"]), 1)
+                state.set_last_synced_round(ws_id, rid)
+                state.delete_op(int(op["id"]))
+                ctx.next_row = end_row + 1
+                state.prune_row_map(ws_id, ROW_MAP_KEEP_PER_SHEET)
+                processed += 1
+                log_info(
+                    "queue.odyssey_sentinel_append_applied",
+                    sheet=ctx.title,
+                    round_id=rid,
+                    rows=len(rows),
+                    start_row=start_row,
+                    end_row=end_row,
+                    next_row=ctx.next_row,
+                )
+            except Exception as e:
+                retryable, retry_after, status = classify_sheet_error(e)
+                op_id = int(op["id"])
+                next_retry = int(op["retry_count"]) + 1
+                if DROP_NON_RETRYABLE_SHEET_ERRORS and not retryable:
+                    log_warn(
+                        "queue.odyssey_sentinel_append_drop_non_retryable",
+                        sheet=ctx.title,
+                        ws_id=ws_id,
+                        op_id=op_id,
+                        round_id=op.get("round_id"),
+                        status=status,
+                        err=repr(e),
+                    )
+                    state.delete_op(op_id)
+                else:
+                    _reschedule(state, op_id, next_retry, retry_after)
+                log_warn(
+                    "queue.odyssey_sentinel_append_failed",
+                    sheet=ctx.title,
+                    op_id=op_id,
+                    status=status,
+                    retryable=retryable,
+                    err=repr(e),
+                )
+
         else:
             i += 1
             log_warn("queue.unknown_op_dropped", op_type=op_type, op_id=op["id"])

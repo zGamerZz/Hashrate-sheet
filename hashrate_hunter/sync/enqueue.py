@@ -29,7 +29,7 @@ from ..domain.pricing import (
     calc_clan_power_up_gmt_pair_from_boost_users_api,
     calc_power_up_gmt_triplet_from_power_up_users_api,
 )
-from ..domain.rows import build_canonical_row, build_clan_round_rows
+from ..domain.rows import build_canonical_row, build_clan_round_rows, build_odyssey_sentinel_boost_rows
 from ..logging_utils import log_debug, log_info, log_warn
 from ..runtime.rate_limit import TokenBucket
 from ..sheets.context import SheetContext
@@ -844,6 +844,182 @@ def enqueue_clan_sheet_ops(
             if DEBUG_VERBOSE:
                 log_debug(
                     "sync.clan_round_enqueued_append",
+                    sheet=ctx.title,
+                    round_id=rid,
+                    rows=len(rows),
+                    checksum=checksum[:12],
+                    row_preview=rows[0][:8] if rows else [],
+                )
+
+    return enqueued
+
+def enqueue_odyssey_sentinel_sheet_ops(
+    db: Optional[DBClient],
+    state: StateStore,
+    odyssey_sentinel_contexts: Dict[int, SheetContext],
+    ability_id_to_name: Dict[str, str],
+    ability_headers: List[str],
+    round_ability_api: GoMiningRoundAbilityApiClient,
+    flush_tick: Optional[Callable[[], int]] = None,
+    flush_every_seconds: float = ENQUEUE_FLUSH_EVERY_SECONDS,
+) -> int:
+    enqueued = 0
+    ability_name_to_ids: Dict[str, List[str]] = {}
+    for ability_id, ability_name in ability_id_to_name.items():
+        ability_name_to_ids.setdefault(ability_name, []).append(ability_id)
+    ability_name_to_id = {
+        name: ",".join(sorted(ids))
+        for name, ids in ability_name_to_ids.items()
+    }
+
+    for ws_id, ctx in odyssey_sentinel_contexts.items():
+        last_flush_monotonic = time.monotonic() - max(0.0, flush_every_seconds)
+
+        def _progress_tick(round_id: Optional[int]) -> None:
+            nonlocal last_flush_monotonic
+            last_flush_monotonic = _maybe_flush_during_enqueue(
+                flush_tick,
+                last_flush_monotonic,
+                flush_every_seconds,
+                scope="odyssey_sentinel",
+                sheet=ctx.title,
+                round_id=round_id,
+            )
+
+        state.upsert_sheet_meta(ws_id, ctx.title, ctx.league_id, layout_sig=None)
+        last_synced = state.get_last_synced_round(ws_id)
+
+        if last_synced is None:
+            cutover = fetch_latest_completed_round_id_prefer_api(db, state, ctx.league_id)
+            if cutover is None:
+                cutover = 0
+            state.set_last_synced_round(ws_id, cutover)
+            log_info(
+                "sync.odyssey_sentinel_init_cutover",
+                sheet=ctx.title,
+                league_id=ctx.league_id,
+                cutover_round=cutover,
+            )
+            continue
+
+        rounds = fetch_completed_rounds_prefer_api(
+            db,
+            state,
+            ctx.league_id,
+            max(0, last_synced),
+            MAX_ROUNDS_PER_POLL,
+        )
+        if DEBUG_VERBOSE:
+            log_debug(
+                "sync.odyssey_sentinel_sheet_poll",
+                sheet=ctx.title,
+                ws_id=ws_id,
+                league_id=ctx.league_id,
+                last_synced=last_synced,
+                fetched_rounds=len(rounds),
+            )
+        if not rounds:
+            continue
+
+        rounds_sorted = sorted(rounds, key=lambda r: safe_int(r.get("round_id")) or -1)
+        round_ids = [safe_int(r.get("round_id")) for r in rounds_sorted]
+        round_ids = [x for x in round_ids if x is not None]
+        row_maps = state.get_round_row_map_bulk(ws_id, round_ids)
+
+        for rec in rounds_sorted:
+            rid = safe_int(rec.get("round_id"))
+            if rid is None or rid <= last_synced:
+                continue
+            _progress_tick(rid)
+            latest_last_synced = state.get_last_synced_round(ws_id)
+            if latest_last_synced is not None and latest_last_synced > last_synced:
+                last_synced = latest_last_synced
+            if rid <= last_synced:
+                continue
+            mapped = row_maps.get(rid)
+            if mapped is None:
+                fresh_map = state.get_round_row_map_bulk(ws_id, [rid]).get(rid)
+                if fresh_map is not None:
+                    mapped = fresh_map
+                    row_maps[rid] = fresh_map
+            if mapped is not None:
+                if DEBUG_VERBOSE:
+                    log_debug(
+                        "sync.odyssey_sentinel_round_skip_existing",
+                        sheet=ctx.title,
+                        round_id=rid,
+                        row_idx=mapped.get("row_idx"),
+                    )
+                continue
+
+            counts_by_id = round_ability_api.fetch_round_ability_counts(
+                rid,
+                expected_league_id=ctx.league_id,
+                progress_hook=lambda rid=rid: _progress_tick(rid),
+            )
+            if counts_by_id is None:
+                log_warn(
+                    "sync.odyssey_sentinel_abilities_unavailable",
+                    sheet=ctx.title,
+                    league_id=ctx.league_id,
+                    round_id=rid,
+                )
+                break
+
+            counts_by_name: Dict[str, int] = {}
+            for ability_id, cnt in counts_by_id.items():
+                header_name = ability_id_to_name.get(str(ability_id or "").strip())
+                if not header_name:
+                    continue
+                counts_by_name[header_name] = counts_by_name.get(header_name, 0) + int(cnt)
+
+            users_by_name: Dict[str, List[Dict[str, Any]]] = {}
+            get_cached_users = getattr(round_ability_api, "get_cached_ability_users_for_round", None)
+            if callable(get_cached_users):
+                for ability_id, header_name in ability_id_to_name.items():
+                    try:
+                        cached_users = get_cached_users(rid, ability_id)
+                    except Exception as e:
+                        cached_users = []
+                        log_warn(
+                            "sync.odyssey_sentinel_users_cache_read_failed",
+                            sheet=ctx.title,
+                            league_id=ctx.league_id,
+                            round_id=rid,
+                            ability_id=ability_id,
+                            err=repr(e),
+                        )
+                    if isinstance(cached_users, list) and cached_users:
+                        users_by_name.setdefault(header_name, []).extend(
+                            [u for u in cached_users if isinstance(u, dict)]
+                        )
+
+            rows = build_odyssey_sentinel_boost_rows(
+                rec,
+                ability_headers,
+                ability_name_to_id,
+                counts_by_name,
+                users_by_name,
+            )
+            if not rows:
+                state.set_last_synced_round(ws_id, rid)
+                last_synced = rid
+                if DEBUG_VERBOSE:
+                    log_debug("sync.odyssey_sentinel_round_no_hits", sheet=ctx.title, round_id=rid)
+                continue
+
+            checksum = row_checksum(rows)  # type: ignore[arg-type]
+            state.enqueue_op(
+                ws_id,
+                "append_odyssey_sentinel_round",
+                rid,
+                checksum,
+                {"rows": rows, "finalized": 1},
+            )
+            enqueued += 1
+            if DEBUG_VERBOSE:
+                log_debug(
+                    "sync.odyssey_sentinel_round_enqueued_append",
                     sheet=ctx.title,
                     round_id=rid,
                     rows=len(rows),

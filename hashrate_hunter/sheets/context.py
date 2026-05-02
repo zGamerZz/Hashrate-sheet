@@ -63,6 +63,8 @@ def _normalize_sheet_marker(raw: Any) -> str:
         return MAIN_SHEET_MARKER
     if s == CLAN_SHEET_MARKER.lower() or s == f"{CLAN_SHEET_MARKER.lower()}_shield":
         return CLAN_SHEET_MARKER
+    if s == ODYSSEY_SENTINEL_SHEET_MARKER.lower():
+        return ODYSSEY_SENTINEL_SHEET_MARKER
     return ""
 
 def _single_cell_from_values(v: Any) -> str:

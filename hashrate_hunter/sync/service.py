@@ -35,7 +35,7 @@ from ..sheets.queue import flush_sheet_queue_with_rate_limit, purge_stale_queue_
 from ..storage.legacy_db import _warn_db_deprecated
 from ..storage.state import StateStore
 from .cache import sync_api_round_cache
-from .enqueue import enqueue_clan_sheet_ops, enqueue_main_sheet_ops
+from .enqueue import enqueue_clan_sheet_ops, enqueue_main_sheet_ops, enqueue_odyssey_sentinel_sheet_ops
 from .reconcile import log_main_sheet_summaries, run_reconcile_pass
 
 def main(once_reconcile: bool = False) -> None:
@@ -60,6 +60,7 @@ def main(once_reconcile: bool = False) -> None:
             TRACKED_USER_BLOCKS_MINED_HEADER,
         ]
         clan_expected_header = list(CLAN_HEADERS)
+        odyssey_sentinel_expected_header = list(ODYSSEY_SENTINEL_HEADERS)
 
         state = StateStore(STATE_DB_PATH)
         write_limiter = TokenBucket(GS_WRITE_REQ_PER_MIN, name="sheets_write")
@@ -121,7 +122,7 @@ def main(once_reconcile: bool = False) -> None:
         )
 
         sh = open_spreadsheet()
-        main_contexts, clan_contexts = refresh_sheet_contexts(
+        main_contexts, clan_contexts, odyssey_sentinel_contexts = refresh_sheet_contexts(
             sh,
             state,
             main_expected_header,
@@ -129,14 +130,20 @@ def main(once_reconcile: bool = False) -> None:
             write_limiter,
             read_limiter,
             enable_clan_sync=ENABLE_CLAN_SYNC,
+            odyssey_sentinel_header=odyssey_sentinel_expected_header,
+            return_odyssey_sentinel=True,
         )
-        contexts_all = {**main_contexts, **clan_contexts}
+        contexts_all = {**main_contexts, **clan_contexts, **odyssey_sentinel_contexts}
         purge_stale_queue_ops(state, contexts_all)
         if not ENABLE_CLAN_SYNC:
             purged_clan_ops = state.purge_ops_by_type(["append_clan_round"])
             if purged_clan_ops > 0:
                 log_info("queue.purged_clan_ops", deleted_ops=purged_clan_ops)
-        configured_league_ids = sorted({ctx.league_id for ctx in main_contexts.values()} | {ctx.league_id for ctx in clan_contexts.values()})
+        configured_league_ids = sorted(
+            {ctx.league_id for ctx in main_contexts.values()}
+            | {ctx.league_id for ctx in clan_contexts.values()}
+            | {ctx.league_id for ctx in odyssey_sentinel_contexts.values()}
+        )
         cached_written, cached_total = sync_api_round_cache(state, round_metrics_api, configured_league_ids)
         if cached_total > 0:
             log_info("sync.api_round_cache_seeded", leagues=len(configured_league_ids), seen=cached_total, written=cached_written)
@@ -147,6 +154,7 @@ def main(once_reconcile: bool = False) -> None:
             title=sh.title,
             active_main_tabs=len(main_contexts),
             active_clan_tabs=len(clan_contexts),
+            active_odyssey_sentinel_tabs=len(odyssey_sentinel_contexts),
         )
         log_info(
             "sync.config",
@@ -250,7 +258,7 @@ def main(once_reconcile: bool = False) -> None:
 
             if now - last_refresh >= SHEET_REFRESH_SECONDS:
                 sh = open_spreadsheet()
-                main_contexts, clan_contexts = refresh_sheet_contexts(
+                main_contexts, clan_contexts, odyssey_sentinel_contexts = refresh_sheet_contexts(
                     sh,
                     state,
                     main_expected_header,
@@ -258,8 +266,10 @@ def main(once_reconcile: bool = False) -> None:
                     write_limiter,
                     read_limiter,
                     enable_clan_sync=ENABLE_CLAN_SYNC,
+                    odyssey_sentinel_header=odyssey_sentinel_expected_header,
+                    return_odyssey_sentinel=True,
                 )
-                contexts_all = {**main_contexts, **clan_contexts}
+                contexts_all = {**main_contexts, **clan_contexts, **odyssey_sentinel_contexts}
                 purge_stale_queue_ops(state, contexts_all)
                 if not ENABLE_CLAN_SYNC:
                     purged_clan_ops = state.purge_ops_by_type(["append_clan_round"])
@@ -267,9 +277,15 @@ def main(once_reconcile: bool = False) -> None:
                         log_info("queue.purged_clan_ops", deleted_ops=purged_clan_ops)
                 configured_league_ids = sorted(
                     {ctx.league_id for ctx in main_contexts.values()} | {ctx.league_id for ctx in clan_contexts.values()}
+                    | {ctx.league_id for ctx in odyssey_sentinel_contexts.values()}
                 )
                 last_refresh = now
-                log_info("sync.sheet_refresh_done", active_main=len(main_contexts), active_clan=len(clan_contexts))
+                log_info(
+                    "sync.sheet_refresh_done",
+                    active_main=len(main_contexts),
+                    active_clan=len(clan_contexts),
+                    active_odyssey_sentinel=len(odyssey_sentinel_contexts),
+                )
 
             if now - last_league_api_poll >= LEAGUES_API_POLL_SECONDS:
                 cached_written, cached_total = sync_api_round_cache(state, round_metrics_api, configured_league_ids)
@@ -330,7 +346,17 @@ def main(once_reconcile: bool = False) -> None:
                         flush_tick=_flush_due_queue_tick,
                         flush_every_seconds=ENQUEUE_FLUSH_EVERY_SECONDS,
                     )
-                enq = enq_main + enq_clan
+                enq_odyssey_sentinel = enqueue_odyssey_sentinel_sheet_ops(
+                    None,
+                    state,
+                    odyssey_sentinel_contexts,
+                    ability_id_to_name,
+                    ability_headers,
+                    round_ability_api,
+                    flush_tick=_flush_due_queue_tick,
+                    flush_every_seconds=ENQUEUE_FLUSH_EVERY_SECONDS,
+                )
+                enq = enq_main + enq_clan + enq_odyssey_sentinel
                 last_poll = now
                 if enq > 0:
                     log_info(
@@ -338,6 +364,7 @@ def main(once_reconcile: bool = False) -> None:
                         count=enq,
                         main=enq_main,
                         clan=enq_clan,
+                        odyssey_sentinel=enq_odyssey_sentinel,
                         queue_total=state.queue_total_count(),
                         queue_due=state.queue_due_count(),
                     )
@@ -369,6 +396,7 @@ def main(once_reconcile: bool = False) -> None:
                     queue_due=due_q,
                     main_contexts=len(main_contexts),
                     clan_contexts=len(clan_contexts),
+                    odyssey_sentinel_contexts=len(odyssey_sentinel_contexts),
                     write_limiter=write_limiter.snapshot(),
                     read_limiter=read_limiter.snapshot(),
                     gomining_limiter=gomining_limiter.snapshot(),

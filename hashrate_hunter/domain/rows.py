@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import requests
 
 from ..config import BASE_HEADERS, CLAN_HEADERS, CLAN_POWER_UP_PRICE_HEADER, CLAN_POWER_UP_PRICE_SENTINEL_HEADER, EXCLUDED_USER_BOOST_AUDIT_HEADER, MISSING_HEADER, POWER_UP_PRICE_HEADER, POWER_UP_PRICE_SENTINEL_HEADER
+from .pricing import has_sentinel_user_discount
 from ..utils import safe_float, safe_int, to_iso_utc
 
 def _normalize_payload_row(row: Any, expected_cols: int, round_id: int, round_col_idx: Optional[int] = 6) -> Optional[List[Any]]:
@@ -145,3 +146,56 @@ def build_clan_round_rows(rec: Dict[str, Any], clan_rows: Sequence[Dict[str, Any
             ]
         )
     return out
+
+def build_odyssey_sentinel_boost_rows(
+    rec: Dict[str, Any],
+    ability_headers: Sequence[str],
+    ability_name_to_id: Dict[str, str],
+    counts_by_name: Dict[str, int],
+    users_by_ability_name: Dict[str, Sequence[Dict[str, Any]]],
+) -> List[List[Any]]:
+    timestamp_utc = to_iso_utc(rec.get("snapshot_ts")) or ""
+    ended_at_utc = to_iso_utc(rec.get("ended_at")) or ""
+    league_id = safe_int(rec.get("league_id")) or ""
+    round_id = safe_int(rec.get("round_id")) or ""
+    rows: List[List[Any]] = []
+    for boost_name in ability_headers:
+        total_count = safe_int(counts_by_name.get(boost_name)) or 0
+        if total_count <= 0:
+            continue
+        ability_id = str(ability_name_to_id.get(boost_name) or "")
+        sentinel_counts: Dict[str, int] = {}
+        sentinel_total = 0
+        for item in users_by_ability_name.get(boost_name, []) or []:
+            if not isinstance(item, dict):
+                continue
+            cnt = safe_int(item.get("count")) or 0
+            if cnt <= 0:
+                continue
+            avatar_url = str(item.get("avatar_url") or "")
+            alias = str(item.get("alias") or "").strip()
+            if not has_sentinel_user_discount(avatar_url, alias):
+                continue
+            uid = safe_int(item.get("user_id"))
+            key = alias or (str(uid) if uid is not None else "")
+            if not key:
+                key = "unknown"
+            sentinel_counts[key] = sentinel_counts.get(key, 0) + cnt
+            sentinel_total += cnt
+        if sentinel_total <= 0:
+            continue
+        sentinel_users = "; ".join(f"{name}={cnt}" for name, cnt in sorted(sentinel_counts.items()))
+        rows.append(
+            [
+                timestamp_utc,
+                league_id,
+                round_id,
+                ended_at_utc,
+                boost_name,
+                ability_id,
+                total_count,
+                sentinel_total,
+                sentinel_users,
+            ]
+        )
+    return rows

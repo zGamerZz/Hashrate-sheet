@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import requests
 
@@ -262,14 +262,23 @@ def refresh_sheet_contexts(
     write_limiter: TokenBucket,
     read_limiter: TokenBucket,
     enable_clan_sync: bool = ENABLE_CLAN_SYNC,
-) -> Tuple[Dict[int, SheetContext], Dict[int, SheetContext]]:
+    odyssey_sentinel_header: Optional[List[str]] = None,
+    return_odyssey_sentinel: bool = False,
+) -> Union[
+    Tuple[Dict[int, SheetContext], Dict[int, SheetContext]],
+    Tuple[Dict[int, SheetContext], Dict[int, SheetContext], Dict[int, SheetContext]],
+]:
     read_limiter.wait_for_token(1)
     worksheets = sh.worksheets()
     selectors = read_sheet_selectors(sh, worksheets, read_limiter)
     main_contexts: Dict[int, SheetContext] = {}
     clan_contexts: Dict[int, SheetContext] = {}
+    odyssey_sentinel_contexts: Dict[int, SheetContext] = {}
+    pending_odyssey_sentinel: List[Any] = []
     main_layout_sig = row_checksum(main_expected_header)
     clan_layout_sig = row_checksum(clan_expected_header)
+    odyssey_sentinel_header = list(odyssey_sentinel_header or ODYSSEY_SENTINEL_HEADERS)
+    odyssey_sentinel_layout_sig = row_checksum(odyssey_sentinel_header)
     if DEBUG_VERBOSE:
         log_debug(
             "sheet.refresh_begin",
@@ -283,6 +292,21 @@ def refresh_sheet_contexts(
         sel = selectors.get(ws.id, {})
         marker = str(sel.get("marker") or "")
         league_id = safe_int(sel.get("league_id"))
+        title_is_odyssey_sentinel = str(getattr(ws, "title", "") or "") == ODYSSEY_SENTINEL_SHEET_TITLE
+        if marker == ODYSSEY_SENTINEL_SHEET_MARKER or title_is_odyssey_sentinel:
+            if league_id is None:
+                pending_odyssey_sentinel.append(ws)
+                continue
+            odyssey_sentinel_contexts[ws.id] = SheetContext(
+                ws_id=ws.id,
+                title=ws.title,
+                ws=ws,
+                league_id=league_id,
+                kind="odyssey_sentinel",
+                expected_cols=len(odyssey_sentinel_header),
+                round_col_idx=2,
+            )
+            continue
         if league_id is None:
             if DEBUG_VERBOSE:
                 log_debug("sheet.refresh_skip_no_league", sheet=ws.title, ws_id=ws.id)
@@ -311,6 +335,28 @@ def refresh_sheet_contexts(
             log_debug("sheet.refresh_skip_clan_disabled", sheet=ws.title, ws_id=ws.id)
         elif DEBUG_VERBOSE:
             log_debug("sheet.refresh_skip_unknown_marker", sheet=ws.title, ws_id=ws.id, marker=marker)
+
+    odyssey_main_candidates = [
+        ctx for ctx in main_contexts.values() if "odyssey" in str(ctx.title or "").strip().lower()
+    ]
+    inferred_odyssey_league_id = odyssey_main_candidates[0].league_id if len(odyssey_main_candidates) == 1 else None
+    for ws in pending_odyssey_sentinel:
+        if inferred_odyssey_league_id is None:
+            log_warn(
+                "sheet.odyssey_sentinel_league_unresolved",
+                sheet=ws.title,
+                candidates=len(odyssey_main_candidates),
+            )
+            continue
+        odyssey_sentinel_contexts[ws.id] = SheetContext(
+            ws_id=ws.id,
+            title=ws.title,
+            ws=ws,
+            league_id=inferred_odyssey_league_id,
+            kind="odyssey_sentinel",
+            expected_cols=len(odyssey_sentinel_header),
+            round_col_idx=2,
+        )
 
     if enable_clan_sync:
         clan_by_league = {ctx.league_id: ctx for ctx in clan_contexts.values()}
@@ -391,7 +437,30 @@ def refresh_sheet_contexts(
         if DEBUG_VERBOSE:
             log_debug("sheet.next_row_detected", sheet=ctx.title, ws_id=ctx.ws_id, kind=ctx.kind, next_row=ctx.next_row)
 
-    if DEBUG_VERBOSE:
-        log_debug("sheet.refresh_done", main_contexts=len(main_contexts), clan_contexts=len(clan_contexts))
+    for ctx in odyssey_sentinel_contexts.values():
+        state.upsert_sheet_meta(ctx.ws_id, ctx.title, ctx.league_id, layout_sig=None)
+        sync_layout_if_needed(
+            ctx,
+            odyssey_sentinel_header,
+            odyssey_sentinel_layout_sig,
+            state,
+            write_limiter,
+            read_limiter,
+            marker=ODYSSEY_SENTINEL_SHEET_MARKER,
+            enable_history_shift=False,
+        )
+        ctx.next_row = _detect_next_row(ctx.ws, read_limiter, round_col_index=(ctx.round_col_idx or 2) + 1)
+        if DEBUG_VERBOSE:
+            log_debug("sheet.next_row_detected", sheet=ctx.title, ws_id=ctx.ws_id, kind=ctx.kind, next_row=ctx.next_row)
 
+    if DEBUG_VERBOSE:
+        log_debug(
+            "sheet.refresh_done",
+            main_contexts=len(main_contexts),
+            clan_contexts=len(clan_contexts),
+            odyssey_sentinel_contexts=len(odyssey_sentinel_contexts),
+        )
+
+    if return_odyssey_sentinel:
+        return main_contexts, clan_contexts, odyssey_sentinel_contexts
     return main_contexts, clan_contexts
