@@ -147,6 +147,8 @@ def calc_boost_gmt_triplet_from_boost_users_api(
     by_user: Dict[int, Tuple[float, float]] = {}
     if clan_api is not None:
         for uid, usage in by_user_usage.items():
+            if not isinstance(usage, dict):
+                continue
             cid = safe_int(usage.get("clan_id"))
             if cid is not None:
                 clan_ids.append(cid)
@@ -158,7 +160,14 @@ def calc_boost_gmt_triplet_from_boost_users_api(
             )
         except TypeError:
             # Backward-compatible fallback for stubs/tests without the new named arg.
-            by_clan_user, by_user = clan_api.fetch_user_power_ee_for_clans(clan_ids)
+            try:
+                by_clan_user, by_user = clan_api.fetch_user_power_ee_for_clans(clan_ids)
+            except Exception as e:
+                log_warn("sync.power_up_user_resolution_failed", err=repr(e), clans=len(set(clan_ids)), users=len(by_user_usage))
+                by_clan_user, by_user = {}, {}
+        except Exception as e:
+            log_warn("sync.power_up_user_resolution_failed", err=repr(e), clans=len(set(clan_ids)), users=len(by_user_usage))
+            by_clan_user, by_user = {}, {}
 
     total_gmt = Decimal("0.00")
     total_gmt_sentinel = Decimal("0.00")
@@ -166,6 +175,9 @@ def calc_boost_gmt_triplet_from_boost_users_api(
     missing_aliases: List[str] = []
 
     for uid, usage in by_user_usage.items():
+        if not isinstance(usage, dict):
+            missing_aliases.append(f"user_{uid}")
+            continue
         cid = safe_int(usage.get("clan_id"))
         sentinel = bool(usage.get("sentinel"))
         alias = str(usage.get("alias") or "").strip() or f"user_{uid}"

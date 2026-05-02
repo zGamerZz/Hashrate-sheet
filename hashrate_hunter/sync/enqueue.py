@@ -10,6 +10,7 @@ import re
 import sqlite3
 import threading
 import time
+import traceback
 import weakref
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -35,7 +36,7 @@ from ..sheets.context import SheetContext
 from ..sheets.layout import _read_round_row_index
 from ..storage.legacy_db import DBClient
 from ..storage.state import StateStore
-from ..utils import row_checksum, safe_int, to_iso_utc, utc_now_iso
+from ..utils import row_checksum, safe_float, safe_int, to_iso_utc, utc_now_iso
 from .cache import fetch_completed_rounds_prefer_api, fetch_latest_completed_round_id_prefer_api
 
 def _maybe_flush_during_enqueue(
@@ -184,8 +185,16 @@ def enqueue_main_sheet_ops(
             if mapped is None:
                 fresh_map = state.get_round_row_map_bulk(ws_id, [rid]).get(rid)
                 if fresh_map is not None:
-                    mapped = fresh_map
-                    row_maps[rid] = fresh_map
+                    if isinstance(fresh_map, dict):
+                        mapped = fresh_map
+                        row_maps[rid] = fresh_map
+                    else:
+                        log_warn(
+                            "sync.round_row_map_invalid_shape",
+                            sheet=ctx.title,
+                            round_id=rid,
+                            typ=type(fresh_map).__name__,
+                        )
             if mapped is None:
                 existing_row_idx = sheet_round_index.get(rid)
                 if existing_row_idx is not None:
@@ -316,9 +325,9 @@ def enqueue_main_sheet_ops(
                         cnt = safe_int(cnt_raw) or 0
                         if not aid or cnt <= 0:
                             continue
-                        mapped = ability_id_to_name.get(aid)
-                        if mapped:
-                            known_counts[mapped] = known_counts.get(mapped, 0) + cnt
+                        header_name = ability_id_to_name.get(aid)
+                        if header_name:
+                            known_counts[header_name] = known_counts.get(header_name, 0) + cnt
                         else:
                             unknown_counts[aid] = unknown_counts.get(aid, 0) + cnt
                     parts: List[str] = []
@@ -338,6 +347,7 @@ def enqueue_main_sheet_ops(
             power_up_missing_aliases: List[str] = []
 
             get_cached_users = getattr(round_ability_api, "get_cached_ability_users_for_round", None)
+            get_tracked_user_blocks_mined = getattr(round_ability_api, "get_cached_tracked_user_blocks_mined_for_round", None)
             refetched_users_for_round = False
 
             if callable(get_cached_users):
@@ -383,11 +393,23 @@ def enqueue_main_sheet_ops(
                             )
                     if power_up_users:
                         power_up_resolution_stats: Dict[str, int] = {}
-                        exact_power_up_gmt, exact_power_up_gmt_sentinel, exact_missing = calc_power_up_gmt_triplet_from_power_up_users_api(
-                            power_up_users,
-                            power_up_clan_api,
-                            resolution_stats=power_up_resolution_stats,
-                        )
+                        try:
+                            exact_power_up_gmt, exact_power_up_gmt_sentinel, exact_missing = calc_power_up_gmt_triplet_from_power_up_users_api(
+                                power_up_users,
+                                power_up_clan_api,
+                                resolution_stats=power_up_resolution_stats,
+                            )
+                        except Exception as e:
+                            exact_power_up_gmt, exact_power_up_gmt_sentinel, exact_missing = None, None, []
+                            log_warn(
+                                "sync.round_power_up_exact_calc_failed",
+                                sheet=ctx.title,
+                                league_id=ctx.league_id,
+                                round_id=rid,
+                                users=len(power_up_users),
+                                boost_count=power_up_count,
+                                err=repr(e),
+                            )
                         resolved_api = int(power_up_resolution_stats.get("resolved_api", 0))
                         missing_count = int(power_up_resolution_stats.get("missing", 0))
                         if resolved_api <= 0:
@@ -474,10 +496,22 @@ def enqueue_main_sheet_ops(
                                 err=repr(e),
                             )
                     if clan_power_up_users:
-                        exact_clan_power_up_gmt, exact_clan_power_up_gmt_sentinel = calc_clan_power_up_gmt_pair_from_boost_users_api(
-                            clan_power_up_users,
-                            power_up_clan_api,
-                        )
+                        try:
+                            exact_clan_power_up_gmt, exact_clan_power_up_gmt_sentinel = calc_clan_power_up_gmt_pair_from_boost_users_api(
+                                clan_power_up_users,
+                                power_up_clan_api,
+                            )
+                        except Exception as e:
+                            exact_clan_power_up_gmt, exact_clan_power_up_gmt_sentinel = None, None
+                            log_warn(
+                                "sync.round_clan_power_up_exact_calc_failed",
+                                sheet=ctx.title,
+                                league_id=ctx.league_id,
+                                round_id=rid,
+                                users=len(clan_power_up_users),
+                                boost_count=clan_power_up_count,
+                                err=repr(e),
+                            )
                         if exact_clan_power_up_gmt is not None and exact_clan_power_up_gmt_sentinel is not None:
                             clan_power_up_gmt_value = exact_clan_power_up_gmt
                             clan_power_up_gmt_sentinel_value = exact_clan_power_up_gmt_sentinel
@@ -527,7 +561,46 @@ def enqueue_main_sheet_ops(
                     clan_power_up_gmt_value = None
                     clan_power_up_gmt_sentinel_value = None
 
+            tracked_user_blocks_mined = None
+            fetch_tracked_user_blocks_mined = getattr(round_ability_api, "fetch_tracked_user_blocks_mined_for_round", None)
+            if callable(fetch_tracked_user_blocks_mined):
+                try:
+                    calculated_at = _to_api_calculated_at(rec.get("ended_at") or rec.get("snapshot_ts"))
+                    tracked_user_blocks_mined = safe_float(
+                        fetch_tracked_user_blocks_mined(
+                            ctx.league_id,
+                            rid,
+                            calculated_at,
+                            progress_hook=lambda rid=rid: _progress_tick(rid),
+                        )
+                    )
+                except Exception as e:
+                    tracked_user_blocks_mined = None
+                    log_warn(
+                        "sync.round_tracked_user_blocks_mined_fetch_failed",
+                        sheet=ctx.title,
+                        league_id=ctx.league_id,
+                        round_id=rid,
+                        user_id=EXCLUDED_BOOST_USER_ID,
+                        err=repr(e),
+                    )
+            if callable(get_tracked_user_blocks_mined):
+                if tracked_user_blocks_mined is None:
+                    try:
+                        tracked_user_blocks_mined = safe_float(get_tracked_user_blocks_mined(rid))
+                    except Exception as e:
+                        tracked_user_blocks_mined = None
+                        log_warn(
+                            "sync.round_tracked_user_blocks_mined_cache_read_failed",
+                            sheet=ctx.title,
+                            league_id=ctx.league_id,
+                            round_id=rid,
+                            user_id=EXCLUDED_BOOST_USER_ID,
+                            err=repr(e),
+                        )
+
             try:
+                stage = "build_row"
                 row = build_canonical_row(
                     rec,
                     ability_headers,
@@ -539,11 +612,14 @@ def enqueue_main_sheet_ops(
                     clan_power_up_gmt_sentinel_value=clan_power_up_gmt_sentinel_value,
                     power_up_missing_aliases=power_up_missing_aliases,
                     excluded_user_boosts_audit=excluded_user_boosts_audit,
+                    tracked_user_blocks_mined=tracked_user_blocks_mined,
                 )
+                stage = "checksum"
                 checksum = row_checksum(row)
                 finalized = 1 if rid <= (max_round - STABILIZATION_ROUNDS) else 0
 
                 if mapped is None:
+                    stage = "enqueue_append"
                     state.enqueue_op(ws_id, "append_round", rid, checksum, {"row": row, "finalized": finalized})
                     state.upsert_round_processing_state(
                         ctx.league_id,
@@ -569,11 +645,13 @@ def enqueue_main_sheet_ops(
 
                 needs_update = (str(mapped.get("checksum")) != checksum) or (int(mapped.get("finalized") or 0) != finalized)
                 if needs_update:
+                    stage = "resolve_row_idx"
                     row_idx = safe_int(mapped.get("row_idx"))
                     if row_idx is None:
                         if DEBUG_VERBOSE:
                             log_debug("sync.round_skip_update_missing_row_idx", sheet=ctx.title, round_id=rid)
                         continue
+                    stage = "enqueue_update"
                     state.enqueue_op(
                         ws_id,
                         "update_round",
@@ -611,7 +689,9 @@ def enqueue_main_sheet_ops(
                     sheet=ctx.title,
                     league_id=ctx.league_id,
                     round_id=rid,
+                    stage=locals().get("stage", "unknown"),
                     err=repr(e),
+                    traceback=traceback.format_exc()[:2000],
                 )
                 prev_attempt = int(rstate.get("attempt_count") or 0)
                 next_attempt = min(ROUND_SOFT_FAIL_MAX_ATTEMPTS, prev_attempt + 1)

@@ -43,6 +43,7 @@ def build_canonical_row(
     clan_power_up_gmt_sentinel_value: Optional[float] = None,
     power_up_missing_aliases: Optional[Sequence[str]] = None,
     excluded_user_boosts_audit: str = "",
+    tracked_user_blocks_mined: Optional[float] = None,
 ) -> List[Any]:
     ts_iso = to_iso_utc(rec.get("snapshot_ts")) or ""
     ended_iso = to_iso_utc(rec.get("ended_at")) or ""
@@ -110,6 +111,7 @@ def build_canonical_row(
     row.append(", ".join(aliases))
     row.append(str(excluded_user_boosts_audit or "").strip())
     row.append("" if btc_fund is None else btc_fund)
+    row.append("" if tracked_user_blocks_mined is None else tracked_user_blocks_mined)
     return row
 
 def build_clan_round_rows(rec: Dict[str, Any], clan_rows: Sequence[Dict[str, Any]]) -> List[List[Any]]:

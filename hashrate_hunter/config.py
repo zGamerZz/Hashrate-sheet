@@ -152,6 +152,7 @@ MISSING_HEADER = "missing"
 EXCLUDED_USER_BOOST_AUDIT_HEADER = "Excluded User 2144425 Boosts (Audit)"
 BTC_FUND_HEADER = "btcFund"
 EXCLUDED_BOOST_USER_ID = 2144425
+TRACKED_USER_BLOCKS_MINED_HEADER = "User 2144425 blocksMined"
 
 PPS_BASE_EE_W_PER_TH = 20.0
 # Legacy alias kept to minimize churn in downstream imports/tests.

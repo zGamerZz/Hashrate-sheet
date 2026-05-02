@@ -50,6 +50,7 @@ def build_target_header(ability_headers: Optional[Sequence[str]] = None) -> List
             main.MISSING_HEADER,
             main.EXCLUDED_USER_BOOST_AUDIT_HEADER,
             main.BTC_FUND_HEADER,
+            main.TRACKED_USER_BLOCKS_MINED_HEADER,
         ]
     )
 

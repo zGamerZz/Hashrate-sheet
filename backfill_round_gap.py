@@ -50,6 +50,7 @@ class PrefetchRoundResult:
     power_up_users: List[Dict[str, Any]] = field(default_factory=list)
     clan_power_up_users: List[Dict[str, Any]] = field(default_factory=list)
     excluded_user_boosts: Dict[str, int] = field(default_factory=dict)
+    tracked_user_blocks_mined: Optional[float] = None
     error: str = ""
 
 
@@ -480,6 +481,7 @@ def merge_prefetch_results_into_client(
             for k, v in (res.excluded_user_boosts or {}).items()
             if str(k).strip() and main.safe_int(v) is not None and int(v) > 0
         }
+        client.round_tracked_user_blocks_mined_cache[rid] = main.safe_float(res.tracked_user_blocks_mined)
         ok_count += 1
     return ok_count, fail_count
 
@@ -715,6 +717,7 @@ def _prefetch_round_worker(
         power_up_users = client.get_cached_ability_users_for_round(round_id, main.POWER_UP_ABILITY_ID)
         clan_power_up_users = client.get_cached_ability_users_for_round(round_id, main.CLAN_POWER_UP_ABILITY_ID)
         excluded = client.get_cached_excluded_user_boosts_for_round(round_id)
+        tracked_user_blocks_mined = client.get_cached_tracked_user_blocks_mined_for_round(round_id)
         return PrefetchRoundResult(
             league_id=league_id,
             round_id=round_id,
@@ -723,6 +726,7 @@ def _prefetch_round_worker(
             power_up_users=[u for u in power_up_users if isinstance(u, dict)],
             clan_power_up_users=[u for u in clan_power_up_users if isinstance(u, dict)],
             excluded_user_boosts=dict(excluded),
+            tracked_user_blocks_mined=tracked_user_blocks_mined,
         )
     except Exception as e:
         return PrefetchRoundResult(
@@ -1081,7 +1085,7 @@ def main_cli() -> int:
 
         ability_id_to_name = main.build_ability_id_to_header(main.ABILITY_DIM_STATIC)
         ability_headers = list(main.ABILITY_HEADER_ORDER)
-        expected_cols = len(main.BASE_HEADERS) + len(ability_headers) + 7
+        expected_cols = len(main.BASE_HEADERS) + len(ability_headers) + 8
 
         sh = main.open_spreadsheet()
         contexts = _load_main_contexts(sh, read_limiter, expected_cols=expected_cols)

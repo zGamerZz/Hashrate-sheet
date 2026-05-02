@@ -529,13 +529,14 @@ class SyncCoreTests(unittest.TestCase):
         self.assertAlmostEqual(row[11], 20.49)
         self.assertEqual(row[12], 3)
         self.assertEqual(row[13], 0)
-        self.assertAlmostEqual(row[-7], 555.0)
+        self.assertAlmostEqual(row[-8], 555.0)
+        self.assertAlmostEqual(row[-7], 0.0)
         self.assertAlmostEqual(row[-6], 0.0)
         self.assertAlmostEqual(row[-5], 0.0)
-        self.assertAlmostEqual(row[-4], 0.0)
+        self.assertEqual(row[-4], "")
         self.assertEqual(row[-3], "")
-        self.assertEqual(row[-2], "")
-        self.assertAlmostEqual(row[-1], 1.2345)
+        self.assertAlmostEqual(row[-2], 1.2345)
+        self.assertEqual(row[-1], "")
 
     def test_build_canonical_row_with_missing_aliases(self) -> None:
         rec = {
@@ -554,13 +555,25 @@ class SyncCoreTests(unittest.TestCase):
             power_up_gmt_sentinel_value=43.56,
             power_up_missing_aliases=["alice", "bob"],
         )
-        self.assertAlmostEqual(row[-7], 54.45)
-        self.assertAlmostEqual(row[-6], 43.56)
+        self.assertAlmostEqual(row[-8], 54.45)
+        self.assertAlmostEqual(row[-7], 43.56)
+        self.assertAlmostEqual(row[-6], 0.0)
         self.assertAlmostEqual(row[-5], 0.0)
-        self.assertAlmostEqual(row[-4], 0.0)
-        self.assertEqual(row[-3], "alice, bob")
+        self.assertEqual(row[-4], "alice, bob")
+        self.assertEqual(row[-3], "")
         self.assertEqual(row[-2], "")
         self.assertEqual(row[-1], "")
+
+    def test_build_canonical_row_appends_tracked_user_blocks_mined(self) -> None:
+        row = main.build_canonical_row(
+            {"round_id": 124, "btc_fund": 1.25},
+            [],
+            {},
+            price_cutover_round=123,
+            tracked_user_blocks_mined=5,
+        )
+        self.assertAlmostEqual(row[-2], 1.25)
+        self.assertEqual(row[-1], 5)
 
     def test_build_canonical_row_cutover_blocks_old_round(self) -> None:
         rec = {
@@ -571,6 +584,7 @@ class SyncCoreTests(unittest.TestCase):
             "efficiency_league": 20.0,
         }
         row = main.build_canonical_row(rec, [], {}, price_cutover_round=123, power_up_gmt_value=999.0)
+        self.assertEqual(row[-8], "")
         self.assertEqual(row[-7], "")
         self.assertEqual(row[-6], "")
         self.assertEqual(row[-5], "")
@@ -588,10 +602,11 @@ class SyncCoreTests(unittest.TestCase):
             "efficiency_league": 20.0,
         }
         row = main.build_canonical_row(rec, [], {}, price_cutover_round=123, power_up_gmt_value=None)
+        self.assertEqual(row[-8], 0.0)
         self.assertEqual(row[-7], 0.0)
         self.assertEqual(row[-6], 0.0)
         self.assertEqual(row[-5], 0.0)
-        self.assertEqual(row[-4], 0.0)
+        self.assertEqual(row[-4], "")
         self.assertEqual(row[-3], "")
         self.assertEqual(row[-2], "")
         self.assertEqual(row[-1], "")
@@ -612,10 +627,11 @@ class SyncCoreTests(unittest.TestCase):
             power_up_gmt_value=None,
             power_up_gmt_sentinel_value=None,
         )
+        self.assertEqual(row[-8], "")
         self.assertEqual(row[-7], "")
-        self.assertEqual(row[-6], "")
+        self.assertEqual(row[-6], 0.0)
         self.assertEqual(row[-5], 0.0)
-        self.assertEqual(row[-4], 0.0)
+        self.assertEqual(row[-4], "")
         self.assertEqual(row[-3], "")
         self.assertEqual(row[-2], "")
         self.assertEqual(row[-1], "")
@@ -1221,6 +1237,7 @@ class SyncCoreTests(unittest.TestCase):
                     {
                         "user": {"id": main.EXCLUDED_BOOST_USER_ID, "avatar": "", "alias": "excluded"},
                         "clan": {"id": 555},
+                        "blocksMined": 5,
                         "usedAbilities": [
                             {"nftGameAbilityId": main.POWER_UP_ABILITY_ID, "count": 3},
                             {"nftGameAbilityId": "unknown-excluded-aid", "count": 2},
@@ -1261,6 +1278,155 @@ class SyncCoreTests(unittest.TestCase):
         excluded_audit = client.get_cached_excluded_user_boosts_for_round(901204)
         self.assertEqual(excluded_audit.get(main.POWER_UP_ABILITY_ID), 3)
         self.assertEqual(excluded_audit.get("unknown-excluded-aid"), 2)
+        self.assertEqual(client.get_cached_tracked_user_blocks_mined_for_round(901204), 5)
+
+    def test_round_ability_api_adds_multiplier_to_tracked_user_blocks_when_user_wins(self) -> None:
+        class FakeResponse:
+            def __init__(self, status_code: int, body: Dict[str, Any]) -> None:
+                self.status_code = status_code
+                self._body = body
+                self.text = json.dumps(body)
+                self.headers: Dict[str, str] = {}
+
+            def json(self) -> Dict[str, Any]:
+                return self._body
+
+        class FakeSession:
+            def post(self, url: str, headers: Dict[str, str], json: Dict[str, Any], timeout: int) -> FakeResponse:
+                _ = (url, headers, json, timeout)
+                participants = [
+                    {
+                        "user": {"id": main.EXCLUDED_BOOST_USER_ID, "avatar": "", "alias": "tracked"},
+                        "blocksMined": 5,
+                        "usedAbilities": [],
+                    },
+                    {
+                        "user": {"id": 123, "avatar": "", "alias": "included"},
+                        "usedAbilities": [{"nftGameAbilityId": main.POWER_UP_ABILITY_ID, "count": 1}],
+                    },
+                ]
+                body = {
+                    "data": {
+                        "count": 2,
+                        "roundId": 901206,
+                        "leagueId": 1,
+                        "multiplier": 2,
+                        "winner": {"user": {"id": main.EXCLUDED_BOOST_USER_ID}},
+                        "participants": participants,
+                    }
+                }
+                return FakeResponse(200, body)
+
+        client = main.GoMiningRoundAbilityApiClient(
+            bearer_token="x",
+            limiter=main.TokenBucket(9999, name="test"),
+            page_limit=50,
+            timeout_seconds=5,
+            max_retries=1,
+        )
+        client.session = FakeSession()  # type: ignore[assignment]
+
+        counts = client.fetch_round_ability_counts(901206, expected_league_id=1)
+        self.assertIsNotNone(counts)
+        self.assertEqual(counts.get(main.POWER_UP_ABILITY_ID), 1)
+        self.assertEqual(client.get_cached_tracked_user_blocks_mined_for_round(901206), 7)
+
+    def test_round_ability_api_does_not_add_multiplier_when_other_user_wins(self) -> None:
+        class FakeResponse:
+            def __init__(self, status_code: int, body: Dict[str, Any]) -> None:
+                self.status_code = status_code
+                self._body = body
+                self.text = json.dumps(body)
+                self.headers: Dict[str, str] = {}
+
+            def json(self) -> Dict[str, Any]:
+                return self._body
+
+        class FakeSession:
+            def post(self, url: str, headers: Dict[str, str], json: Dict[str, Any], timeout: int) -> FakeResponse:
+                _ = (url, headers, json, timeout)
+                body = {
+                    "data": {
+                        "count": 1,
+                        "roundId": 901207,
+                        "leagueId": 1,
+                        "multiplier": 2,
+                        "winner": {"user": {"id": 123}},
+                        "participants": [
+                            {
+                                "user": {"id": main.EXCLUDED_BOOST_USER_ID},
+                                "blocksMined": 5,
+                                "usedAbilities": [],
+                            }
+                        ],
+                    }
+                }
+                return FakeResponse(200, body)
+
+        client = main.GoMiningRoundAbilityApiClient(
+            bearer_token="x",
+            limiter=main.TokenBucket(9999, name="test"),
+            page_limit=50,
+            timeout_seconds=5,
+            max_retries=1,
+        )
+        client.session = FakeSession()  # type: ignore[assignment]
+
+        counts = client.fetch_round_ability_counts(901207, expected_league_id=1)
+        self.assertIsNotNone(counts)
+        self.assertEqual(client.get_cached_tracked_user_blocks_mined_for_round(901207), 5)
+
+    def test_round_ability_api_fetches_tracked_user_blocks_mined_from_player_leaderboard(self) -> None:
+        class FakeResponse:
+            def __init__(self, status_code: int, body: Dict[str, Any]) -> None:
+                self.status_code = status_code
+                self._body = body
+                self.text = json.dumps(body)
+                self.headers: Dict[str, str] = {}
+
+            def json(self) -> Dict[str, Any]:
+                return self._body
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.calls: List[Dict[str, Any]] = []
+
+            def post(self, url: str, headers: Dict[str, str], json: Dict[str, Any], timeout: int) -> FakeResponse:
+                _ = (url, headers, timeout)
+                self.calls.append({"url": url, "payload": json})
+                skip = int(json["pagination"]["skip"])
+                if skip == 0:
+                    participants = [
+                        {"user": {"userId": 111}, "blocksMined": 9},
+                    ]
+                else:
+                    participants = [
+                        {"user": {"userId": main.EXCLUDED_BOOST_USER_ID}, "blocksMined": 1},
+                    ]
+                body = {"data": {"count": 2, "participants": participants}}
+                return FakeResponse(200, body)
+
+        client = main.GoMiningRoundAbilityApiClient(
+            bearer_token="x",
+            limiter=main.TokenBucket(9999, name="test"),
+            player_leaderboard_url="https://example.test/api/nft-game/user-leaderboard/index",
+            page_limit=1,
+            timeout_seconds=5,
+            max_retries=1,
+        )
+        fake_session = FakeSession()
+        client.session = fake_session  # type: ignore[assignment]
+
+        blocks_mined = client.fetch_tracked_user_blocks_mined_for_round(
+            1,
+            901205,
+            "2026-04-28T00:00:00.000Z",
+        )
+        self.assertEqual(blocks_mined, 1)
+        self.assertEqual(client.get_cached_tracked_user_blocks_mined_for_round(901205), 1)
+        self.assertEqual([c["payload"]["pagination"]["skip"] for c in fake_session.calls], [0, 1])
+        self.assertTrue(all(c["payload"]["calculatedAt"] == "2026-04-28T00:00:00.000Z" for c in fake_session.calls))
+        self.assertTrue(all(c["payload"]["leagueId"] == 1 for c in fake_session.calls))
 
     def test_round_ability_api_refreshes_on_403_jwt_expired(self) -> None:
         class FakeResponse:
@@ -1430,7 +1596,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 8,
                 round_col_idx=6,
             )
             fake_round_api = FakeRoundAPI()
@@ -1534,7 +1700,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=3,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 8,
                 round_col_idx=6,
             )
             main.GAP_SCAN_LOOKBACK_ROUNDS = 10
@@ -1597,7 +1763,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=3,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 8,
                 round_col_idx=6,
             )
             main.GAP_SCAN_LOOKBACK_ROUNDS = 10
@@ -1667,7 +1833,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 8,
                 round_col_idx=6,
             )
             enq = main.enqueue_main_sheet_ops(
@@ -1686,10 +1852,11 @@ class SyncCoreTests(unittest.TestCase):
             payload = json.loads(due[0]["payload_json"])
             row = payload["row"]
             self.assertEqual(row[12], 5)
+            self.assertAlmostEqual(row[-8], 5.0 * main.calc_power_up_gmt(1000.0, 20.0))
             self.assertAlmostEqual(row[-7], 5.0 * main.calc_power_up_gmt(1000.0, 20.0))
-            self.assertAlmostEqual(row[-6], 5.0 * main.calc_power_up_gmt(1000.0, 20.0))
+            self.assertAlmostEqual(row[-6], 0.0)
             self.assertAlmostEqual(row[-5], 0.0)
-            self.assertAlmostEqual(row[-4], 0.0)
+            self.assertEqual(row[-4], "")
             self.assertEqual(row[-3], "")
             self.assertEqual(row[-2], "")
             self.assertEqual(row[-1], "")
@@ -1734,6 +1901,10 @@ class SyncCoreTests(unittest.TestCase):
                 _ = round_id
                 return {main.POWER_UP_ABILITY_ID: 3, "unknown-aid": 2}
 
+            def get_cached_tracked_user_blocks_mined_for_round(self, round_id: int) -> int:
+                _ = round_id
+                return 7
+
         fd, path = tempfile.mkstemp(prefix="sync_state_", suffix=".sqlite3")
         os.close(fd)
         try:
@@ -1748,7 +1919,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 8,
                 round_col_idx=6,
             )
             enq = main.enqueue_main_sheet_ops(
@@ -1765,8 +1936,9 @@ class SyncCoreTests(unittest.TestCase):
             payload = json.loads(due[0]["payload_json"])
             row = payload["row"]
             self.assertEqual(row[12], 4)
-            self.assertEqual(row[-2], "Power Up Boost=3; ability_id=unknown-aid:2")
-            self.assertEqual(row[-1], "")
+            self.assertEqual(row[-3], "Power Up Boost=3; ability_id=unknown-aid:2")
+            self.assertEqual(row[-2], "")
+            self.assertEqual(row[-1], 7)
             st.close()
         finally:
             try:
@@ -1827,7 +1999,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 8,
                 round_col_idx=6,
             )
             enq = main.enqueue_main_sheet_ops(
@@ -1846,10 +2018,11 @@ class SyncCoreTests(unittest.TestCase):
             row = payload["row"]
             clan_cpu = main.calc_clan_power_up_gmt(2000.0) or 0.0
             self.assertEqual(row[12], 2)
+            self.assertAlmostEqual(row[-8], 0.0)
             self.assertAlmostEqual(row[-7], 0.0)
-            self.assertAlmostEqual(row[-6], 0.0)
-            self.assertAlmostEqual(row[-5], clan_cpu)
-            self.assertAlmostEqual(row[-4], float(main.round_gmt_2(clan_cpu * 0.8)))
+            self.assertAlmostEqual(row[-6], clan_cpu)
+            self.assertAlmostEqual(row[-5], float(main.round_gmt_2(clan_cpu * 0.8)))
+            self.assertEqual(row[-4], "")
             self.assertEqual(row[-3], "")
             self.assertEqual(row[-2], "")
             self.assertEqual(row[-1], "")
@@ -1901,7 +2074,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 8,
                 round_col_idx=6,
             )
             enq = main.enqueue_main_sheet_ops(
@@ -1988,7 +2161,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 8,
                 round_col_idx=6,
             )
             enq = main.enqueue_main_sheet_ops(
@@ -2097,7 +2270,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 8,
                 round_col_idx=6,
             )
             fake_round_api = FakeRoundAPI()
@@ -2764,7 +2937,7 @@ class SyncCoreTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + 1 + 7,
+                expected_cols=len(main.BASE_HEADERS) + 1 + 8,
                 round_col_idx=6,
             )
             enq = main.enqueue_main_sheet_ops(
@@ -3020,7 +3193,7 @@ class BackfillRoundGapTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + len(main.ABILITY_HEADER_ORDER) + 7,
+                expected_cols=len(main.BASE_HEADERS) + len(main.ABILITY_HEADER_ORDER) + 8,
                 round_col_idx=6,
             )
 
@@ -3074,7 +3247,7 @@ class BackfillRoundGapTests(unittest.TestCase):
                 ws=None,
                 league_id=1,
                 kind="main",
-                expected_cols=len(main.BASE_HEADERS) + len(main.ABILITY_HEADER_ORDER) + 7,
+                expected_cols=len(main.BASE_HEADERS) + len(main.ABILITY_HEADER_ORDER) + 8,
                 round_col_idx=6,
             )
             bumped = {"done": False}
@@ -3298,10 +3471,10 @@ class BackfillRoundGapTests(unittest.TestCase):
 
     def test_eclipse_backfill_target_header_has_exact_main_shape(self) -> None:
         header = backfill_eclipse_backfill.build_target_header()
-        self.assertEqual(len(header), 33)
+        self.assertEqual(len(header), 34)
         self.assertEqual(header[: len(main.BASE_HEADERS)], main.BASE_HEADERS)
         self.assertEqual(header[12:26], main.ABILITY_HEADER_ORDER)
-        self.assertEqual(header[-7:], [
+        self.assertEqual(header[-8:], [
             main.POWER_UP_PRICE_HEADER,
             main.POWER_UP_PRICE_SENTINEL_HEADER,
             main.CLAN_POWER_UP_PRICE_HEADER,
@@ -3309,6 +3482,7 @@ class BackfillRoundGapTests(unittest.TestCase):
             main.MISSING_HEADER,
             main.EXCLUDED_USER_BOOST_AUDIT_HEADER,
             main.BTC_FUND_HEADER,
+            main.TRACKED_USER_BLOCKS_MINED_HEADER,
         ])
 
     def test_eclipse_backfill_filter_records_for_target(self) -> None:
