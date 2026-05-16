@@ -34,7 +34,7 @@ except Exception:  # pragma: no cover
     Credentials = None  # type: ignore
 
 from ..config import *
-from ..logging_utils import log_debug, log_warn
+from ..logging_utils import log_debug, log_info, log_warn
 from ..runtime.rate_limit import TokenBucket
 from ..utils import safe_int
 
@@ -55,7 +55,12 @@ def open_spreadsheet() -> Any:
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
     gc = gspread.authorize(creds)
-    return gc.open_by_key(SPREADSHEET_ID)
+    if hasattr(gc, "set_timeout"):
+        gc.set_timeout(SHEETS_API_TIMEOUT_SECONDS)
+    log_info("sheets.open_start", spreadsheet_id=SPREADSHEET_ID, timeout_s=SHEETS_API_TIMEOUT_SECONDS)
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    log_info("sheets.open_done", title=getattr(sh, "title", ""))
+    return sh
 
 def _normalize_sheet_marker(raw: Any) -> str:
     s = str(raw or "").strip().lower()

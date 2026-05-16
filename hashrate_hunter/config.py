@@ -29,6 +29,7 @@ SYNC_API_GAP_FILL_PROBE_MAX = max(
 SHEET_REFRESH_SECONDS = int(os.getenv("SHEET_REFRESH_SECONDS", "1800"))
 GS_WRITE_REQ_PER_MIN = int(os.getenv("GS_WRITE_REQ_PER_MIN", "45"))
 GS_READ_REQ_PER_MIN = int(os.getenv("GS_READ_REQ_PER_MIN", "20"))
+SHEETS_API_TIMEOUT_SECONDS = max(5, int(os.getenv("SHEETS_API_TIMEOUT_SECONDS", "30")))
 STATE_DB_PATH = os.getenv("STATE_DB_PATH", "./sync_state.sqlite")
 LOCK_FILE_PATH = os.getenv("LOCK_FILE_PATH", "./sync.lock")
 LEAGUES_API_URL = os.getenv("LEAGUES_API_URL", "https://api.gomining.com/api/nft-game/league/index")
@@ -67,6 +68,7 @@ ROUND_USER_LEADERBOARD_API_URL = os.getenv(
 ROUND_API_PAGE_LIMIT = max(1, min(50, int(os.getenv("ROUND_API_PAGE_LIMIT", "50"))))
 ROUND_API_TIMEOUT_SECONDS = int(os.getenv("ROUND_API_TIMEOUT_SECONDS", "45"))
 ROUND_API_MAX_RETRIES = max(1, int(os.getenv("ROUND_API_MAX_RETRIES", "4")))
+ROUND_API_PROGRESS_EVERY_PAGES = max(0, int(os.getenv("ROUND_API_PROGRESS_EVERY_PAGES", "50")))
 GOMINING_API_REQ_PER_MIN = int(os.getenv("GOMINING_API_REQ_PER_MIN", "120"))
 TOKEN_URL = os.getenv("TOKEN_URL", "").strip()
 TOKEN_X_AUTH = os.getenv("TOKEN_X_AUTH", "").strip()
@@ -104,10 +106,13 @@ MAX_MISSING_SHEET_RETRIES = int(os.getenv("MAX_MISSING_SHEET_RETRIES", "20"))
 AUTO_EXPAND_SHEET_ROWS = os.getenv("AUTO_EXPAND_SHEET_ROWS", "1").strip() in {"1", "true", "TRUE", "yes", "YES"}
 DROP_NON_RETRYABLE_SHEET_ERRORS = os.getenv("DROP_NON_RETRYABLE_SHEET_ERRORS", "1").strip() in {"1", "true", "TRUE", "yes", "YES"}
 PURGE_QUEUE_FOR_MISSING_SHEETS = os.getenv("PURGE_QUEUE_FOR_MISSING_SHEETS", "1").strip() in {"1", "true", "TRUE", "yes", "YES"}
+SKIP_SENTINEL_SHEETS = os.getenv("SKIP_SENTINEL_SHEETS", "1").strip() in {"1", "true", "TRUE", "yes", "YES"}
 DRY_RUN = os.getenv("DRY_RUN", "0").strip() in {"1", "true", "TRUE", "yes", "YES"}
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 DEBUG_VERBOSE = os.getenv("DEBUG_VERBOSE", "1").strip() in {"1", "true", "TRUE", "yes", "YES"}
 LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", "")
+LOG_FILE_MAX_BYTES = max(1_000_000, int(os.getenv("LOG_FILE_MAX_BYTES", "25000000")))
+LOG_FILE_BACKUP_COUNT = max(0, int(os.getenv("LOG_FILE_BACKUP_COUNT", "5")))
 QUEUE_DEBUG_PREVIEW = int(os.getenv("QUEUE_DEBUG_PREVIEW", "180"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "30"))
 try:
@@ -115,6 +120,8 @@ try:
 except Exception:
     ENQUEUE_FLUSH_EVERY_SECONDS = 5.0
 RECONCILE_INTERVAL_SECONDS = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "900"))
+RECONCILE_RETRY_LIMIT_PER_PASS = max(0, int(os.getenv("RECONCILE_RETRY_LIMIT_PER_PASS", "20")))
+RECONCILE_RETRY_MAX_LAG_ROUNDS = max(0, int(os.getenv("RECONCILE_RETRY_MAX_LAG_ROUNDS", "5000")))
 ROUND_SOFT_FAIL_MAX_ATTEMPTS = max(1, int(os.getenv("ROUND_SOFT_FAIL_MAX_ATTEMPTS", "8")))
 try:
     ROUND_RETRY_BACKOFF_MIN_SECONDS = max(1.0, float(os.getenv("ROUND_RETRY_BACKOFF_MIN_SECONDS", "15")))

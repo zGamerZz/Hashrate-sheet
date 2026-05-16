@@ -21,7 +21,13 @@ import requests
 
 from ..api.clan import GoMiningClanApiClient
 from ..api.round_ability import GoMiningRoundAbilityApiClient
-from ..config import GAP_SCAN_LOOKBACK_ROUNDS, MAX_ROUNDS_PER_POLL, RECONCILE_DEEP_MISSING_PER_PASS
+from ..config import (
+    GAP_SCAN_LOOKBACK_ROUNDS,
+    MAX_ROUNDS_PER_POLL,
+    RECONCILE_DEEP_MISSING_PER_PASS,
+    RECONCILE_RETRY_LIMIT_PER_PASS,
+    RECONCILE_RETRY_MAX_LAG_ROUNDS,
+)
 from ..logging_utils import log_info
 from ..runtime.rate_limit import TokenBucket
 from ..sheets.context import SheetContext
@@ -62,8 +68,17 @@ def run_reconcile_pass(
         if not round_ids:
             continue
         row_map = state.get_round_row_map_bulk(ws_id, round_ids)
-        retry_states = state.list_retryable_round_states(ctx.league_id, limit=MAX_ROUNDS_PER_POLL)
-        retry_ids = {int(safe_int(x.get("round_id")) or -1) for x in retry_states if safe_int(x.get("round_id")) is not None}
+        retry_ids: set[int] = set()
+        if RECONCILE_RETRY_LIMIT_PER_PASS > 0:
+            retry_states = state.list_retryable_round_states(ctx.league_id, limit=MAX_ROUNDS_PER_POLL)
+            retry_floor = max(0, int(latest_round) - int(RECONCILE_RETRY_MAX_LAG_ROUNDS))
+            for item in retry_states:
+                rid = safe_int(item.get("round_id"))
+                if rid is None or int(rid) < retry_floor:
+                    continue
+                retry_ids.add(int(rid))
+                if len(retry_ids) >= RECONCILE_RETRY_LIMIT_PER_PASS:
+                    break
         missing_ids = [rid for rid in round_ids if rid >= from_round and rid not in row_map]
         deep_missing_ids: List[int] = []
         if RECONCILE_DEEP_MISSING_PER_PASS > 0:

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 from typing import Any, List
 
-from .config import LOG_FILE_PATH, LOG_LEVEL
+from .config import LOG_FILE_BACKUP_COUNT, LOG_FILE_MAX_BYTES, LOG_FILE_PATH, LOG_LEVEL
 
 def _setup_logger() -> logging.Logger:
     logger = logging.getLogger("hashrate_sync")
@@ -22,7 +23,12 @@ def _setup_logger() -> logging.Logger:
 
     if LOG_FILE_PATH.strip():
         try:
-            fh = logging.FileHandler(LOG_FILE_PATH, encoding="utf-8")
+            fh = RotatingFileHandler(
+                LOG_FILE_PATH,
+                maxBytes=LOG_FILE_MAX_BYTES,
+                backupCount=LOG_FILE_BACKUP_COUNT,
+                encoding="utf-8",
+            )
             fh.setFormatter(fmt)
             logger.addHandler(fh)
         except Exception as e:
@@ -60,5 +66,5 @@ def log_info(msg: str, **fields: Any) -> None:
 def log_warn(msg: str, **fields: Any) -> None:
     LOGGER.warning(msg + _render_fields(**fields))
 
-def log_error(msg: str, **fields: Any) -> None:
-    LOGGER.error(msg + _render_fields(**fields))
+def log_error(msg: str, exc_info: bool = False, **fields: Any) -> None:
+    LOGGER.error(msg + _render_fields(**fields), exc_info=exc_info)

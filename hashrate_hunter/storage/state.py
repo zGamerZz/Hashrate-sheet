@@ -244,7 +244,7 @@ class StateStore:
             WHERE league_id=?
               AND retry_after_ts<=?
               AND (metrics_status!='ok' OR abilities_status!='ok' OR sheet_status!='ok')
-            ORDER BY round_id ASC
+            ORDER BY round_id DESC
             LIMIT ?
             """,
             (league_id, time.time(), max(1, int(limit))),

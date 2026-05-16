@@ -26,7 +26,7 @@ from ..api.round_ability import GoMiningRoundAbilityApiClient
 from ..api.round_metrics import GoMiningRoundMetricsApiClient
 from ..config import *
 from ..domain.abilities import build_ability_id_to_header
-from ..logging_utils import log_debug, log_info, log_warn
+from ..logging_utils import log_debug, log_error, log_info, log_warn
 from ..runtime.lock import SingleInstanceLock
 from ..runtime.rate_limit import AdaptiveRateController, TokenBucket
 from ..sheets.context import open_spreadsheet
@@ -246,137 +246,141 @@ def main(once_reconcile: bool = False) -> None:
             return
 
         while True:
-            now = time.time()
+            try:
+                now = time.time()
 
-            if now - last_refresh >= SHEET_REFRESH_SECONDS:
-                sh = open_spreadsheet()
-                main_contexts, clan_contexts = refresh_sheet_contexts(
-                    sh,
-                    state,
-                    main_expected_header,
-                    clan_expected_header,
-                    write_limiter,
-                    read_limiter,
-                    enable_clan_sync=ENABLE_CLAN_SYNC,
-                )
-                contexts_all = {**main_contexts, **clan_contexts}
-                purge_stale_queue_ops(state, contexts_all)
-                if not ENABLE_CLAN_SYNC:
-                    purged_clan_ops = state.purge_ops_by_type(["append_clan_round"])
-                    if purged_clan_ops > 0:
-                        log_info("queue.purged_clan_ops", deleted_ops=purged_clan_ops)
-                configured_league_ids = sorted(
-                    {ctx.league_id for ctx in main_contexts.values()} | {ctx.league_id for ctx in clan_contexts.values()}
-                )
-                last_refresh = now
-                log_info("sync.sheet_refresh_done", active_main=len(main_contexts), active_clan=len(clan_contexts))
-
-            if now - last_league_api_poll >= LEAGUES_API_POLL_SECONDS:
-                cached_written, cached_total = sync_api_round_cache(state, round_metrics_api, configured_league_ids)
-                if cached_total > 0 and DEBUG_VERBOSE:
-                    log_debug(
-                        "sync.api_round_cache_poll",
-                        leagues=len(configured_league_ids),
-                        seen=cached_total,
-                        written=cached_written,
+                if now - last_refresh >= SHEET_REFRESH_SECONDS:
+                    sh = open_spreadsheet()
+                    main_contexts, clan_contexts = refresh_sheet_contexts(
+                        sh,
+                        state,
+                        main_expected_header,
+                        clan_expected_header,
+                        write_limiter,
+                        read_limiter,
+                        enable_clan_sync=ENABLE_CLAN_SYNC,
                     )
-                api_leagues = fetch_league_catalog_from_api(round_metrics_api.bearer_token)
-                last_league_api_poll = now
-                if api_leagues:
-                    configured = {ctx.league_id for ctx in main_contexts.values()}
-                    api_set = set(api_leagues.keys())
-                    missing_in_sheets = sorted(api_set - configured)
-                    unknown_in_sheets = sorted(configured - api_set)
-                    log_info(
-                        "sync.league_catalog",
-                        api=len(api_set),
-                        configured=len(configured),
-                        missing_in_sheets=len(missing_in_sheets),
-                        unknown_in_sheets=len(unknown_in_sheets),
+                    contexts_all = {**main_contexts, **clan_contexts}
+                    purge_stale_queue_ops(state, contexts_all)
+                    if not ENABLE_CLAN_SYNC:
+                        purged_clan_ops = state.purge_ops_by_type(["append_clan_round"])
+                        if purged_clan_ops > 0:
+                            log_info("queue.purged_clan_ops", deleted_ops=purged_clan_ops)
+                    configured_league_ids = sorted(
+                        {ctx.league_id for ctx in main_contexts.values()} | {ctx.league_id for ctx in clan_contexts.values()}
                     )
+                    last_refresh = now
+                    log_info("sync.sheet_refresh_done", active_main=len(main_contexts), active_clan=len(clan_contexts))
 
-            if now - last_poll >= SYNC_POLL_SECONDS:
-                cached_written, cached_total = sync_api_round_cache(state, round_metrics_api, configured_league_ids)
-                if cached_total > 0 and DEBUG_VERBOSE:
-                    log_debug(
-                        "sync.api_round_cache_poll",
-                        leagues=len(configured_league_ids),
-                        seen=cached_total,
-                        written=cached_written,
-                    )
+                if now - last_league_api_poll >= LEAGUES_API_POLL_SECONDS:
+                    cached_written, cached_total = sync_api_round_cache(state, round_metrics_api, configured_league_ids)
+                    if cached_total > 0 and DEBUG_VERBOSE:
+                        log_debug(
+                            "sync.api_round_cache_poll",
+                            leagues=len(configured_league_ids),
+                            seen=cached_total,
+                            written=cached_written,
+                        )
+                    api_leagues = fetch_league_catalog_from_api(round_metrics_api.bearer_token)
+                    last_league_api_poll = now
+                    if api_leagues:
+                        configured = {ctx.league_id for ctx in main_contexts.values()}
+                        api_set = set(api_leagues.keys())
+                        missing_in_sheets = sorted(api_set - configured)
+                        unknown_in_sheets = sorted(configured - api_set)
+                        log_info(
+                            "sync.league_catalog",
+                            api=len(api_set),
+                            configured=len(configured),
+                            missing_in_sheets=len(missing_in_sheets),
+                            unknown_in_sheets=len(unknown_in_sheets),
+                        )
 
-                def _flush_due_queue_tick() -> int:
-                    return flush_sheet_queue_with_rate_limit(state, contexts_all, write_limiter)
+                if now - last_poll >= SYNC_POLL_SECONDS:
+                    cached_written, cached_total = sync_api_round_cache(state, round_metrics_api, configured_league_ids)
+                    if cached_total > 0 and DEBUG_VERBOSE:
+                        log_debug(
+                            "sync.api_round_cache_poll",
+                            leagues=len(configured_league_ids),
+                            seen=cached_total,
+                            written=cached_written,
+                        )
 
-                enq_main = enqueue_main_sheet_ops(
-                    None,
-                    state,
-                    main_contexts,
-                    ability_id_to_name,
-                    ability_headers,
-                    round_ability_api,
-                    read_limiter,
-                    power_up_clan_api=power_up_clan_api,
-                    flush_tick=_flush_due_queue_tick,
-                    flush_every_seconds=ENQUEUE_FLUSH_EVERY_SECONDS,
-                )
-                enq_clan = 0
-                if ENABLE_CLAN_SYNC and clan_api is not None:
-                    enq_clan = enqueue_clan_sheet_ops(
+                    def _flush_due_queue_tick() -> int:
+                        return flush_sheet_queue_with_rate_limit(state, contexts_all, write_limiter)
+
+                    enq_main = enqueue_main_sheet_ops(
                         None,
                         state,
-                        clan_contexts,
-                        clan_api,
+                        main_contexts,
+                        ability_id_to_name,
+                        ability_headers,
+                        round_ability_api,
+                        read_limiter,
+                        power_up_clan_api=power_up_clan_api,
                         flush_tick=_flush_due_queue_tick,
                         flush_every_seconds=ENQUEUE_FLUSH_EVERY_SECONDS,
                     )
-                enq = enq_main + enq_clan
-                last_poll = now
-                if enq > 0:
-                    log_info(
-                        "queue.enqueued",
-                        count=enq,
-                        main=enq_main,
-                        clan=enq_clan,
-                        queue_total=state.queue_total_count(),
-                        queue_due=state.queue_due_count(),
+                    enq_clan = 0
+                    if ENABLE_CLAN_SYNC and clan_api is not None:
+                        enq_clan = enqueue_clan_sheet_ops(
+                            None,
+                            state,
+                            clan_contexts,
+                            clan_api,
+                            flush_tick=_flush_due_queue_tick,
+                            flush_every_seconds=ENQUEUE_FLUSH_EVERY_SECONDS,
+                        )
+                    enq = enq_main + enq_clan
+                    last_poll = now
+                    if enq > 0:
+                        log_info(
+                            "queue.enqueued",
+                            count=enq,
+                            main=enq_main,
+                            clan=enq_clan,
+                            queue_total=state.queue_total_count(),
+                            queue_due=state.queue_due_count(),
+                        )
+
+                if now - last_reconcile_poll >= RECONCILE_INTERVAL_SECONDS:
+                    rec_stats = run_reconcile_pass(
+                        state=state,
+                        main_contexts=main_contexts,
+                        ability_id_to_name=ability_id_to_name,
+                        ability_headers=ability_headers,
+                        round_ability_api=round_ability_api,
+                        read_limiter=read_limiter,
+                        power_up_clan_api=power_up_clan_api,
                     )
+                    last_reconcile_poll = now
+                    if rec_stats.get("queued_ops", 0) > 0 or DEBUG_VERBOSE:
+                        log_info("sync.reconcile_done", **rec_stats, queue_total=state.queue_total_count(), queue_due=state.queue_due_count())
 
-            if now - last_reconcile_poll >= RECONCILE_INTERVAL_SECONDS:
-                rec_stats = run_reconcile_pass(
-                    state=state,
-                    main_contexts=main_contexts,
-                    ability_id_to_name=ability_id_to_name,
-                    ability_headers=ability_headers,
-                    round_ability_api=round_ability_api,
-                    read_limiter=read_limiter,
-                    power_up_clan_api=power_up_clan_api,
-                )
-                last_reconcile_poll = now
-                if rec_stats.get("queued_ops", 0) > 0 or DEBUG_VERBOSE:
-                    log_info("sync.reconcile_done", **rec_stats, queue_total=state.queue_total_count(), queue_due=state.queue_due_count())
+                done = flush_sheet_queue_with_rate_limit(state, contexts_all, write_limiter)
+                if done > 0:
+                    log_info("queue.flushed", processed=done)
 
-            done = flush_sheet_queue_with_rate_limit(state, contexts_all, write_limiter)
-            if done > 0:
-                log_info("queue.flushed", processed=done)
+                if now - last_heartbeat >= HEARTBEAT_SECONDS:
+                    total_q = state.queue_total_count()
+                    due_q = state.queue_due_count()
+                    log_info(
+                        "sync.heartbeat",
+                        queue_total=total_q,
+                        queue_due=due_q,
+                        main_contexts=len(main_contexts),
+                        clan_contexts=len(clan_contexts),
+                        write_limiter=write_limiter.snapshot(),
+                        read_limiter=read_limiter.snapshot(),
+                        gomining_limiter=gomining_limiter.snapshot(),
+                    )
+                    log_main_sheet_summaries(state, main_contexts)
+                    last_heartbeat = now
 
-            if now - last_heartbeat >= HEARTBEAT_SECONDS:
-                total_q = state.queue_total_count()
-                due_q = state.queue_due_count()
-                log_info(
-                    "sync.heartbeat",
-                    queue_total=total_q,
-                    queue_due=due_q,
-                    main_contexts=len(main_contexts),
-                    clan_contexts=len(clan_contexts),
-                    write_limiter=write_limiter.snapshot(),
-                    read_limiter=read_limiter.snapshot(),
-                    gomining_limiter=gomining_limiter.snapshot(),
-                )
-                log_main_sheet_summaries(state, main_contexts)
-                last_heartbeat = now
-
-            time.sleep(1.0)
+                time.sleep(1.0)
+            except Exception:
+                log_error("sync.loop_unhandled_exception", exc_info=True)
+                time.sleep(min(30.0, max(1.0, float(SYNC_POLL_SECONDS))))
 
     finally:
         try:

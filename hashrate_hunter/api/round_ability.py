@@ -21,7 +21,7 @@ import requests
 
 from ..api.auth import _is_jwt_expired_response, _shared_token_cached, _shared_token_fetch
 from ..config import *
-from ..logging_utils import log_warn
+from ..logging_utils import log_info, log_warn
 from ..runtime.rate_limit import AdaptiveRateController, TokenBucket
 from ..utils import safe_float, safe_int
 
@@ -302,6 +302,13 @@ class GoMiningRoundAbilityApiClient:
                     self.round_excluded_user_boosts_cache[rid] = {}
                     self.round_tracked_user_blocks_mined_cache[rid] = None
                     return {}
+                if ROUND_API_PROGRESS_EVERY_PAGES > 0:
+                    log_info(
+                        "gomining_api.round_user_scan_start",
+                        round_id=rid,
+                        total_count=total_count,
+                        page_limit=self.page_limit,
+                    )
 
             if winner_user_id is None:
                 winner = data.get("winner")
@@ -358,6 +365,19 @@ class GoMiningRoundAbilityApiClient:
                             bucket["alias"] = participant_alias
 
             fetched += len(participants)
+            if (
+                ROUND_API_PROGRESS_EVERY_PAGES > 0
+                and page_no > 0
+                and page_no % ROUND_API_PROGRESS_EVERY_PAGES == 0
+            ):
+                log_info(
+                    "gomining_api.round_user_scan_progress",
+                    round_id=rid,
+                    fetched=fetched,
+                    total_count=total_count,
+                    page=page_no,
+                    skip=skip,
+                )
             if len(participants) < self.page_limit:
                 break
             if total_count is not None and fetched >= total_count:
@@ -417,6 +437,14 @@ class GoMiningRoundAbilityApiClient:
         if len(self.round_tracked_user_blocks_mined_cache) > 512:
             for old_rid in sorted(self.round_tracked_user_blocks_mined_cache.keys())[:-256]:
                 self.round_tracked_user_blocks_mined_cache.pop(old_rid, None)
+        if ROUND_API_PROGRESS_EVERY_PAGES > 0:
+            log_info(
+                "gomining_api.round_user_scan_done",
+                round_id=rid,
+                fetched=fetched,
+                total_count=total_count,
+                abilities=len(counts),
+            )
         return counts
 
     def get_cached_ability_users_for_round(self, round_id: int, ability_id: str) -> List[Dict[str, Any]]:

@@ -68,6 +68,9 @@ def _looks_like_iso_ts(value: Any) -> bool:
         return False
     return re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", s) is not None
 
+def _is_sentinel_sheet_title(title: str) -> bool:
+    return "sentinel" in str(title or "").strip().lower()
+
 def _history_shift_detected(ws: Any, read_limiter: TokenBucket) -> bool:
     try:
         read_limiter.wait_for_token(1)
@@ -280,9 +283,26 @@ def refresh_sheet_contexts(
         )
 
     for ws in worksheets:
+        title = str(getattr(ws, "title", "") or "")
+        if SKIP_SENTINEL_SHEETS and _is_sentinel_sheet_title(title):
+            log_info("sheet.refresh_skip_sentinel", sheet=title, ws_id=ws.id)
+            continue
         sel = selectors.get(ws.id, {})
         marker = str(sel.get("marker") or "")
         league_id = safe_int(sel.get("league_id"))
+        if league_id is None or not marker:
+            cached_sheet = state.get_sheet_state(ws.id)
+            cached_league = safe_int((cached_sheet or {}).get("league_id"))
+            if cached_league is not None:
+                league_id = cached_league
+                marker = CLAN_SHEET_MARKER if title.endswith(CLAN_TAB_SUFFIX) or "Clan" in title else MAIN_SHEET_MARKER
+                log_warn(
+                    "sheet.selector_cached_fallback",
+                    sheet=title,
+                    ws_id=ws.id,
+                    league_id=league_id,
+                    marker=marker,
+                )
         if league_id is None:
             if DEBUG_VERBOSE:
                 log_debug("sheet.refresh_skip_no_league", sheet=ws.title, ws_id=ws.id)
@@ -371,7 +391,9 @@ def refresh_sheet_contexts(
             marker=MAIN_SHEET_MARKER,
             enable_history_shift=True,
         )
-        ctx.next_row = _detect_next_row(ctx.ws, read_limiter, round_col_index=(ctx.round_col_idx or 6) + 1)
+        detected_next_row = _detect_next_row(ctx.ws, read_limiter, round_col_index=(ctx.round_col_idx or 6) + 1)
+        local_max_row = state.get_max_row_idx(ctx.ws_id)
+        ctx.next_row = max(detected_next_row, (int(local_max_row) + 1) if local_max_row is not None else LOG_START_ROW)
         if DEBUG_VERBOSE:
             log_debug("sheet.next_row_detected", sheet=ctx.title, ws_id=ctx.ws_id, kind=ctx.kind, next_row=ctx.next_row)
 
@@ -387,7 +409,9 @@ def refresh_sheet_contexts(
             marker=CLAN_SHEET_MARKER,
             enable_history_shift=False,
         )
-        ctx.next_row = _detect_next_row(ctx.ws, read_limiter, round_col_index=(ctx.round_col_idx or 2) + 1)
+        detected_next_row = _detect_next_row(ctx.ws, read_limiter, round_col_index=(ctx.round_col_idx or 2) + 1)
+        local_max_row = state.get_max_row_idx(ctx.ws_id)
+        ctx.next_row = max(detected_next_row, (int(local_max_row) + 1) if local_max_row is not None else LOG_START_ROW)
         if DEBUG_VERBOSE:
             log_debug("sheet.next_row_detected", sheet=ctx.title, ws_id=ctx.ws_id, kind=ctx.kind, next_row=ctx.next_row)
 
