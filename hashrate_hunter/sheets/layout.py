@@ -232,9 +232,10 @@ def sync_layout_if_needed(
         if not _remove_clan_gmt_column(ctx, write_limiter):
             return
     write_limiter.wait_for_token(1)
+    league_cell_value: Any = "" if marker == CLAN_CPU_SHEET_MARKER else ctx.league_id
     updates = [
         {"range": "A1", "values": [[marker]]},
-        {"range": "B1", "values": [[ctx.league_id]]},
+        {"range": "B1", "values": [[league_cell_value]]},
         {"range": "A3", "values": [expected_header]},
     ]
     if marker == MAIN_SHEET_MARKER:
@@ -245,6 +246,8 @@ def sync_layout_if_needed(
             ]
         )
     elif marker == CLAN_SHEET_MARKER:
+        updates.append({"range": "C1", "values": [["last_roundId"]]})
+    elif marker == CLAN_CPU_SHEET_MARKER:
         updates.append({"range": "C1", "values": [["last_roundId"]]})
     ctx.ws.batch_update(updates, value_input_option="RAW")
     state.upsert_sheet_meta(ctx.ws_id, ctx.title, ctx.league_id, layout_sig=layout_sig)
@@ -263,10 +266,13 @@ def refresh_sheet_contexts(
     read_limiter: TokenBucket,
     enable_clan_sync: bool = ENABLE_CLAN_SYNC,
     odyssey_sentinel_header: Optional[List[str]] = None,
+    clan_cpu_header: Optional[List[str]] = None,
     return_odyssey_sentinel: bool = False,
+    return_clan_cpu: bool = False,
 ) -> Union[
     Tuple[Dict[int, SheetContext], Dict[int, SheetContext]],
     Tuple[Dict[int, SheetContext], Dict[int, SheetContext], Dict[int, SheetContext]],
+    Tuple[Dict[int, SheetContext], Dict[int, SheetContext], Dict[int, SheetContext], Dict[int, SheetContext]],
 ]:
     read_limiter.wait_for_token(1)
     worksheets = sh.worksheets()
@@ -274,11 +280,14 @@ def refresh_sheet_contexts(
     main_contexts: Dict[int, SheetContext] = {}
     clan_contexts: Dict[int, SheetContext] = {}
     odyssey_sentinel_contexts: Dict[int, SheetContext] = {}
+    clan_cpu_contexts: Dict[int, SheetContext] = {}
     pending_odyssey_sentinel: List[Any] = []
     main_layout_sig = row_checksum(main_expected_header)
     clan_layout_sig = row_checksum(clan_expected_header)
     odyssey_sentinel_header = list(odyssey_sentinel_header or ODYSSEY_SENTINEL_HEADERS)
     odyssey_sentinel_layout_sig = row_checksum(odyssey_sentinel_header)
+    clan_cpu_header = list(clan_cpu_header or CLAN_CPU_HEADERS)
+    clan_cpu_layout_sig = row_checksum(clan_cpu_header)
     if DEBUG_VERBOSE:
         log_debug(
             "sheet.refresh_begin",
@@ -293,6 +302,18 @@ def refresh_sheet_contexts(
         marker = str(sel.get("marker") or "")
         league_id = safe_int(sel.get("league_id"))
         title_is_odyssey_sentinel = str(getattr(ws, "title", "") or "") == ODYSSEY_SENTINEL_SHEET_TITLE
+        title_is_clan_cpu = str(getattr(ws, "title", "") or "") == CLAN_CPU_SHEET_TITLE
+        if marker == CLAN_CPU_SHEET_MARKER or title_is_clan_cpu:
+            clan_cpu_contexts[ws.id] = SheetContext(
+                ws_id=ws.id,
+                title=ws.title,
+                ws=ws,
+                league_id=0,
+                kind="clan_cpu",
+                expected_cols=len(clan_cpu_header),
+                round_col_idx=2,
+            )
+            continue
         if marker == ODYSSEY_SENTINEL_SHEET_MARKER or title_is_odyssey_sentinel:
             if league_id is None:
                 pending_odyssey_sentinel.append(ws)
@@ -405,6 +426,31 @@ def refresh_sheet_contexts(
                     err=repr(e),
                 )
 
+    if not clan_cpu_contexts:
+        if DRY_RUN:
+            log_info("sheet.clan_cpu_tab_create_dry_skip", target_title=CLAN_CPU_SHEET_TITLE)
+        else:
+            try:
+                write_limiter.wait_for_token(1)
+                ws_new = sh.add_worksheet(
+                    title=CLAN_CPU_SHEET_TITLE,
+                    rows=max(1000, LOG_START_ROW + 50),
+                    cols=max(12, len(clan_cpu_header) + 2),
+                )
+                ctx = SheetContext(
+                    ws_id=ws_new.id,
+                    title=ws_new.title,
+                    ws=ws_new,
+                    league_id=0,
+                    kind="clan_cpu",
+                    expected_cols=len(clan_cpu_header),
+                    round_col_idx=2,
+                )
+                clan_cpu_contexts[ws_new.id] = ctx
+                log_info("sheet.clan_cpu_tab_created", sheet=ctx.title)
+            except Exception as e:
+                log_warn("sheet.clan_cpu_tab_create_failed", target_title=CLAN_CPU_SHEET_TITLE, err=repr(e))
+
     for ctx in main_contexts.values():
         state.upsert_sheet_meta(ctx.ws_id, ctx.title, ctx.league_id, layout_sig=None)
         sync_layout_if_needed(
@@ -453,14 +499,33 @@ def refresh_sheet_contexts(
         if DEBUG_VERBOSE:
             log_debug("sheet.next_row_detected", sheet=ctx.title, ws_id=ctx.ws_id, kind=ctx.kind, next_row=ctx.next_row)
 
+    for ctx in clan_cpu_contexts.values():
+        state.upsert_sheet_meta(ctx.ws_id, ctx.title, ctx.league_id, layout_sig=None)
+        sync_layout_if_needed(
+            ctx,
+            clan_cpu_header,
+            clan_cpu_layout_sig,
+            state,
+            write_limiter,
+            read_limiter,
+            marker=CLAN_CPU_SHEET_MARKER,
+            enable_history_shift=False,
+        )
+        ctx.next_row = _detect_next_row(ctx.ws, read_limiter, round_col_index=(ctx.round_col_idx or 2) + 1)
+        if DEBUG_VERBOSE:
+            log_debug("sheet.next_row_detected", sheet=ctx.title, ws_id=ctx.ws_id, kind=ctx.kind, next_row=ctx.next_row)
+
     if DEBUG_VERBOSE:
         log_debug(
             "sheet.refresh_done",
             main_contexts=len(main_contexts),
             clan_contexts=len(clan_contexts),
             odyssey_sentinel_contexts=len(odyssey_sentinel_contexts),
+            clan_cpu_contexts=len(clan_cpu_contexts),
         )
 
+    if return_clan_cpu:
+        return main_contexts, clan_contexts, odyssey_sentinel_contexts, clan_cpu_contexts
     if return_odyssey_sentinel:
         return main_contexts, clan_contexts, odyssey_sentinel_contexts
     return main_contexts, clan_contexts

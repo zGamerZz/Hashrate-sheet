@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import requests
 
@@ -196,6 +196,42 @@ def build_odyssey_sentinel_boost_rows(
                 total_count,
                 sentinel_total,
                 sentinel_users,
+            ]
+        )
+    return rows
+
+def build_clan_cpu_usage_rows(
+    rec: Dict[str, Any],
+    clan_power_up_users: Sequence[Dict[str, Any]],
+    clan_names_by_id: Optional[Mapping[int, str]] = None,
+) -> List[List[Any]]:
+    timestamp_utc = to_iso_utc(rec.get("snapshot_ts")) or ""
+    ended_at_utc = to_iso_utc(rec.get("ended_at")) or ""
+    league_id = safe_int(rec.get("league_id")) or ""
+    round_id = safe_int(rec.get("round_id")) or ""
+    names = clan_names_by_id or {}
+    counts_by_clan: Dict[int, int] = {}
+
+    for item in clan_power_up_users or []:
+        if not isinstance(item, dict):
+            continue
+        clan_id = safe_int(item.get("clan_id"))
+        cnt = safe_int(item.get("count")) or 0
+        if clan_id is None or cnt <= 0:
+            continue
+        counts_by_clan[clan_id] = counts_by_clan.get(clan_id, 0) + cnt
+
+    rows: List[List[Any]] = []
+    for clan_id, count in sorted(counts_by_clan.items(), key=lambda x: (-x[1], x[0])):
+        rows.append(
+            [
+                timestamp_utc,
+                league_id,
+                round_id,
+                ended_at_utc,
+                clan_id,
+                str(names.get(clan_id) or ""),
+                count,
             ]
         )
     return rows

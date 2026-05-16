@@ -35,7 +35,7 @@ from ..sheets.queue import flush_sheet_queue_with_rate_limit, purge_stale_queue_
 from ..storage.legacy_db import _warn_db_deprecated
 from ..storage.state import StateStore
 from .cache import sync_api_round_cache
-from .enqueue import enqueue_clan_sheet_ops, enqueue_main_sheet_ops, enqueue_odyssey_sentinel_sheet_ops
+from .enqueue import enqueue_clan_cpu_sheet_ops, enqueue_clan_sheet_ops, enqueue_main_sheet_ops, enqueue_odyssey_sentinel_sheet_ops
 from .reconcile import log_main_sheet_summaries, run_reconcile_pass
 
 def main(once_reconcile: bool = False) -> None:
@@ -61,6 +61,7 @@ def main(once_reconcile: bool = False) -> None:
         ]
         clan_expected_header = list(CLAN_HEADERS)
         odyssey_sentinel_expected_header = list(ODYSSEY_SENTINEL_HEADERS)
+        clan_cpu_expected_header = list(CLAN_CPU_HEADERS)
 
         state = StateStore(STATE_DB_PATH)
         write_limiter = TokenBucket(GS_WRITE_REQ_PER_MIN, name="sheets_write")
@@ -122,7 +123,7 @@ def main(once_reconcile: bool = False) -> None:
         )
 
         sh = open_spreadsheet()
-        main_contexts, clan_contexts, odyssey_sentinel_contexts = refresh_sheet_contexts(
+        main_contexts, clan_contexts, odyssey_sentinel_contexts, clan_cpu_contexts = refresh_sheet_contexts(
             sh,
             state,
             main_expected_header,
@@ -131,9 +132,11 @@ def main(once_reconcile: bool = False) -> None:
             read_limiter,
             enable_clan_sync=ENABLE_CLAN_SYNC,
             odyssey_sentinel_header=odyssey_sentinel_expected_header,
+            clan_cpu_header=clan_cpu_expected_header,
             return_odyssey_sentinel=True,
+            return_clan_cpu=True,
         )
-        contexts_all = {**main_contexts, **clan_contexts, **odyssey_sentinel_contexts}
+        contexts_all = {**main_contexts, **clan_contexts, **odyssey_sentinel_contexts, **clan_cpu_contexts}
         purge_stale_queue_ops(state, contexts_all)
         if not ENABLE_CLAN_SYNC:
             purged_clan_ops = state.purge_ops_by_type(["append_clan_round"])
@@ -155,6 +158,7 @@ def main(once_reconcile: bool = False) -> None:
             active_main_tabs=len(main_contexts),
             active_clan_tabs=len(clan_contexts),
             active_odyssey_sentinel_tabs=len(odyssey_sentinel_contexts),
+            active_clan_cpu_tabs=len(clan_cpu_contexts),
         )
         log_info(
             "sync.config",
@@ -258,7 +262,7 @@ def main(once_reconcile: bool = False) -> None:
 
             if now - last_refresh >= SHEET_REFRESH_SECONDS:
                 sh = open_spreadsheet()
-                main_contexts, clan_contexts, odyssey_sentinel_contexts = refresh_sheet_contexts(
+                main_contexts, clan_contexts, odyssey_sentinel_contexts, clan_cpu_contexts = refresh_sheet_contexts(
                     sh,
                     state,
                     main_expected_header,
@@ -267,9 +271,11 @@ def main(once_reconcile: bool = False) -> None:
                     read_limiter,
                     enable_clan_sync=ENABLE_CLAN_SYNC,
                     odyssey_sentinel_header=odyssey_sentinel_expected_header,
+                    clan_cpu_header=clan_cpu_expected_header,
                     return_odyssey_sentinel=True,
+                    return_clan_cpu=True,
                 )
-                contexts_all = {**main_contexts, **clan_contexts, **odyssey_sentinel_contexts}
+                contexts_all = {**main_contexts, **clan_contexts, **odyssey_sentinel_contexts, **clan_cpu_contexts}
                 purge_stale_queue_ops(state, contexts_all)
                 if not ENABLE_CLAN_SYNC:
                     purged_clan_ops = state.purge_ops_by_type(["append_clan_round"])
@@ -285,6 +291,7 @@ def main(once_reconcile: bool = False) -> None:
                     active_main=len(main_contexts),
                     active_clan=len(clan_contexts),
                     active_odyssey_sentinel=len(odyssey_sentinel_contexts),
+                    active_clan_cpu=len(clan_cpu_contexts),
                 )
 
             if now - last_league_api_poll >= LEAGUES_API_POLL_SECONDS:
@@ -356,7 +363,16 @@ def main(once_reconcile: bool = False) -> None:
                     flush_tick=_flush_due_queue_tick,
                     flush_every_seconds=ENQUEUE_FLUSH_EVERY_SECONDS,
                 )
-                enq = enq_main + enq_clan + enq_odyssey_sentinel
+                enq_clan_cpu = enqueue_clan_cpu_sheet_ops(
+                    None,
+                    state,
+                    clan_cpu_contexts,
+                    main_contexts,
+                    round_ability_api,
+                    flush_tick=_flush_due_queue_tick,
+                    flush_every_seconds=ENQUEUE_FLUSH_EVERY_SECONDS,
+                )
+                enq = enq_main + enq_clan + enq_odyssey_sentinel + enq_clan_cpu
                 last_poll = now
                 if enq > 0:
                     log_info(
@@ -365,6 +381,7 @@ def main(once_reconcile: bool = False) -> None:
                         main=enq_main,
                         clan=enq_clan,
                         odyssey_sentinel=enq_odyssey_sentinel,
+                        clan_cpu=enq_clan_cpu,
                         queue_total=state.queue_total_count(),
                         queue_due=state.queue_due_count(),
                     )
@@ -397,6 +414,7 @@ def main(once_reconcile: bool = False) -> None:
                     main_contexts=len(main_contexts),
                     clan_contexts=len(clan_contexts),
                     odyssey_sentinel_contexts=len(odyssey_sentinel_contexts),
+                    clan_cpu_contexts=len(clan_cpu_contexts),
                     write_limiter=write_limiter.snapshot(),
                     read_limiter=read_limiter.snapshot(),
                     gomining_limiter=gomining_limiter.snapshot(),

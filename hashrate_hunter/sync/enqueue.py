@@ -29,7 +29,7 @@ from ..domain.pricing import (
     calc_clan_power_up_gmt_pair_from_boost_users_api,
     calc_power_up_gmt_triplet_from_power_up_users_api,
 )
-from ..domain.rows import build_canonical_row, build_clan_round_rows, build_odyssey_sentinel_boost_rows
+from ..domain.rows import build_canonical_row, build_clan_cpu_usage_rows, build_clan_round_rows, build_odyssey_sentinel_boost_rows
 from ..logging_utils import log_debug, log_info, log_warn
 from ..runtime.rate_limit import TokenBucket
 from ..sheets.context import SheetContext
@@ -1025,6 +1025,157 @@ def enqueue_odyssey_sentinel_sheet_ops(
                     rows=len(rows),
                     checksum=checksum[:12],
                     row_preview=rows[0][:8] if rows else [],
+                )
+
+    return enqueued
+
+def enqueue_clan_cpu_sheet_ops(
+    db: Optional[DBClient],
+    state: StateStore,
+    clan_cpu_contexts: Dict[int, SheetContext],
+    source_contexts: Dict[int, SheetContext],
+    round_ability_api: GoMiningRoundAbilityApiClient,
+    flush_tick: Optional[Callable[[], int]] = None,
+    flush_every_seconds: float = ENQUEUE_FLUSH_EVERY_SECONDS,
+) -> int:
+    enqueued = 0
+    source_league_ids = sorted({int(ctx.league_id) for ctx in source_contexts.values() if safe_int(ctx.league_id) is not None})
+    if not source_league_ids:
+        return 0
+
+    for ws_id, ctx in clan_cpu_contexts.items():
+        last_flush_monotonic = time.monotonic() - max(0.0, flush_every_seconds)
+
+        def _progress_tick(round_id: Optional[int]) -> None:
+            nonlocal last_flush_monotonic
+            last_flush_monotonic = _maybe_flush_during_enqueue(
+                flush_tick,
+                last_flush_monotonic,
+                flush_every_seconds,
+                scope="clan_cpu",
+                sheet=ctx.title,
+                round_id=round_id,
+            )
+
+        state.upsert_sheet_meta(ws_id, ctx.title, ctx.league_id, layout_sig=None)
+        last_synced = state.get_last_synced_round(ws_id)
+
+        if last_synced is None:
+            latest_candidates: List[int] = []
+            for league_id in source_league_ids:
+                latest = fetch_latest_completed_round_id_prefer_api(db, state, league_id)
+                if latest is not None:
+                    latest_candidates.append(int(latest))
+            cutover = max(latest_candidates) if latest_candidates else 0
+            state.set_last_synced_round(ws_id, cutover)
+            log_info("sync.clan_cpu_init_cutover", sheet=ctx.title, leagues=len(source_league_ids), cutover_round=cutover)
+            continue
+
+        all_rounds: List[Dict[str, Any]] = []
+        for league_id in source_league_ids:
+            all_rounds.extend(
+                fetch_completed_rounds_prefer_api(
+                    db,
+                    state,
+                    league_id,
+                    max(0, last_synced),
+                    MAX_ROUNDS_PER_POLL,
+                )
+            )
+        if DEBUG_VERBOSE:
+            log_debug(
+                "sync.clan_cpu_sheet_poll",
+                sheet=ctx.title,
+                ws_id=ws_id,
+                leagues=len(source_league_ids),
+                last_synced=last_synced,
+                fetched_rounds=len(all_rounds),
+            )
+        if not all_rounds:
+            continue
+
+        rounds_sorted = sorted(all_rounds, key=lambda r: (safe_int(r.get("round_id")) or -1, safe_int(r.get("league_id")) or -1))
+        for rec in rounds_sorted:
+            rid = safe_int(rec.get("round_id"))
+            league_id = safe_int(rec.get("league_id"))
+            if rid is None or league_id is None or rid <= last_synced:
+                continue
+            _progress_tick(rid)
+            latest_last_synced = state.get_last_synced_round(ws_id)
+            if latest_last_synced is not None and latest_last_synced > last_synced:
+                last_synced = latest_last_synced
+            if rid <= last_synced:
+                continue
+
+            counts_by_id = round_ability_api.fetch_round_ability_counts(
+                rid,
+                expected_league_id=league_id,
+                progress_hook=lambda rid=rid: _progress_tick(rid),
+            )
+            if counts_by_id is None:
+                log_warn(
+                    "sync.clan_cpu_abilities_unavailable",
+                    sheet=ctx.title,
+                    league_id=league_id,
+                    round_id=rid,
+                )
+                break
+
+            clan_power_up_count = safe_int(counts_by_id.get(CLAN_POWER_UP_ABILITY_ID)) or 0
+            if clan_power_up_count <= 0:
+                state.set_last_synced_round(ws_id, rid)
+                last_synced = rid
+                if DEBUG_VERBOSE:
+                    log_debug("sync.clan_cpu_round_no_hits", sheet=ctx.title, league_id=league_id, round_id=rid)
+                continue
+
+            get_cached_users = getattr(round_ability_api, "get_cached_ability_users_for_round", None)
+            clan_power_up_users: List[Dict[str, Any]] = []
+            if callable(get_cached_users):
+                try:
+                    cached_users = get_cached_users(rid, CLAN_POWER_UP_ABILITY_ID)
+                    if isinstance(cached_users, list):
+                        clan_power_up_users = [u for u in cached_users if isinstance(u, dict)]
+                except Exception as e:
+                    log_warn(
+                        "sync.clan_cpu_users_cache_read_failed",
+                        sheet=ctx.title,
+                        league_id=league_id,
+                        round_id=rid,
+                        err=repr(e),
+                    )
+            rows = build_clan_cpu_usage_rows(rec, clan_power_up_users)
+            if not rows:
+                state.set_last_synced_round(ws_id, rid)
+                last_synced = rid
+                if DEBUG_VERBOSE:
+                    log_debug(
+                        "sync.clan_cpu_round_no_clan_rows",
+                        sheet=ctx.title,
+                        league_id=league_id,
+                        round_id=rid,
+                        boost_count=clan_power_up_count,
+                    )
+                continue
+
+            checksum = row_checksum(rows)  # type: ignore[arg-type]
+            state.enqueue_op(
+                ws_id,
+                "append_clan_cpu_round",
+                rid,
+                checksum,
+                {"rows": rows, "finalized": 1},
+            )
+            enqueued += 1
+            if DEBUG_VERBOSE:
+                log_debug(
+                    "sync.clan_cpu_round_enqueued_append",
+                    sheet=ctx.title,
+                    league_id=league_id,
+                    round_id=rid,
+                    rows=len(rows),
+                    checksum=checksum[:12],
+                    row_preview=rows[0][:7] if rows else [],
                 )
 
     return enqueued

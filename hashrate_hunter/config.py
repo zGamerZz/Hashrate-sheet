@@ -141,6 +141,8 @@ CLAN_SHEET_MARKER = "leagueId_to_log_clan"
 CLAN_TAB_SUFFIX = " - Clan"
 ODYSSEY_SENTINEL_SHEET_TITLE = "Odyssey-sentinel"
 ODYSSEY_SENTINEL_SHEET_MARKER = "odyssey_sentinel_boosts"
+CLAN_CPU_SHEET_TITLE = "Clan CPUs"
+CLAN_CPU_SHEET_MARKER = "clan_cpu_usage"
 
 LEAGUE_TH_HEADER = "League global TH"
 LEAGUE_TH_COL_INDEX = 7  # 0-based index, column H in the sheet.
@@ -208,6 +210,16 @@ ODYSSEY_SENTINEL_HEADERS: List[str] = [
     "totalBoostCount",
     "sentinelBoostCount",
     "sentinelUsers",
+]
+
+CLAN_CPU_HEADERS: List[str] = [
+    "timestamp_utc",
+    "leagueId",
+    "roundId",
+    "endedAt_utc",
+    "clanId",
+    "clanName",
+    "cpuCount",
 ]
 
 # Fixed, clean boost layout (no stealer/maintenance/other columns).

@@ -65,6 +65,8 @@ def _normalize_sheet_marker(raw: Any) -> str:
         return CLAN_SHEET_MARKER
     if s == ODYSSEY_SENTINEL_SHEET_MARKER.lower():
         return ODYSSEY_SENTINEL_SHEET_MARKER
+    if s == CLAN_CPU_SHEET_MARKER.lower():
+        return CLAN_CPU_SHEET_MARKER
     return ""
 
 def _single_cell_from_values(v: Any) -> str:
@@ -129,12 +131,14 @@ def read_sheet_selectors(sh: Any, worksheets: Sequence[Any], read_limiter: Token
         configured = [v.get("league_id") for v in out.values() if v.get("league_id") is not None]
         main_count = sum(1 for v in out.values() if v.get("marker") == MAIN_SHEET_MARKER)
         clan_count = sum(1 for v in out.values() if v.get("marker") == CLAN_SHEET_MARKER)
+        clan_cpu_count = sum(1 for v in out.values() if v.get("marker") == CLAN_CPU_SHEET_MARKER)
         log_debug(
             "sheet.read_selectors",
             total=len(out),
             configured=len(configured),
             main_tabs=main_count,
             clan_tabs=clan_count,
+            clan_cpu_tabs=clan_cpu_count,
             leagues=sorted(set(configured))[:200],
         )
     return out

@@ -3695,6 +3695,256 @@ class BackfillRoundGapTests(unittest.TestCase):
             finally:
                 st.close()
 
+    def test_build_clan_cpu_usage_rows_aggregates_only_valid_clans(self) -> None:
+        rec = {
+            "snapshot_ts": "2026-04-20T10:00:00+00:00",
+            "ended_at": "2026-04-20T10:01:00+00:00",
+            "league_id": 1,
+            "round_id": 101,
+        }
+        rows = main.build_clan_cpu_usage_rows(
+            rec,
+            [
+                {"user_id": 1, "clan_id": 777, "count": 2},
+                {"user_id": 2, "clan_id": 777, "count": 3},
+                {"user_id": 3, "clan_id": 888, "count": 1},
+                {"user_id": 4, "clan_id": 999, "count": 0},
+                {"user_id": 5, "count": 4},
+            ],
+            {777: "Alpha", 888: "Beta"},
+        )
+        self.assertEqual(rows[0], ["2026-04-20T10:00:00+00:00", 1, 101, "2026-04-20T10:01:00+00:00", 777, "Alpha", 5])
+        self.assertEqual(rows[1], ["2026-04-20T10:00:00+00:00", 1, 101, "2026-04-20T10:01:00+00:00", 888, "Beta", 1])
+        self.assertEqual(main.build_clan_cpu_usage_rows(rec, [{"clan_id": 777, "count": 0}]), [])
+
+    def test_enqueue_clan_cpu_sheet_ops_enqueues_only_cpu_hit_rounds(self) -> None:
+        class FakeRoundAPI:
+            def fetch_round_ability_counts(
+                self,
+                round_id: int,
+                expected_league_id: int | None = None,
+                progress_hook: Any | None = None,
+            ) -> Dict[str, int] | None:
+                _ = (expected_league_id, progress_hook)
+                if round_id == 101:
+                    return {main.CLAN_POWER_UP_ABILITY_ID: 5, main.POWER_UP_ABILITY_ID: 9}
+                if round_id == 102:
+                    return {main.POWER_UP_ABILITY_ID: 2}
+                return {}
+
+            def get_cached_ability_users_for_round(self, round_id: int, ability_id: str) -> List[Dict[str, Any]]:
+                if round_id == 101 and ability_id == main.CLAN_POWER_UP_ABILITY_ID:
+                    return [
+                        {"user_id": 1, "clan_id": 777, "count": 2},
+                        {"user_id": 2, "clan_id": 777, "count": 3},
+                    ]
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            st = main.StateStore(os.path.join(td, "state.sqlite"))
+            try:
+                cpu_ctx = main.SheetContext(
+                    ws_id=333,
+                    title=main.CLAN_CPU_SHEET_TITLE,
+                    ws=None,
+                    league_id=0,
+                    kind="clan_cpu",
+                    expected_cols=len(main.CLAN_CPU_HEADERS),
+                    round_col_idx=2,
+                )
+                main_ctx = main.SheetContext(ws_id=11, title="main", ws=None, league_id=1)
+                st.upsert_sheet_meta(cpu_ctx.ws_id, cpu_ctx.title, cpu_ctx.league_id)
+                st.set_last_synced_round(cpu_ctx.ws_id, 100)
+                SyncCoreTests._seed_api_rounds(
+                    st,
+                    [
+                        {"league_id": 1, "round_id": 101, "snapshot_ts": "2026-04-20T10:00:00+00:00", "ended_at": "2026-04-20T10:01:00+00:00"},
+                        {"league_id": 1, "round_id": 102, "snapshot_ts": "2026-04-20T10:02:00+00:00", "ended_at": "2026-04-20T10:03:00+00:00"},
+                    ],
+                )
+                enq = main.enqueue_clan_cpu_sheet_ops(None, st, {333: cpu_ctx}, {11: main_ctx}, FakeRoundAPI())  # type: ignore[arg-type]
+                self.assertEqual(enq, 1)
+                self.assertEqual(st.get_last_synced_round(cpu_ctx.ws_id), 102)
+                due = st.fetch_due_ops(limit=10)
+                self.assertEqual(len(due), 1)
+                self.assertEqual(due[0]["op_type"], "append_clan_cpu_round")
+                payload = json.loads(due[0]["payload_json"])
+                self.assertEqual(payload["rows"][0][4], 777)
+                self.assertEqual(payload["rows"][0][6], 5)
+            finally:
+                st.close()
+
+    def test_refresh_sheet_contexts_detects_existing_clan_cpu_sheet(self) -> None:
+        class FakeCell:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+        class FakeWS:
+            def __init__(self) -> None:
+                self.id = 333
+                self.title = main.CLAN_CPU_SHEET_TITLE
+                self.batch_updates: List[List[Dict[str, Any]]] = []
+
+            def acell(self, cell: str) -> FakeCell:
+                if cell == "A1":
+                    return FakeCell(main.CLAN_CPU_SHEET_MARKER)
+                return FakeCell("")
+
+            def row_values(self, _row: int) -> List[str]:
+                return []
+
+            def col_values(self, _index: int) -> List[str]:
+                return [""] * 3
+
+            def batch_update(self, updates: List[Dict[str, Any]], value_input_option: str = "RAW") -> None:
+                _ = value_input_option
+                self.batch_updates.append(list(updates))
+
+        class FakeSpreadsheet:
+            def __init__(self, ws: FakeWS) -> None:
+                self._ws = ws
+
+            def worksheets(self) -> List[FakeWS]:
+                return [self._ws]
+
+        with tempfile.TemporaryDirectory() as td:
+            st = main.StateStore(os.path.join(td, "state.sqlite"))
+            try:
+                ws = FakeWS()
+                _main, _clan, _sentinel, clan_cpu = main.refresh_sheet_contexts(
+                    FakeSpreadsheet(ws),
+                    st,
+                    main.BASE_HEADERS + list(main.ABILITY_HEADER_ORDER),
+                    list(main.CLAN_HEADERS),
+                    main.TokenBucket(9999, name="write"),
+                    main.TokenBucket(9999, name="read"),
+                    enable_clan_sync=False,
+                    odyssey_sentinel_header=list(main.ODYSSEY_SENTINEL_HEADERS),
+                    clan_cpu_header=list(main.CLAN_CPU_HEADERS),
+                    return_odyssey_sentinel=True,
+                    return_clan_cpu=True,
+                )
+                self.assertEqual(len(clan_cpu), 1)
+                ctx = clan_cpu[333]
+                self.assertEqual(ctx.kind, "clan_cpu")
+                self.assertEqual(ctx.league_id, 0)
+                self.assertTrue(ws.batch_updates)
+                by_range = {item["range"]: item["values"][0][0] for item in ws.batch_updates[0]}
+                self.assertEqual(by_range["A1"], main.CLAN_CPU_SHEET_MARKER)
+                self.assertEqual(ws.batch_updates[0][2]["values"][0], main.CLAN_CPU_HEADERS)
+            finally:
+                st.close()
+
+    def test_refresh_sheet_contexts_creates_missing_clan_cpu_sheet(self) -> None:
+        class FakeCell:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+        class FakeWS:
+            def __init__(self, ws_id: int, title: str, marker: str = "", league: str = "") -> None:
+                self.id = ws_id
+                self.title = title
+                self.marker = marker
+                self.league = league
+                self.batch_updates: List[List[Dict[str, Any]]] = []
+                self.row_count = 10
+
+            def acell(self, cell: str) -> FakeCell:
+                if cell == "A1":
+                    return FakeCell(self.marker)
+                if cell == main.CONFIG_CELL:
+                    return FakeCell(self.league)
+                return FakeCell("")
+
+            def row_values(self, _row: int) -> List[str]:
+                return []
+
+            def col_values(self, _index: int) -> List[str]:
+                return [""] * 3
+
+            def batch_update(self, updates: List[Dict[str, Any]], value_input_option: str = "RAW") -> None:
+                _ = value_input_option
+                self.batch_updates.append(list(updates))
+
+        class FakeSpreadsheet:
+            def __init__(self) -> None:
+                self.items = [FakeWS(11, "main", main.MAIN_SHEET_MARKER, "1")]
+
+            def worksheets(self) -> List[FakeWS]:
+                return list(self.items)
+
+            def add_worksheet(self, title: str, rows: int, cols: int) -> FakeWS:
+                _ = (rows, cols)
+                ws = FakeWS(334, title)
+                self.items.append(ws)
+                return ws
+
+        with tempfile.TemporaryDirectory() as td:
+            st = main.StateStore(os.path.join(td, "state.sqlite"))
+            try:
+                sh = FakeSpreadsheet()
+                _main, _clan, _sentinel, clan_cpu = main.refresh_sheet_contexts(
+                    sh,
+                    st,
+                    main.BASE_HEADERS + list(main.ABILITY_HEADER_ORDER),
+                    list(main.CLAN_HEADERS),
+                    main.TokenBucket(9999, name="write"),
+                    main.TokenBucket(9999, name="read"),
+                    enable_clan_sync=False,
+                    odyssey_sentinel_header=list(main.ODYSSEY_SENTINEL_HEADERS),
+                    clan_cpu_header=list(main.CLAN_CPU_HEADERS),
+                    return_odyssey_sentinel=True,
+                    return_clan_cpu=True,
+                )
+                self.assertIn(334, clan_cpu)
+                self.assertEqual(sh.items[-1].title, main.CLAN_CPU_SHEET_TITLE)
+                self.assertTrue(sh.items[-1].batch_updates)
+            finally:
+                st.close()
+
+    def test_flush_sheet_queue_applies_clan_cpu_append(self) -> None:
+        class FakeWS:
+            def __init__(self) -> None:
+                self.id = 333
+                self.title = main.CLAN_CPU_SHEET_TITLE
+                self.row_count = 20
+                self.updates: List[Dict[str, Any]] = []
+
+            def update(self, range_name: str, values: List[List[Any]], value_input_option: str = "RAW") -> None:
+                self.updates.append({"range": range_name, "values": values, "value_input_option": value_input_option})
+
+            def add_rows(self, n: int) -> None:
+                self.row_count += int(n)
+
+        with tempfile.TemporaryDirectory() as td:
+            st = main.StateStore(os.path.join(td, "state.sqlite"))
+            try:
+                ws = FakeWS()
+                ctx = main.SheetContext(
+                    ws_id=333,
+                    title=main.CLAN_CPU_SHEET_TITLE,
+                    ws=ws,
+                    league_id=0,
+                    kind="clan_cpu",
+                    next_row=main.LOG_START_ROW,
+                    expected_cols=len(main.CLAN_CPU_HEADERS),
+                    round_col_idx=2,
+                )
+                st.upsert_sheet_meta(ctx.ws_id, ctx.title, ctx.league_id)
+                rows = [
+                    ["2026-04-20T10:00:00+00:00", 1, 101, "2026-04-20T10:01:00+00:00", 777, "", 5],
+                    ["2026-04-20T10:00:00+00:00", 1, 101, "2026-04-20T10:01:00+00:00", 888, "", 1],
+                ]
+                st.enqueue_op(ctx.ws_id, "append_clan_cpu_round", 101, main.row_checksum(rows), {"rows": rows, "finalized": 1})
+                done = main.flush_sheet_queue_with_rate_limit(st, {ctx.ws_id: ctx}, main.TokenBucket(9999, name="write"))
+                self.assertEqual(done, 1)
+                self.assertEqual(ws.updates[0]["range"], "A4")
+                self.assertEqual(ws.updates[0]["values"], rows)
+                self.assertEqual(st.get_last_synced_round(ctx.ws_id), 101)
+                self.assertEqual(st.get_round_row_map_bulk(ctx.ws_id, [101])[101]["row_idx"], 4)
+            finally:
+                st.close()
+
     def test_eclipse_backfill_target_header_has_exact_main_shape(self) -> None:
         header = backfill_eclipse_backfill.build_target_header()
         self.assertEqual(len(header), 34)
